@@ -67,6 +67,15 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+/// Default adapter MTU reported in the `MANA_QUERY_DEV_CONFIG` response.
+///
+/// MANA drivers that negotiate `GDMA_MESSAGE_V2` or later require
+/// `adapter_mtu >= ETH_MIN_MTU + ETH_HLEN` and reject a zero value with
+/// `-EPROTO` ("Adapter MTU too small"). Report the standard Ethernet frame
+/// length (1514), which matches the driver's own V1-era default and yields a
+/// 1500-byte L3 MTU once the 14-byte Ethernet header is subtracted.
+const MANA_DEFAULT_ADAPTER_MTU: u16 = 1514;
+
 pub struct GuestBuffers {
     gm: GuestMemory,
     rx_packets: Slab<RxPacket>,
@@ -268,7 +277,7 @@ impl BasicNic {
                     max_num_vports: self.vports.len() as u16,
                     reserved: 0,
                     max_num_eqs: 64,
-                    adapter_mtu: 0,
+                    adapter_mtu: MANA_DEFAULT_ADAPTER_MTU,
                     reserved2: 0,
                     adapter_link_speed_mbps: self.config.adapter_link_speed_mbps,
                 };

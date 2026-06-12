@@ -853,11 +853,18 @@ flags:
     ///                          user_mode_apic=false and host WHP
     ///                          support)
     ///
+    /// KVM parameters (x86_64 guests only):
+    ///   nested_virt          - expose VMX/SVM to the guest so it can run
+    ///                          its own hypervisor (requires host KVM
+    ///                          nested-virt support)
+    ///
     /// Examples:
     ///   --hypervisor whp
     ///   --hypervisor whp:user_mode_apic
     ///   --hypervisor whp:user_mode_apic,no_enlightenments
     ///   --hypervisor whp:nested_virt
+    ///   --hypervisor kvm
+    ///   --hypervisor kvm:nested_virt
     #[clap(long)]
     pub hypervisor: Option<String>,
 
@@ -945,9 +952,29 @@ flags:
     #[clap(long)]
     pub openhcl_dump_path: Option<PathBuf>,
 
-    /// halt the VM when the guest requests a reset, instead of resetting it
-    #[clap(long)]
-    pub halt_on_reset: bool,
+    /// what to do when the guest requests a reset: reset it (default), halt the
+    /// VM for inspection, or exit the VMM process (use `exit:<code>` to set the
+    /// exit status)
+    #[clap(long, value_name = "ACTION", default_value = "reset", value_parser = parse_guest_power_action)]
+    pub guest_reset_action: GuestPowerAction,
+
+    /// what to do when the guest powers off or hibernates: halt the VM for
+    /// inspection (default), reset it, or exit the VMM process (use
+    /// `exit:<code>` to set the exit status)
+    #[clap(long, value_name = "ACTION", default_value = "halt", value_parser = parse_guest_power_action)]
+    pub guest_shutdown_action: GuestPowerAction,
+
+    /// what to do when the guest triple-faults: halt the VM for inspection
+    /// (default), reset it, or exit the VMM process (use `exit:<code>` to set
+    /// the exit status)
+    #[clap(long, value_name = "ACTION", default_value = "halt", value_parser = parse_guest_power_action)]
+    pub guest_crash_action: GuestPowerAction,
+
+    /// what to do when the guest watchdog fires (the guest stopped petting it):
+    /// reset the VM (default), halt it for inspection, or exit the VMM process
+    /// (use `exit:<code>` to set the exit status). Requires `--guest-watchdog`.
+    #[clap(long, value_name = "ACTION", default_value = "reset", value_parser = parse_guest_power_action, requires = "guest_watchdog")]
+    pub guest_watchdog_action: GuestPowerAction,
 
     /// write saved state .proto files to the specified path
     #[clap(long)]
@@ -1253,6 +1280,39 @@ impl FromStr for FsArgsWithOptions {
             options,
             pcie_port,
         })
+    }
+}
+
+/// What the VMM does on a guest power event (reset, power-off/hibernate,
+/// triple-fault, or watchdog timeout). Parsed from `reset`, `halt`, `exit`, or
+/// `exit:<code>`; a bare `exit` uses status 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GuestPowerAction {
+    /// Restart the guest.
+    Reset,
+    /// Stop the VM but keep the VMM process, so it can be inspected or
+    /// restarted from the REPL.
+    Halt,
+    /// Exit the VMM process with this status code.
+    Exit(u8),
+}
+
+/// Parse a [`GuestPowerAction`] from `reset`, `halt`, `exit`, or `exit:<code>`.
+/// A bare `exit` exits with status 0; `exit:<code>` exits with `<code>` (0-255).
+fn parse_guest_power_action(s: &str) -> Result<GuestPowerAction, String> {
+    match s {
+        "reset" => Ok(GuestPowerAction::Reset),
+        "halt" => Ok(GuestPowerAction::Halt),
+        "exit" => Ok(GuestPowerAction::Exit(0)),
+        _ => match s.strip_prefix("exit:") {
+            Some(code) => code
+                .parse::<u8>()
+                .map(GuestPowerAction::Exit)
+                .map_err(|err| format!("invalid exit code '{code}' (expected 0-255): {err}")),
+            None => Err(format!(
+                "expected reset, halt, exit, or exit:<code>, got '{s}'"
+            )),
+        },
     }
 }
 
@@ -2851,8 +2911,12 @@ pub struct PcieRootComplexCli {
     pub end_bus: u8,
     pub low_mmio: u32,
     pub high_mmio: u64,
+    pub low_mmio_base: Option<u64>,
+    pub high_mmio_base: Option<u64>,
+    pub preserve_bars: bool,
     pub hdm: u64,
     pub hdm_window_restrictions: CfmwsWindowRestrictions,
+    pub vnode: Option<u32>,
 }
 
 impl FromStr for PcieRootComplexCli {
@@ -2876,8 +2940,12 @@ impl FromStr for PcieRootComplexCli {
         let mut end_bus = 255;
         let mut low_mmio = DEFAULT_PCIE_CRS_LOW_SIZE;
         let mut high_mmio = DEFAULT_PCIE_CRS_HIGH_SIZE;
+        let mut low_mmio_base = None;
+        let mut high_mmio_base = None;
+        let mut preserve_bars = false;
         let mut hdm = DEFAULT_PCIE_HDM_SIZE;
         let mut hdm_window_restrictions = DEFAULT_HDM_WINDOW_RESTRICTIONS;
+        let mut vnode = None;
         for opt in opts {
             let mut s = opt.split('=');
             let opt = s.next().context("expected option")?;
@@ -2906,6 +2974,21 @@ impl FromStr for PcieRootComplexCli {
                     high_mmio =
                         parse_memory(high_mmio_str).context("failed to parse high MMIO size")?;
                 }
+                "low_mmio_base" => {
+                    let base_str = s.next().context("expected low MMIO base address")?;
+                    low_mmio_base = Some(
+                        parse_memory(base_str).context("failed to parse low MMIO base address")?,
+                    );
+                }
+                "high_mmio_base" => {
+                    let base_str = s.next().context("expected high MMIO base address")?;
+                    high_mmio_base = Some(
+                        parse_memory(base_str).context("failed to parse high MMIO base address")?,
+                    );
+                }
+                "preserve_bars" => {
+                    preserve_bars = true;
+                }
                 "hdm" => {
                     let hdm_str = s.next().context("expected HDM decoder size")?;
                     hdm = parse_memory(hdm_str).context("failed to parse HDM decoder size")?;
@@ -2917,6 +3000,11 @@ impl FromStr for PcieRootComplexCli {
                     hdm_window_restrictions =
                         parse_cxl_cfmws_window_restriction_u16_bitmask(mask_str)
                             .context("failed to parse HDM window restrictions bitmask")?;
+                }
+                "node" => {
+                    let node_str = s.next().context("expected NUMA node number")?;
+                    vnode =
+                        Some(u32::from_str(node_str).context("failed to parse NUMA node number")?);
                 }
                 opt => anyhow::bail!("unknown option: '{opt}'"),
             }
@@ -2933,8 +3021,12 @@ impl FromStr for PcieRootComplexCli {
             end_bus,
             low_mmio,
             high_mmio,
+            low_mmio_base,
+            high_mmio_base,
+            preserve_bars,
             hdm,
             hdm_window_restrictions,
+            vnode,
         })
     }
 }
@@ -3165,7 +3257,7 @@ impl FromStr for PcieRemoteCli {
 
 /// CLI configuration for a VFIO-assigned PCI device.
 ///
-/// Syntax: `host=<bdf>,port=<name>[,iommu=<id>]`
+/// Syntax: `host=<bdf>,port=<name>[,iommu=<id>][,bar0=pt..bar5=pt]`
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub struct VfioDeviceCli {
@@ -3176,6 +3268,9 @@ pub struct VfioDeviceCli {
     /// Optional iommufd context ID. When set, uses VFIO cdev + iommufd
     /// instead of the legacy group/container path.
     pub iommu: Option<String>,
+    /// Per-BAR passthrough flags. When `bar_pt[i]` is true, the virtual
+    /// BAR is pre-programmed with the physical BAR address (GPA = HPA).
+    pub bar_pt: [bool; 6],
 }
 
 #[cfg(target_os = "linux")]
@@ -3186,6 +3281,7 @@ impl FromStr for VfioDeviceCli {
         let mut host: Option<String> = None;
         let mut port: Option<String> = None;
         let mut iommu: Option<String> = None;
+        let mut bar_pt = [false; 6];
 
         for kv in s.split(',') {
             let (key, value) = kv
@@ -3213,6 +3309,13 @@ impl FromStr for VfioDeviceCli {
                     }
                     iommu = Some(value.to_string());
                 }
+                "bar0" | "bar1" | "bar2" | "bar3" | "bar4" | "bar5" => {
+                    if value != "pt" {
+                        anyhow::bail!("--vfio: '{key}' only accepts 'pt' as a value");
+                    }
+                    let idx: usize = key[3..].parse().unwrap();
+                    bar_pt[idx] = true;
+                }
                 _ => anyhow::bail!("unknown --vfio key: '{key}'"),
             }
         }
@@ -3229,6 +3332,7 @@ impl FromStr for VfioDeviceCli {
             port_name,
             pci_id,
             iommu,
+            bar_pt,
         })
     }
 }
@@ -4201,6 +4305,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4215,6 +4323,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4229,6 +4341,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4243,6 +4359,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4257,6 +4377,10 @@ mod tests {
                 high_mmio: 2 * ONE_GB,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4271,6 +4395,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4285,6 +4413,10 @@ mod tests {
                 high_mmio: 64 * ONE_GB,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4299,6 +4431,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: 2 * ONE_GB,
                 hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4313,6 +4449,10 @@ mod tests {
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
                 hdm_window_restrictions: CfmwsWindowRestrictions::try_from_bits(0x21).unwrap(),
+                vnode: None,
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
             }
         );
 
@@ -4333,6 +4473,25 @@ mod tests {
         assert!(PcieRootComplexCli::from_str("rc,hdm_window_restrictions=bad").is_err());
         assert!(PcieRootComplexCli::from_str("rc,hdm_window_restrictions").is_err());
         assert!(PcieRootComplexCli::from_str("rc,cxl").is_err());
+
+        // node option
+        assert_eq!(
+            PcieRootComplexCli::from_str("rc9,node=1").unwrap(),
+            PcieRootComplexCli {
+                name: "rc9".to_string(),
+                segment: 0,
+                start_bus: 0,
+                end_bus: 255,
+                low_mmio: DEFAULT_LOW_MMIO,
+                high_mmio: DEFAULT_HIGH_MMIO,
+                hdm: DEFAULT_HDM,
+                hdm_window_restrictions: DEFAULT_HDM_WINDOW_RESTRICTIONS,
+                vnode: Some(1),
+                low_mmio_base: None,
+                high_mmio_base: None,
+                preserve_bars: false,
+            }
+        );
     }
 
     #[test]
@@ -4712,6 +4871,55 @@ mod tests {
     fn test_pidfile_option_parsed() {
         let opt = Options::try_parse_from(["openvmm", "--pidfile", "/tmp/test.pid"]).unwrap();
         assert_eq!(opt.pidfile, Some(PathBuf::from("/tmp/test.pid")));
+    }
+
+    #[test]
+    fn test_guest_power_action_flags() {
+        // Defaults preserve the historical behavior: reset and watchdog reboot,
+        // power-off and crash keep the stopped VM.
+        let opt = Options::try_parse_from(["openvmm"]).unwrap();
+        assert_eq!(opt.guest_reset_action, GuestPowerAction::Reset);
+        assert_eq!(opt.guest_shutdown_action, GuestPowerAction::Halt);
+        assert_eq!(opt.guest_crash_action, GuestPowerAction::Halt);
+        assert_eq!(opt.guest_watchdog_action, GuestPowerAction::Reset);
+        // The CLI defaults must match the shared GuestPowerActions::default() the
+        // ttrpc server uses, so the two launch paths never drift.
+        assert_eq!(
+            crate::vm_controller::GuestPowerActions {
+                shutdown: opt.guest_shutdown_action,
+                reset: opt.guest_reset_action,
+                crash: opt.guest_crash_action,
+                watchdog: opt.guest_watchdog_action,
+            },
+            crate::vm_controller::GuestPowerActions::default(),
+        );
+
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--guest-watchdog",
+            "--guest-reset-action",
+            "exit",
+            "--guest-shutdown-action",
+            "exit:5",
+            "--guest-crash-action",
+            "reset",
+            "--guest-watchdog-action",
+            "halt",
+        ])
+        .unwrap();
+        // A bare `exit` is status 0; `exit:5` carries the code through.
+        assert_eq!(opt.guest_reset_action, GuestPowerAction::Exit(0));
+        assert_eq!(opt.guest_shutdown_action, GuestPowerAction::Exit(5));
+        assert_eq!(opt.guest_crash_action, GuestPowerAction::Reset);
+        assert_eq!(opt.guest_watchdog_action, GuestPowerAction::Halt);
+
+        // Malformed and out-of-range exit codes are rejected (status is 0-255).
+        assert!(Options::try_parse_from(["openvmm", "--guest-reset-action", "exit:nope"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--guest-reset-action", "exit:300"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--guest-reset-action", "exit:-1"]).is_err());
+
+        // --guest-watchdog-action requires the watchdog device (--guest-watchdog).
+        assert!(Options::try_parse_from(["openvmm", "--guest-watchdog-action", "halt"]).is_err());
     }
 
     #[cfg(target_os = "linux")]

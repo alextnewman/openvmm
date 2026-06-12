@@ -68,7 +68,7 @@ use pal_async::task::Spawn;
 use pal_async::task::Task;
 use petri_artifacts_common::tags::MachineArch;
 use petri_artifacts_core::ResolvedArtifact;
-use pipette_client::PIPETTE_VSOCK_PORT;
+use pipette_client::PIPETTE_PORT;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
 use serial_16550_resources::ComPort;
@@ -389,6 +389,7 @@ impl PetriVmConfigOpenVmm {
                 EfiDiagnosticsLogLevel::Info => firmware_uefi_resources::LogLevel::make_info(),
                 EfiDiagnosticsLogLevel::Full => firmware_uefi_resources::LogLevel::make_full(),
             };
+            let diagnostics_rate_limit = uefi_cfg.and_then(|c| c.efi_diagnostics_rate_limit);
             let nvram_storage = if vmgs.disk().is_some() {
                 VmgsFileHandle::new(vmgs_format::FileId::BIOS_NVRAM, true).into_resource()
             } else {
@@ -402,6 +403,7 @@ impl PetriVmConfigOpenVmm {
                 custom_uefi_vars,
                 secure_boot,
                 log_level,
+                diagnostics_rate_limit,
                 nvram_storage,
                 None,
             ));
@@ -653,7 +655,7 @@ impl PetriVmConfigOpenVmm {
         };
 
         // Make the pipette connection listener.
-        let path = format!("{vsock_path_string}_{PIPETTE_VSOCK_PORT}");
+        let path = format!("{vsock_path_string}_{PIPETTE_PORT}");
         let pipette_listener = PolledSocket::new(
             driver,
             UnixListener::bind(path).context("failed to bind to pipette listener")?,
@@ -662,7 +664,7 @@ impl PetriVmConfigOpenVmm {
         // Make the vtl2 pipette connection listener.
         let vtl2_pipette_listener = if let Some(vtl2_vmbus) = &config.vtl2_vmbus {
             let path = vtl2_vmbus.vsock_path.as_ref().unwrap();
-            let path = format!("{path}_{PIPETTE_VSOCK_PORT}");
+            let path = format!("{path}_{PIPETTE_PORT}");
             Some(PolledSocket::new(
                 driver,
                 UnixListener::bind(path).context("failed to bind to vtl2 pipette listener")?,
@@ -687,6 +689,7 @@ impl PetriVmConfigOpenVmm {
                 pipette_listener,
                 vtl2_pipette_listener,
                 linux_direct_serial_agent,
+                tcp_pipette_port: None,
                 driver: driver.clone(),
                 output_dir: log_source.output_dir().to_owned(),
                 openvmm_path: openvmm_path.clone(),
@@ -882,6 +885,7 @@ impl PetriVmConfigSetupCore<'_> {
                             default_boot_always_attempt,
                             enable_vpci_boot,
                             efi_diagnostics_log_level: _, // applied to top-level Config below
+                            efi_diagnostics_rate_limit: _, // applied to top-level Config below
                         },
                 },
             ) => {
@@ -970,6 +974,23 @@ impl PetriVmConfigSetupCore<'_> {
                     }
                 }
 
+                // Plumb the EFI diagnostics rate-limit override to the
+                // OpenHCL-side UEFI device via env var.
+                if let Firmware::OpenhclUefi {
+                    uefi_config:
+                        UefiConfig {
+                            efi_diagnostics_rate_limit: Some(limit),
+                            ..
+                        },
+                    ..
+                } = self.firmware
+                {
+                    append_cmdline(
+                        &mut cmdline,
+                        format!("HCL_EFI_DIAGNOSTICS_RATE_LIMIT={limit}"),
+                    );
+                }
+
                 let vtl2_base_address = vtl2_base_address_type.unwrap_or_else(|| {
                     if isolated {
                         // Isolated VMs must load at the location specified by
@@ -1043,6 +1064,7 @@ impl PetriVmConfigSetupCore<'_> {
                 default_boot_always_attempt,
                 enable_vpci_boot,
                 efi_diagnostics_log_level,
+                efi_diagnostics_rate_limit: _, // applied device-side via UefiManifest::new
             },
             OpenHclConfig { vmbus_redirect, .. },
         ) = match self.firmware {
@@ -1372,6 +1394,7 @@ async fn vmbus_storage_controllers_to_openvmm(
                         requests: None,
                     }
                     .into_resource(),
+                    vnode: None,
                 });
             }
             VmbusStorageType::VirtioBlk => {
@@ -1403,6 +1426,7 @@ async fn vmbus_storage_controllers_to_openvmm(
                             .into_resource(),
                         )
                         .into_resource(),
+                        vnode: None,
                     });
                 }
             }

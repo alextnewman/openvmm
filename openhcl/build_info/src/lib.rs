@@ -193,7 +193,13 @@ pub static OPENHCL_VERSION: OpenHclVersion = OpenHclVersion::new();
 // UNSAFETY: link_section and export_name are unsafe.
 #[expect(unsafe_code)]
 // SAFETY: The build_info section is custom and carries no safety requirements.
-#[unsafe(link_section = ".build_info")]
+// The bare ".build_info" name is only valid for ELF/COFF; Mach-O (Apple) rejects
+// it because it requires a "segment,section" specifier. The section exists only
+// to make build info discoverable in the shipping (ELF) OpenHCL binaries, so it
+// is omitted on Apple targets, which are built solely to run unit tests on dev
+// hosts. The static remains reachable via `get()`, and the shipping layout on
+// ELF/COFF is unchanged.
+#[cfg_attr(not(target_vendor = "apple"), unsafe(link_section = ".build_info"))]
 // SAFETY: The name "BUILD_INFO" is only declared here in OpenHCL and shouldn't
 // collide with any other symbols. It is a special symbol intended for
 // post-mortem debugging, and no runtime functionality should depend on it.

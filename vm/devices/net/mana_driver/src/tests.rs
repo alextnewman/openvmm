@@ -18,7 +18,15 @@ use gdma_defs::GdmaQueueType;
 use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
+use net_backend::Endpoint;
+use net_backend::MultiQueueSupport;
+use net_backend::Queue;
+use net_backend::QueueConfig;
+use net_backend::RssConfig;
 use net_backend::null::NullEndpoint;
+use async_trait::async_trait;
+use inspect::InspectMut;
+use parking_lot::Mutex;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
 use pci_core::bus_range::AssignedBusRange;
@@ -690,7 +698,7 @@ async fn test_gdma_reset_request_with_revoke(driver: DefaultDriver) {
     clippy::await_holding_lock,
     reason = "the test executor is single-threaded and GdmaDevice::reset does not re-enter the device lock"
 )]
-async fn reset_emulated_gdma(device: &Arc<parking_lot::Mutex<gdma::GdmaDevice>>) {
+async fn reset_emulated_gdma(device: &Arc<Mutex<gdma::GdmaDevice>>) {
     device.lock().reset().await;
 }
 
@@ -900,4 +908,256 @@ async fn test_gdma_query_stats(driver: DefaultDriver) {
     assert_eq!(stats.reported_statistics, STATISTICS_FLAGS_ALL);
     assert_eq!(stats.hc_in_octets, 0);
     assert_eq!(stats.hc_out_octets, 0);
+}
+
+/// A backend endpoint that records the RSS indirection table the device plumbs
+/// to it on every `get_queues` call, so a test can prove the device re-resolved
+/// and re-applied steering. Datapath behavior is delegated to a `NullEndpoint`.
+struct RecordingEndpoint {
+    tables: Arc<Mutex<Vec<Vec<u16>>>>,
+    inner: NullEndpoint,
+}
+
+impl RecordingEndpoint {
+    fn new(tables: Arc<Mutex<Vec<Vec<u16>>>>) -> Self {
+        Self {
+            tables,
+            inner: NullEndpoint::new(),
+        }
+    }
+}
+
+impl InspectMut for RecordingEndpoint {
+    fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+        self.inner.inspect_mut(req);
+    }
+}
+
+#[async_trait]
+impl Endpoint for RecordingEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "resteer-recording"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        self.tables.lock().push(
+            rss.map(|r| r.indirection_table.to_vec())
+                .unwrap_or_default(),
+        );
+        self.inner.get_queues(config, rss, queues).await
+    }
+
+    async fn stop(&mut self) {
+        self.inner.stop().await;
+    }
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 16,
+            indirection_table_size: 128,
+        }
+    }
+}
+
+/// The Linux driver reconfigures RSS on a *live* vport (ethtool -X /
+/// `mana_config_rss` -> `mana_cfg_vport_steering`): it re-sends
+/// `MANA_CONFIG_VPORT_RX` with `rx_enable` re-asserted TRUE and `update_indir_tab`
+/// set, pushing a new indirection table without bringing the receive path down.
+/// The device must re-resolve the new handle-based table and re-plumb it to the
+/// backend; before this it only acted on rx_enable transitions, so a steering
+/// update on an already-running vport fell through and was silently ignored (the
+/// device acked success but the steering never changed). This creates four
+/// receive queues, steers with one table, then live-re-steers with the reversed
+/// table and asserts the backend saw both resolved tables in order.
+#[async_test]
+async fn test_gdma_live_rss_resteer(driver: DefaultDriver) {
+    const NUM_QUEUES: usize = 4;
+
+    let recorded = Arc::new(Mutex::new(Vec::<Vec<u16>>::new()));
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_live_rss_resteer");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(RecordingEndpoint::new(recorded.clone())),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let port_config = bnic.query_vport_config(0).await.unwrap();
+    let vport = port_config.vport;
+
+    let buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer((NUM_QUEUES * 4 + 1) * PAGE_SIZE)
+            .unwrap(),
+    );
+    let mut arena = ResourceArena::new();
+    let eq_gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+    let (eq_id, _) = gdma
+        .create_eq(
+            &mut arena,
+            dev_id,
+            eq_gdma_region,
+            PAGE_SIZE as u32,
+            device_props.pdid,
+            device_props.db_id,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // Create NUM_QUEUES receive objects (collecting their handles for the
+    // indirection table) and NUM_QUEUES transmit objects, so the device builds
+    // one datapath task per queue pair.
+    let mut rx_handles = Vec::new();
+    for i in 0..NUM_QUEUES {
+        let wq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let cq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((2 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+        let resp = bnic
+            .create_wq_obj(
+                &mut arena,
+                vport,
+                GdmaQueueType::GDMA_RQ,
+                &WqConfig {
+                    wq_gdma_region: wq_region,
+                    cq_gdma_region: cq_region,
+                    wq_size: PAGE_SIZE as u32,
+                    cq_size: PAGE_SIZE as u32,
+                    cq_moderation_ctx_id: 0,
+                    eq_id,
+                },
+            )
+            .await
+            .unwrap();
+        rx_handles.push(resp.wq_obj);
+    }
+    let sq_base = NUM_QUEUES * 2 + 1;
+    for i in 0..NUM_QUEUES {
+        let wq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((sq_base + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let cq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((sq_base + 1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+        bnic.create_wq_obj(
+            &mut arena,
+            vport,
+            GdmaQueueType::GDMA_SQ,
+            &WqConfig {
+                wq_gdma_region: wq_region,
+                cq_gdma_region: cq_region,
+                wq_size: PAGE_SIZE as u32,
+                cq_size: PAGE_SIZE as u32,
+                cq_moderation_ctx_id: 0,
+                eq_id,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Enable the receive path with an identity-order indirection table, then
+    // re-steer the *running* vport with the reversed table. The device resolves
+    // each work-queue object handle to its receive queue index before handing
+    // the table to the backend, so the backend should observe [0,1,2,3] then
+    // [3,2,1,0].
+    let table_a: Vec<u64> = rx_handles.clone();
+    let table_b: Vec<u64> = rx_handles.iter().rev().copied().collect();
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    bnic.config_vport_rx(
+        vport,
+        &RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(true),
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: Some(&table_a),
+        },
+    )
+    .await
+    .unwrap();
+    bnic.config_vport_rx(
+        vport,
+        &RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(true),
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: Some(&table_b),
+        },
+    )
+    .await
+    .unwrap();
+
+    let resolved = recorded.lock().clone();
+    assert_eq!(
+        resolved,
+        vec![vec![0u16, 1, 2, 3], vec![3u16, 2, 1, 0]],
+        "live RSS re-steer must re-resolve the indirection table and re-plumb it \
+         to the backend (a missing second entry means the update was dropped)"
+    );
+
+    arena.destroy(&mut gdma).await;
 }

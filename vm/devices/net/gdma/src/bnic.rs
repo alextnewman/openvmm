@@ -252,6 +252,101 @@ impl Vport {
     }
 }
 
+/// Builds and starts one datapath task per queue pair for `vport`, resolving the
+/// RSS indirection table (if present in the request payload) and plumbing the
+/// resolved table + hash key down to the backend, which owns steering.
+///
+/// The receive path must be stopped (`tasks` empty) before calling: the initial
+/// `rx_enable=TRUE` transition arrives that way, and a live re-steer must
+/// `stop_datapath()` first so the backend queues are released before they are
+/// re-acquired via `get_queues`.
+async fn start_vport_datapath(
+    vport: &mut Vport,
+    state: &mut HwState,
+    req: &ManaCfgRxSteerReq,
+    read: &mut Limit<WqeAccess<'_>>,
+) -> anyhow::Result<()> {
+    let n = vport.queue_cfg.tx.len().min(vport.queue_cfg.rx.len());
+    if n == 0 {
+        anyhow::bail!("queues not configured");
+    }
+
+    // When an indirection table is supplied it follows the request header in the
+    // payload as `num_indir_entries` 64-bit work-queue object handles. Translate
+    // each handle into the index of the receive queue it names. Steering itself
+    // is performed by the backend (modeling the PF / physical wire), so the
+    // device only has to plumb the resolved table and hash key down to it.
+    let rss = if req.update_indir_tab != 0 && req.num_indir_entries > 0 {
+        let mut table = Vec::with_capacity(req.num_indir_entries as usize);
+        for _ in 0..req.num_indir_entries {
+            let handle: u64 = read
+                .read_plain()
+                .context("reading rss indirection entry")?;
+            let idx = vport
+                .queue_cfg
+                .rx
+                .iter()
+                .position(|w| w.wq_obj == handle)
+                .context("indirection table references unknown rx queue")?;
+            table.push(idx as u16);
+        }
+        Some((req.hashkey, table))
+    } else {
+        None
+    };
+
+    let configs = (0..n)
+        .map(|_| QueueConfig {
+            driver: Box::new(state.queues.driver.clone()),
+        })
+        .collect();
+
+    let rss_cfg = rss.as_ref().map(|(key, table)| RssConfig {
+        key: key.as_slice(),
+        indirection_table: table.as_slice(),
+        flags: 0,
+    });
+
+    let mut queues = vec![];
+    vport
+        .endpoint
+        .get_queues(configs, rss_cfg.as_ref(), &mut queues)
+        .await?;
+    anyhow::ensure!(
+        queues.len() == n,
+        "backend returned {} queues, expected {n}",
+        queues.len()
+    );
+
+    for (k, epqueue) in queues.into_iter().enumerate() {
+        let (sq_id, sq_cq_id) = (vport.queue_cfg.tx[k].wq_id, vport.queue_cfg.tx[k].cq_id);
+        let (rq_id, rq_cq_id) = (vport.queue_cfg.rx[k].wq_id, vport.queue_cfg.rx[k].cq_id);
+
+        let mut task = TaskControl::new(TxRxState);
+        task.insert(
+            &state.queues.driver,
+            "gdma-bnic",
+            TxRxTask {
+                queues: state.queues.clone(),
+                epqueue,
+                pool: GuestBuffers {
+                    gm: state.queues.gm.clone(),
+                    rx_packets: Default::default(),
+                },
+                sq_id,
+                sq_cq_id,
+                rq_id,
+                rq_cq_id,
+                tx_segment_buffer: Vec::new(),
+                rx_buf_count: 0,
+            },
+        );
+        task.start();
+        vport.tasks.push(task);
+    }
+    Ok(())
+}
+
 /// A work-queue object created via `MANA_CREATE_WQ_OBJ`: an associated
 /// work queue and completion queue, addressed by the opaque `wq_obj` handle
 /// returned to the guest.
@@ -504,92 +599,28 @@ impl BasicNic {
                         vport.stop_datapath().await;
                     }
                     Tristate::TRUE if vport.tasks.is_empty() => {
-                        let n = vport.queue_cfg.tx.len().min(vport.queue_cfg.rx.len());
-                        if n == 0 {
-                            anyhow::bail!("queues not configured");
-                        }
-
-                        // When RSS is enabled the indirection table follows the
-                        // request header in the payload as `num_indir_entries`
-                        // 64-bit work-queue object handles. Translate each handle
-                        // into the index of the receive queue it names. Steering
-                        // itself is performed by the backend (modeling the PF /
-                        // physical wire), so the device only has to plumb the
-                        // resolved table and hash key down to it.
-                        let rss = if matches!(req.rss_enable, Tristate::TRUE)
-                            && req.num_indir_entries > 0
+                        start_vport_datapath(vport, state, &req, &mut read).await?;
+                    }
+                    _ => {
+                        // Live RSS reconfiguration on an already-running vport.
+                        // The real driver (ethtool -X / `mana_config_rss` ->
+                        // `mana_cfg_vport_steering`) re-asserts `rx_enable=TRUE`
+                        // and sets `update_indir_tab` / `update_hashkey` to push
+                        // a new indirection table or hash key WITHOUT bringing
+                        // the vport down (it fences each RQ around the change).
+                        // Steering is backend-owned and its only (re)config entry
+                        // point is `get_queues`, so re-apply by briefly cycling
+                        // the datapath: drop the tasks (releasing the backend
+                        // queues) and rebuild them with the new table/key. Without
+                        // this the update falls through and is silently ignored --
+                        // the device acks success but the steering never changes.
+                        if !vport.tasks.is_empty()
+                            && (req.update_indir_tab != 0 || req.update_hashkey != 0)
                         {
-                            let mut table = Vec::with_capacity(req.num_indir_entries as usize);
-                            for _ in 0..req.num_indir_entries {
-                                let handle: u64 = read
-                                    .read_plain()
-                                    .context("reading rss indirection entry")?;
-                                let idx = vport
-                                    .queue_cfg
-                                    .rx
-                                    .iter()
-                                    .position(|w| w.wq_obj == handle)
-                                    .context("indirection table references unknown rx queue")?;
-                                table.push(idx as u16);
-                            }
-                            Some((req.hashkey, table))
-                        } else {
-                            None
-                        };
-
-                        let configs = (0..n)
-                            .map(|_| QueueConfig {
-                                driver: Box::new(state.queues.driver.clone()),
-                            })
-                            .collect();
-
-                        let rss_cfg = rss.as_ref().map(|(key, table)| RssConfig {
-                            key: key.as_slice(),
-                            indirection_table: table.as_slice(),
-                            flags: 0,
-                        });
-
-                        let mut queues = vec![];
-                        vport
-                            .endpoint
-                            .get_queues(configs, rss_cfg.as_ref(), &mut queues)
-                            .await?;
-                        anyhow::ensure!(
-                            queues.len() == n,
-                            "backend returned {} queues, expected {n}",
-                            queues.len()
-                        );
-
-                        for (k, epqueue) in queues.into_iter().enumerate() {
-                            let (sq_id, sq_cq_id) =
-                                (vport.queue_cfg.tx[k].wq_id, vport.queue_cfg.tx[k].cq_id);
-                            let (rq_id, rq_cq_id) =
-                                (vport.queue_cfg.rx[k].wq_id, vport.queue_cfg.rx[k].cq_id);
-
-                            let mut task = TaskControl::new(TxRxState);
-                            task.insert(
-                                &state.queues.driver,
-                                "gdma-bnic",
-                                TxRxTask {
-                                    queues: state.queues.clone(),
-                                    epqueue,
-                                    pool: GuestBuffers {
-                                        gm: state.queues.gm.clone(),
-                                        rx_packets: Default::default(),
-                                    },
-                                    sq_id,
-                                    sq_cq_id,
-                                    rq_id,
-                                    rq_cq_id,
-                                    tx_segment_buffer: Vec::new(),
-                                    rx_buf_count: 0,
-                                },
-                            );
-                            task.start();
-                            vport.tasks.push(task);
+                            vport.stop_datapath().await;
+                            start_vport_datapath(vport, state, &req, &mut read).await?;
                         }
                     }
-                    _ => {}
                 }
             }
             ManaCommandCode::MANA_VTL2_MOVE_FILTER => {

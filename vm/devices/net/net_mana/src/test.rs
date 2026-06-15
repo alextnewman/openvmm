@@ -7,26 +7,39 @@ use crate::GuestDmaMode;
 use crate::ManaEndpoint;
 use crate::ManaTestConfiguration;
 use crate::QueueStats;
+use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
+use inspect::InspectMut;
 use inspect_counters::Counter;
 use mana_driver::mana::ManaDevice;
 use mesh::CancelContext;
 use mesh::CancelReason;
 use net_backend::BufferAccess;
 use net_backend::Endpoint;
+use net_backend::MultiQueueSupport;
+use net_backend::Queue;
 use net_backend::QueueConfig;
+use net_backend::RssConfig;
 use net_backend::RxId;
 use net_backend::TxId;
 use net_backend::TxSegment;
 use net_backend::VlanMetadata;
+use net_backend::linearize;
 use net_backend::loopback::LoopbackEndpoint;
+use net_backend::next_packet;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
+use parking_lot::Mutex;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::MsiConnection;
+use std::collections::VecDeque;
 use std::future::poll_fn;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use test_with_tracing::test;
 use user_driver_emulated_mock::DeviceTestMemory;
@@ -1436,4 +1449,333 @@ async fn test_vlan_mixed_batch(driver: DefaultDriver) {
             .drop_eligible_indicator(),
         false
     );
+}
+
+/// Per-queue state inside the [`SteeringSwitch`].
+#[derive(Default)]
+struct SteeringQueueState {
+    /// Receive buffers the device has made available on this queue.
+    rx_avail: VecDeque<RxId>,
+    /// Packets steered to this queue, waiting for a receive buffer.
+    pending: VecDeque<(Vec<u8>, Option<VlanMetadata>)>,
+    /// Waker for the datapath task servicing this queue.
+    waker: Option<Waker>,
+}
+
+/// Shared state for the [`SteeringEndpoint`] test backend.
+///
+/// Models the PF / physical wire: it owns the resolved RSS indirection table
+/// and steers each transmitted frame onto a receive queue accordingly.
+struct SteeringSwitch {
+    /// Indirection table as resolved by the device: bucket -> receive queue
+    /// index. Recorded from the [`RssConfig`] handed to `get_queues`.
+    indir: Vec<u16>,
+    queues: Vec<SteeringQueueState>,
+}
+
+/// A test backend that steers transmitted frames to a receive queue chosen by
+/// the RSS indirection table, using the first packet byte as the hash bucket.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SteeringEndpoint {
+    switch: Arc<Mutex<SteeringSwitch>>,
+}
+
+impl SteeringEndpoint {
+    fn new(switch: Arc<Mutex<SteeringSwitch>>) -> Self {
+        Self { switch }
+    }
+}
+
+#[async_trait]
+impl Endpoint for SteeringEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "steering-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut switch = self.switch.lock();
+            switch.indir = rss
+                .map(|r| r.indirection_table.to_vec())
+                .unwrap_or_default();
+            switch.queues.clear();
+            switch.queues.resize_with(config.len(), Default::default);
+        }
+        for index in 0..config.len() {
+            queues.push(Box::new(SteeringQueue {
+                switch: self.switch.clone(),
+                index,
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 8,
+            indirection_table_size: 128,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SteeringQueue {
+    switch: Arc<Mutex<SteeringSwitch>>,
+    index: usize,
+}
+
+impl Queue for SteeringQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        let mut switch = self.switch.lock();
+        let q = &mut switch.queues[self.index];
+        if !q.pending.is_empty() && !q.rx_avail.is_empty() {
+            Poll::Ready(())
+        } else {
+            q.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        let mut switch = self.switch.lock();
+        switch.queues[self.index]
+            .rx_avail
+            .extend(done.iter().copied());
+    }
+
+    fn rx_poll(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let mut switch = self.switch.lock();
+        let mut n = 0;
+        while n < packets.len() {
+            let q = &mut switch.queues[self.index];
+            if q.pending.is_empty() || q.rx_avail.is_empty() {
+                break;
+            }
+            let rx_id = q.rx_avail.pop_front().unwrap();
+            let (data, vlan) = q.pending.pop_front().unwrap();
+            pool.write_packet(
+                rx_id,
+                &net_backend::RxMetadata {
+                    offset: 0,
+                    len: data.len(),
+                    vlan,
+                    ..Default::default()
+                },
+                &data,
+            );
+            packets[n] = rx_id;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        mut segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let mut sent = 0;
+        while !segments.is_empty() {
+            let (meta, _, _) = next_packet(segments);
+            let vlan = meta.vlan;
+            let before = segments.len();
+            let data = linearize(pool, &mut segments)?;
+            sent += before - segments.len();
+
+            let mut switch = self.switch.lock();
+            // Use the first packet byte as the hash bucket so tests can steer
+            // deterministically. With no indirection table, fall back to the
+            // transmitting queue (loopback).
+            let target = if switch.indir.is_empty() {
+                self.index
+            } else {
+                let bucket = data.first().copied().unwrap_or(0) as usize;
+                switch.indir[bucket % switch.indir.len()] as usize
+            };
+            let q = &mut switch.queues[target];
+            q.pending.push_back((data, vlan));
+            if let Some(waker) = q.waker.take() {
+                waker.wake();
+            }
+        }
+        Ok((true, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        Ok(0)
+    }
+}
+
+/// Drives every queue until a single steered receive lands, returning the index
+/// of the queue that received it. Panics on timeout.
+async fn poll_for_steered_rx(
+    queues: &mut [Box<dyn Queue>],
+    pool: &mut net_backend::tests::Bufs,
+) -> usize {
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| {
+                let mut ready = Poll::Pending;
+                for q in queues.iter_mut() {
+                    if q.poll_ready(cx, &mut *pool).is_ready() {
+                        ready = Poll::Ready(());
+                    }
+                }
+                ready
+            }))
+            .await
+            .is_err()
+        {
+            panic!("timed out waiting for steered receive");
+        }
+
+        for q in queues.iter_mut() {
+            let mut tx_done = [TxId(0); 4];
+            let _ = q.tx_poll(&mut *pool, &mut tx_done);
+        }
+
+        for (k, q) in queues.iter_mut().enumerate() {
+            let mut rx = [RxId(0)];
+            if q.rx_poll(&mut *pool, &mut rx).unwrap() > 0 {
+                return k;
+            }
+        }
+    }
+}
+
+/// Verifies that the device advertises multiple receive queues, translates the
+/// guest's RSS indirection table (work-queue object handles) back into receive
+/// queue indices, and steers each frame to the queue named by the table.
+#[async_test]
+async fn test_rss_steering_distributes_across_queues(driver: DefaultDriver) {
+    const NUM_QUEUES: usize = 4;
+    // Non-identity table so a mistranslation (e.g. identity) is caught:
+    // bucket b is steered to queue INDIR[b].
+    const INDIR: [u16; NUM_QUEUES] = [3, 2, 1, 0];
+
+    let pages = 256; // 1MB
+    let mem = DeviceTestMemory::new(pages * 2, true, "test_rss_steering");
+    let payload_mem = mem.payload_mem();
+
+    let switch = Arc::new(Mutex::new(SteeringSwitch {
+        indir: Vec::new(),
+        queues: Vec::new(),
+    }));
+
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(SteeringEndpoint::new(switch.clone())),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, NUM_QUEUES as u16, None)
+        .await
+        .unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+
+    let mut queues = Vec::new();
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+    let key = [0u8; 40];
+    endpoint
+        .get_queues(
+            (0..NUM_QUEUES)
+                .map(|_| QueueConfig {
+                    driver: Box::new(driver.clone()),
+                })
+                .collect(),
+            Some(&RssConfig {
+                key: &key,
+                indirection_table: &INDIR,
+                flags: 0,
+            }),
+            &mut queues,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queues.len(), NUM_QUEUES);
+
+    // The device must resolve the guest's handle-based indirection table back
+    // into receive queue indices before handing it to the backend.
+    assert_eq!(switch.lock().indir, INDIR.to_vec());
+
+    // Give each queue a disjoint range of receive buffer ids so the buffer that
+    // receives a frame identifies the queue it landed on. `Bufs` maps id ->
+    // payload offset id*2048; offset 0 is reserved as transmit scratch.
+    const BUFS_PER_QUEUE: u32 = 8;
+    for (q, queue) in queues.iter_mut().enumerate() {
+        let base = q as u32 * BUFS_PER_QUEUE + 1;
+        let ids: Vec<RxId> = (base..base + BUFS_PER_QUEUE).map(RxId).collect();
+        queue.rx_avail(&mut pool, &ids);
+    }
+
+    // For each bucket, transmit a one-segment frame whose first byte selects the
+    // bucket, always from queue 0, and confirm the device steers it onto the
+    // queue named by the indirection table.
+    for (bucket, &target_queue) in INDIR.iter().enumerate() {
+        let mut packet = vec![0u8; 64];
+        packet[0] = bucket as u8;
+        payload_mem.write_at(0, &packet).unwrap();
+
+        let seg = TxSegment {
+            ty: net_backend::TxSegmentType::Head(net_backend::TxMetadata {
+                id: TxId(1),
+                segment_count: 1,
+                len: packet.len() as u32,
+                ..Default::default()
+            }),
+            gpa: 0,
+            len: packet.len() as u32,
+        };
+        queues[0].tx_avail(&mut pool, &[seg]).unwrap();
+
+        let received_on = poll_for_steered_rx(&mut queues, &mut pool).await;
+        assert_eq!(
+            received_on, target_queue as usize,
+            "bucket {bucket} should steer to queue {target_queue}",
+        );
+    }
+
+    drop(queues);
+    endpoint.stop().await;
 }

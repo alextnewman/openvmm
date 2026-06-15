@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use self::bnic_defs::CQE_RX_OBJECT_FENCE;
 use self::bnic_defs::CQE_RX_TRUNCATED;
 use self::bnic_defs::CQE_TX_GDMA_ERR;
 use self::bnic_defs::CQE_TX_OKAY;
@@ -37,6 +38,7 @@ use gdma_defs::Wqe;
 use gdma_defs::access::WqeAccess;
 use gdma_defs::bnic as bnic_defs;
 use gdma_defs::bnic::ManaDestroyWqobjReq;
+use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::ManaTxShortOob;
 use gdma_defs::bnic::Tristate;
 use guestmem::GuestMemory;
@@ -454,6 +456,39 @@ impl BasicNic {
                 let wq = removed.context("specified queue does not exist")?;
                 state.queues.free_wq(is_send, wq.wq_id).unwrap();
                 state.queues.free_cq(wq.cq_id).unwrap();
+            }
+            ManaCommandCode::MANA_FENCE_RQ => {
+                let req: ManaFenceRqReq = read
+                    .read_plain()
+                    .context("failed to read fence rq request")?;
+
+                // The driver fences a receive queue (on RSS reconfiguration and
+                // on vport teardown) by sending this command and then blocking
+                // until a fence completion lands on the queue's CQ. Locate the
+                // receive object by its handle and post a CQE_RX_OBJECT_FENCE so
+                // the driver's fence_event completes instead of timing out.
+                let (cq_id, wq_id) = self
+                    .vports
+                    .iter()
+                    .find_map(|vport| {
+                        vport
+                            .queue_cfg
+                            .rx
+                            .iter()
+                            .find(|w| w.wq_obj == req.wq_obj_handle)
+                            .map(|w| (w.cq_id, w.wq_id))
+                    })
+                    .context("specified rq does not exist")?;
+
+                let fence = ManaRxcompOob {
+                    cqe_hdr: ManaCqeHeader::new()
+                        .with_cqe_type(CQE_RX_OBJECT_FENCE)
+                        .with_client_type(MANA_CQE_COMPLETION),
+                    ..FromZeros::new_zeroed()
+                };
+                state
+                    .queues
+                    .post_cq(cq_id, fence.as_bytes(), wq_id, false);
             }
             ManaCommandCode::MANA_CONFIG_VPORT_RX => {
                 let req: ManaCfgRxSteerReq = read

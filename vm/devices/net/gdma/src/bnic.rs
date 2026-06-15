@@ -8,6 +8,8 @@ use self::bnic_defs::MANA_CQE_COMPLETION;
 use self::bnic_defs::MANA_LONG_PKT_FMT;
 use self::bnic_defs::ManaCommandCode;
 use self::bnic_defs::ManaCqeHeader;
+use self::bnic_defs::ManaQueryStatisticsRequest;
+use self::bnic_defs::ManaQueryStatisticsResponse;
 use self::bnic_defs::ManaQueryVportCfgReq;
 use self::bnic_defs::ManaRxcompOob;
 use self::bnic_defs::ManaRxcompOobFlags;
@@ -487,6 +489,24 @@ impl BasicNic {
                 };
 
                 write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_QUERY_STATS => {
+                let req: ManaQueryStatisticsRequest = read
+                    .read_plain()
+                    .context("reading query stats request")?;
+
+                // The emulated datapath keeps no traffic counters yet, so report
+                // the requested statistics as available with zeroed values. The
+                // driver only requires a successful response whose
+                // `reported_statistics` mask covers what it asked for.
+                let resp = ManaQueryStatisticsResponse {
+                    reported_statistics: req.requested_statistics,
+                    ..FromZeros::new_zeroed()
+                };
+
+                let resp_bytes = resp.as_bytes();
+                let write_len = guest_resp_size.min(resp_bytes.len());
+                write.write(&resp_bytes[..write_len])?;
             }
             ManaCommandCode::MANA_VTL2_ASSIGN_SERIAL_NUMBER => {
                 let req: ManaSetVportSerialNo =

@@ -245,6 +245,22 @@ impl BasicNic {
         Self { vports, config }
     }
 
+    /// Tears down every vport's datapath, returning the NIC to its initial
+    /// state. This mirrors the teardown performed when a vport's receive path
+    /// is disabled, but applies to all vports unconditionally so the device can
+    /// be reset even when the guest never disabled them.
+    pub async fn shutdown(&mut self) {
+        for vport in &mut self.vports {
+            if vport.task.is_running() {
+                vport.task.stop().await;
+                vport.task.remove();
+                vport.endpoint.stop().await;
+            }
+            vport.queue_cfg = QueueCfg { tx: None, rx: None };
+            vport.serial_no = 0;
+        }
+    }
+
     pub async fn handle_req(
         &mut self,
         state: &mut HwState,

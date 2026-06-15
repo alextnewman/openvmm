@@ -271,17 +271,30 @@ async fn start_vport_datapath(
         anyhow::bail!("queues not configured");
     }
 
-    // When an indirection table is supplied it follows the request header in the
-    // payload as `num_indir_entries` 64-bit work-queue object handles. Translate
-    // each handle into the index of the receive queue it names. Steering itself
-    // is performed by the backend (modeling the PF / physical wire), so the
-    // device only has to plumb the resolved table and hash key down to it.
+    // When an indirection table is supplied it is located at `indir_tab_offset`
+    // bytes from the start of the GDMA request (including the request header) --
+    // NOT necessarily immediately after the fixed request struct. The V2
+    // steering request the Linux driver sends (GDMA_MESSAGE_V2) inserts
+    // `cqe_coalescing_enable` plus reserved padding between the fixed fields and
+    // the table, so the table starts 8 bytes later than the V1 layout. Honor the
+    // declared offset rather than assuming the table is contiguous with the
+    // struct; otherwise the device reads the table 8 bytes early and every
+    // handle fails to resolve ("unknown rx queue"), which the real driver
+    // surfaces as `mana_open` failing to configure the RSS table. Each entry is a
+    // 64-bit work-queue object handle; translate it into the index of the receive
+    // queue it names. Steering itself is performed by the backend (modeling the
+    // PF / physical wire), so the device only has to plumb the resolved table and
+    // hash key down to it.
     let rss = if req.update_indir_tab != 0 && req.num_indir_entries > 0 {
+        let consumed = size_of::<GdmaReqHdr>() + size_of::<ManaCfgRxSteerReq>();
+        let skip = (req.indir_tab_offset as usize)
+            .checked_sub(consumed)
+            .context("indirection table offset overlaps fixed request fields")?;
+        read.skip(skip).context("seeking to indirection table")?;
+
         let mut table = Vec::with_capacity(req.num_indir_entries as usize);
         for _ in 0..req.num_indir_entries {
-            let handle: u64 = read
-                .read_plain()
-                .context("reading rss indirection entry")?;
+            let handle: u64 = read.read_plain().context("reading rss indirection entry")?;
             let idx = vport
                 .queue_cfg
                 .rx

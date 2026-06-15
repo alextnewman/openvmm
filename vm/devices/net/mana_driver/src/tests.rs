@@ -552,3 +552,62 @@ async fn test_gdma_reset_allows_reestablish(driver: DefaultDriver) {
         .unwrap();
     gdma.test_eq().await.unwrap();
 }
+
+/// The driver allocates DMA regions for queue memory and, when a region is not
+/// consumed by a queue, tears it down with `GDMA_DESTROY_DMA_REGION`. The device
+/// must service that command (acknowledge it and forget the region) rather than
+/// rejecting it; otherwise the driver logs a teardown error on every such
+/// region. This exercises the create-then-destroy round trip end to end.
+#[async_test]
+async fn test_gdma_destroy_dma_region(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_destroy_dma_region");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let region_buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(PAGE_SIZE)
+            .unwrap(),
+    );
+    let mut arena = ResourceArena::new();
+    let gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, region_buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+
+    // The device must accept the teardown of a region it created.
+    gdma.destroy_dma_region(dev_id, gdma_region).await.unwrap();
+
+    // The region is now owned by neither side; tell the arena so it does not
+    // attempt to destroy it again, then drop its remaining (host) resources.
+    arena.take_dma_region(gdma_region);
+    arena.destroy(&mut gdma).await;
+}

@@ -13,6 +13,7 @@ use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaQueueType;
+use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
 use net_backend::null::NullEndpoint;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
@@ -610,4 +611,50 @@ async fn test_gdma_destroy_dma_region(driver: DefaultDriver) {
     // attempt to destroy it again, then drop its remaining (host) resources.
     arena.take_dma_region(gdma_region);
     arena.destroy(&mut gdma).await;
+}
+
+/// `ethtool -S` drives `MANA_QUERY_STATS`; the device must service it and return
+/// a response whose `reported_statistics` mask covers what the driver requested.
+/// Before this was handled the command was rejected and stats reporting failed.
+#[async_test]
+async fn test_gdma_query_stats(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_stats");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let stats = bnic.query_stats(STATISTICS_FLAGS_ALL).await.unwrap();
+
+    // The device reported every statistic the driver asked for. The emulated
+    // datapath has seen no traffic, so the counters themselves are zero.
+    assert_eq!(stats.reported_statistics, STATISTICS_FLAGS_ALL);
+    assert_eq!(stats.hc_in_octets, 0);
+    assert_eq!(stats.hc_out_octets, 0);
 }

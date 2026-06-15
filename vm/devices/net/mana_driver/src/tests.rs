@@ -24,6 +24,7 @@ use user_driver::DeviceBacking;
 use user_driver::memory::PAGE_SIZE;
 use user_driver_emulated_mock::DeviceTestMemory;
 use user_driver_emulated_mock::EmulatedDevice;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -437,4 +438,117 @@ async fn test_gdma_reset_request_with_revoke(driver: DefaultDriver) {
         Some(true),
         "reset_request_pending should remain revoke_vtl0_vf=true after deregister_device"
     );
+}
+
+/// Resets the emulated device through its [`ChangeDeviceState`] implementation,
+/// modelling the reset the host performs on a VM reset or function-level reset.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the test executor is single-threaded and GdmaDevice::reset does not re-enter the device lock"
+)]
+async fn reset_emulated_gdma(device: &Arc<parking_lot::Mutex<gdma::GdmaDevice>>) {
+    device.lock().reset().await;
+}
+
+/// Drops `gdma` without sending DESTROY_HWC, leaving the device's HW channel
+/// established. This models a guest that went away (for example an ungraceful
+/// reboot) without tearing the channel down. `save()` is used because it is the
+/// supported way to suppress the DESTROY_HWC that [`GdmaDriver`]'s `Drop`
+/// otherwise sends; the saved state is intentionally discarded. Dropping the
+/// driver afterwards releases its handle to the shared device so the test
+/// executor can still shut down.
+async fn abandon_channel<T: DeviceBacking>(mut gdma: GdmaDriver<T>) {
+    gdma.save()
+        .await
+        .expect("save suppresses DESTROY_HWC on drop");
+    drop(gdma);
+}
+
+/// Establishing the HW channel a second time without an intervening teardown
+/// must be rejected: the device reports that a channel is already active. This
+/// is the failure a guest hits after an ungraceful reboot when the device does
+/// not reset its state, and it is the precondition that
+/// [`test_gdma_reset_allows_reestablish`] shows the reset path clears.
+#[async_test]
+async fn test_gdma_reestablish_rejected_while_active(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_reestablish_rejected");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+    let device_again = device.clone();
+
+    let dma_client = device.dma_client();
+    let buffer0 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+    let buffer1 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let gdma = GdmaDriver::new(&driver, device, 1, Some(buffer0))
+        .await
+        .unwrap();
+
+    // The guest goes away without issuing DESTROY_HWC, leaving the channel
+    // established on the device.
+    abandon_channel(gdma).await;
+
+    let result = GdmaDriver::new(&driver, device_again, 1, Some(buffer1)).await;
+    assert!(
+        result.is_err(),
+        "re-establishing the HW channel should fail while one is still active"
+    );
+
+    // Reset tears down the still-active channel so the lingering HW channel task
+    // stops and the test executor can shut down cleanly.
+    reset_emulated_gdma(&device_inner).await;
+}
+
+/// After the device is reset (as the host does on VM reset / FLR), the guest can
+/// re-establish the HW channel even when the previous channel was never torn
+/// down gracefully.
+#[async_test]
+async fn test_gdma_reset_allows_reestablish(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_reset_reestablish");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+    let device_again = device.clone();
+
+    let dma_client = device.dma_client();
+    let buffer0 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+    let buffer1 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let gdma = GdmaDriver::new(&driver, device, 1, Some(buffer0))
+        .await
+        .unwrap();
+
+    // The guest goes away (e.g. an ungraceful reboot) without issuing
+    // DESTROY_HWC, leaving the channel established on the device.
+    abandon_channel(gdma).await;
+
+    // The host resets the device, tearing down the stale channel.
+    reset_emulated_gdma(&device_inner).await;
+
+    // The guest can now re-establish the channel cleanly.
+    let mut gdma = GdmaDriver::new(&driver, device_again, 1, Some(buffer1))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
 }

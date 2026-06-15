@@ -17,6 +17,7 @@ use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
 use gdma_defs::GdmaCreateQueueReq;
 use gdma_defs::GdmaCreateQueueResp;
+use gdma_defs::GdmaDestroyDmaRegionReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaDisableQueueReq;
@@ -440,6 +441,15 @@ impl HwControl {
                     .write(resp.as_bytes())
                     .context("writing dma region response")?;
                 size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DESTROY_DMA_REGION => {
+                let req: GdmaDestroyDmaRegionReq = read
+                    .read_plain()
+                    .context("reading destroy dma region request")?;
+                self.state
+                    .remove_dma_region(req.gdma_region)
+                    .context("destroying dma region")?;
+                0
             }
             GdmaRequestType::GDMA_CREATE_QUEUE => {
                 let req: GdmaCreateQueueReq = read.read_plain().context("reading queue request")?;

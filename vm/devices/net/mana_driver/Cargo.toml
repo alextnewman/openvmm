@@ -27,6 +27,7 @@ zerocopy.workspace = true
 safe_intrinsics.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 chipset_device.workspace = true
 gdma.workspace = true
 net_backend.workspace = true

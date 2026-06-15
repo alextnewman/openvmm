@@ -4261,6 +4261,7 @@ name = "mana_driver"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "build_info",
  "chipset_device",
  "futures",

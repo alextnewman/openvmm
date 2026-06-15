@@ -11,29 +11,35 @@ use crate::gdma_driver::GdmaDriver;
 use crate::mana::ResourceArena;
 use crate::queues::Cq;
 use crate::queues::DoorbellPage;
+use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
+use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaQueueType;
+use gdma_defs::GdmaReqHdr;
 use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
+use gdma_defs::bnic::ManaCfgRxSteerReq;
+use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
+use gdma_defs::bnic::Tristate;
+use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend::MultiQueueSupport;
 use net_backend::Queue;
 use net_backend::QueueConfig;
 use net_backend::RssConfig;
 use net_backend::null::NullEndpoint;
-use async_trait::async_trait;
-use inspect::InspectMut;
-use parking_lot::Mutex;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
+use parking_lot::Mutex;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::MsiConnection;
 use std::sync::Arc;
 use test_with_tracing::test;
 use user_driver::DeviceBacking;
+use user_driver::memory::MemoryBlock;
 use user_driver::memory::PAGE_SIZE;
 use user_driver_emulated_mock::DeviceTestMemory;
 use user_driver_emulated_mock::EmulatedDevice;
@@ -41,6 +47,9 @@ use vmcore::device_state::ChangeDeviceState;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 #[async_test]
 async fn test_gdma(driver: DefaultDriver) {
@@ -1045,78 +1054,10 @@ async fn test_gdma_live_rss_resteer(driver: DefaultDriver) {
     // Create NUM_QUEUES receive objects (collecting their handles for the
     // indirection table) and NUM_QUEUES transmit objects, so the device builds
     // one datapath task per queue pair.
-    let mut rx_handles = Vec::new();
-    for i in 0..NUM_QUEUES {
-        let wq_region = gdma
-            .create_dma_region(
-                &mut arena,
-                dev_id,
-                buffer.subblock((1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
-            )
-            .await
-            .unwrap();
-        let cq_region = gdma
-            .create_dma_region(
-                &mut arena,
-                dev_id,
-                buffer.subblock((2 + i * 2) * PAGE_SIZE, PAGE_SIZE),
-            )
-            .await
-            .unwrap();
-        let mut bnic = BnicDriver::new(&mut gdma, dev_id);
-        let resp = bnic
-            .create_wq_obj(
-                &mut arena,
-                vport,
-                GdmaQueueType::GDMA_RQ,
-                &WqConfig {
-                    wq_gdma_region: wq_region,
-                    cq_gdma_region: cq_region,
-                    wq_size: PAGE_SIZE as u32,
-                    cq_size: PAGE_SIZE as u32,
-                    cq_moderation_ctx_id: 0,
-                    eq_id,
-                },
-            )
-            .await
-            .unwrap();
-        rx_handles.push(resp.wq_obj);
-    }
-    let sq_base = NUM_QUEUES * 2 + 1;
-    for i in 0..NUM_QUEUES {
-        let wq_region = gdma
-            .create_dma_region(
-                &mut arena,
-                dev_id,
-                buffer.subblock((sq_base + i * 2) * PAGE_SIZE, PAGE_SIZE),
-            )
-            .await
-            .unwrap();
-        let cq_region = gdma
-            .create_dma_region(
-                &mut arena,
-                dev_id,
-                buffer.subblock((sq_base + 1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
-            )
-            .await
-            .unwrap();
-        let mut bnic = BnicDriver::new(&mut gdma, dev_id);
-        bnic.create_wq_obj(
-            &mut arena,
-            vport,
-            GdmaQueueType::GDMA_SQ,
-            &WqConfig {
-                wq_gdma_region: wq_region,
-                cq_gdma_region: cq_region,
-                wq_size: PAGE_SIZE as u32,
-                cq_size: PAGE_SIZE as u32,
-                cq_moderation_ctx_id: 0,
-                eq_id,
-            },
-        )
-        .await
-        .unwrap();
-    }
+    let rx_handles = create_steering_queues(
+        &mut gdma, dev_id, vport, eq_id, &mut arena, &buffer, NUM_QUEUES,
+    )
+    .await;
 
     // Enable the receive path with an identity-order indirection table, then
     // re-steer the *running* vport with the reversed table. The device resolves
@@ -1157,6 +1098,230 @@ async fn test_gdma_live_rss_resteer(driver: DefaultDriver) {
         vec![vec![0u16, 1, 2, 3], vec![3u16, 2, 1, 0]],
         "live RSS re-steer must re-resolve the indirection table and re-plumb it \
          to the backend (a missing second entry means the update was dropped)"
+    );
+
+    arena.destroy(&mut gdma).await;
+}
+
+/// Creates `num_queues` receive objects (returning their work-queue object
+/// handles in order) followed by `num_queues` transmit objects on `vport`, each
+/// backed by a one-page WQ + CQ carved out of `buffer` (page 0 is reserved for
+/// the caller's EQ, so `buffer` must be at least `num_queues * 4 + 1` pages). The
+/// device assigns every receive object a distinct handle, so an RSS indirection
+/// table can name individual queues.
+async fn create_steering_queues<T: DeviceBacking>(
+    gdma: &mut GdmaDriver<T>,
+    dev_id: GdmaDevId,
+    vport: u64,
+    eq_id: u32,
+    arena: &mut ResourceArena,
+    buffer: &Arc<MemoryBlock>,
+    num_queues: usize,
+) -> Vec<u64> {
+    let mut rx_handles = Vec::new();
+    for i in 0..num_queues {
+        let wq_region = gdma
+            .create_dma_region(
+                arena,
+                dev_id,
+                buffer.subblock((1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let cq_region = gdma
+            .create_dma_region(
+                arena,
+                dev_id,
+                buffer.subblock((2 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let mut bnic = BnicDriver::new(gdma, dev_id);
+        let resp = bnic
+            .create_wq_obj(
+                arena,
+                vport,
+                GdmaQueueType::GDMA_RQ,
+                &WqConfig {
+                    wq_gdma_region: wq_region,
+                    cq_gdma_region: cq_region,
+                    wq_size: PAGE_SIZE as u32,
+                    cq_size: PAGE_SIZE as u32,
+                    cq_moderation_ctx_id: 0,
+                    eq_id,
+                },
+            )
+            .await
+            .unwrap();
+        rx_handles.push(resp.wq_obj);
+    }
+    let sq_base = num_queues * 2 + 1;
+    for i in 0..num_queues {
+        let wq_region = gdma
+            .create_dma_region(
+                arena,
+                dev_id,
+                buffer.subblock((sq_base + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let cq_region = gdma
+            .create_dma_region(
+                arena,
+                dev_id,
+                buffer.subblock((sq_base + 1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let mut bnic = BnicDriver::new(gdma, dev_id);
+        bnic.create_wq_obj(
+            arena,
+            vport,
+            GdmaQueueType::GDMA_SQ,
+            &WqConfig {
+                wq_gdma_region: wq_region,
+                cq_gdma_region: cq_region,
+                wq_size: PAGE_SIZE as u32,
+                cq_size: PAGE_SIZE as u32,
+                cq_moderation_ctx_id: 0,
+                eq_id,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    rx_handles
+}
+
+/// The real Linux driver sends the **V2** steering request
+/// (`mana_cfg_rx_steer_req_v2`, GDMA_MESSAGE_V2): it inserts `cqe_coalescing_enable`
+/// plus 7 reserved bytes between the fixed request fields and the indirection
+/// table, and points `indir_tab_offset` past that 8-byte gap. The device must
+/// honor `indir_tab_offset` when reading the table instead of assuming the table
+/// is contiguous with the fixed struct; otherwise it reads the table 8 bytes
+/// early, every work-queue handle fails to resolve, and `MANA_CONFIG_VPORT_RX`
+/// fails with "indirection table references unknown rx queue" -- which the real
+/// driver surfaces as `mana_open` failing to configure the RSS table. The Rust
+/// `BnicDriver` only speaks the V1 layout (table contiguous with the struct), so
+/// this crafts a raw V2 request to exercise the offset path: it builds four
+/// receive queues and steers with a reversed table placed at the V2 offset,
+/// asserting the backend observes the correctly resolved [3,2,1,0] table.
+#[async_test]
+async fn test_gdma_rss_v2_indir_offset(driver: DefaultDriver) {
+    const NUM_QUEUES: usize = 4;
+
+    let recorded = Arc::new(Mutex::new(Vec::<Vec<u16>>::new()));
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_rss_v2_indir_offset");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(RecordingEndpoint::new(recorded.clone())),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let port_config = bnic.query_vport_config(0).await.unwrap();
+    let vport = port_config.vport;
+
+    let buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer((NUM_QUEUES * 4 + 1) * PAGE_SIZE)
+            .unwrap(),
+    );
+    let mut arena = ResourceArena::new();
+    let eq_gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+    let (eq_id, _) = gdma
+        .create_eq(
+            &mut arena,
+            dev_id,
+            eq_gdma_region,
+            PAGE_SIZE as u32,
+            device_props.pdid,
+            device_props.db_id,
+            0,
+        )
+        .await
+        .unwrap();
+
+    let rx_handles = create_steering_queues(
+        &mut gdma, dev_id, vport, eq_id, &mut arena, &buffer, NUM_QUEUES,
+    )
+    .await;
+
+    // Craft the V2 steering request by hand: `cqe_coalescing_enable` +
+    // `reserved2[7]` sit between the fixed struct and the indirection table, and
+    // `indir_tab_offset` points past them. A non-zero `cqe_coalescing_enable`
+    // guarantees the 8-byte gap cannot be silently mistaken for a valid (zero)
+    // handle were the device to (wrongly) read the table contiguously.
+    #[repr(C)]
+    #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    struct CfgRxSteerReqV2 {
+        fixed: ManaCfgRxSteerReq,
+        cqe_coalescing_enable: u8,
+        reserved2: [u8; 7],
+        indir_tab: [u64; NUM_QUEUES],
+    }
+
+    let reversed: Vec<u64> = rx_handles.iter().rev().copied().collect();
+    let req = CfgRxSteerReqV2 {
+        fixed: ManaCfgRxSteerReq {
+            vport,
+            num_indir_entries: NUM_QUEUES as u16,
+            indir_tab_offset: (size_of::<GdmaReqHdr>() + size_of::<ManaCfgRxSteerReq>() + 8) as u16,
+            rx_enable: Tristate::TRUE,
+            rss_enable: Tristate::TRUE,
+            update_default_rxobj: 0,
+            update_hashkey: 0,
+            update_indir_tab: 1,
+            reserved: 0,
+            default_rxobj: 0,
+            hashkey: [0; 40],
+        },
+        cqe_coalescing_enable: 1,
+        reserved2: [0; 7],
+        indir_tab: reversed.try_into().unwrap(),
+    };
+
+    gdma.request::<_, ()>(ManaCommandCode::MANA_CONFIG_VPORT_RX.0, dev_id, req)
+        .await
+        .expect(
+            "V2 MANA_CONFIG_VPORT_RX must succeed once the device honors \
+             indir_tab_offset when reading the indirection table",
+        );
+
+    let resolved = recorded.lock().clone();
+    assert_eq!(
+        resolved,
+        vec![vec![3u16, 2, 1, 0]],
+        "device must read the indirection table at indir_tab_offset (V2 layout); \
+         reading it contiguous with the fixed struct mis-resolves every handle"
     );
 
     arena.destroy(&mut gdma).await;

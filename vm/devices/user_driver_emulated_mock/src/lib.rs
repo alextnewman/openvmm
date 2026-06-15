@@ -131,6 +131,17 @@ impl<T: PciConfigSpace + MmioIntercept, U: DmaClient> EmulatedDevice<T, U> {
     }
 }
 
+impl<T, U> EmulatedDevice<T, U> {
+    /// Returns the shared inner device.
+    ///
+    /// This is primarily intended for tests that need to drive device-level
+    /// operations (such as reset) that are not exposed through the
+    /// [`DeviceBacking`] interface.
+    pub fn device(&self) -> &Arc<Mutex<T>> {
+        &self.device
+    }
+}
+
 /// A memory mapping for an [`EmulatedDevice`].
 #[derive(Inspect)]
 pub struct Mapping<T> {

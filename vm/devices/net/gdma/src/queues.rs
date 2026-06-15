@@ -418,6 +418,26 @@ impl Queues {
         Ok(())
     }
 
+    /// Clears all queue allocations, returning the engine to its initial state.
+    ///
+    /// Used when the device is reset so that a subsequent HW channel
+    /// establishment starts from a clean slate, even if the guest never
+    /// released the queues it previously allocated.
+    pub fn reset(&self) {
+        for sq in &self.sqs {
+            *sq.lock() = None;
+        }
+        for rq in &self.rqs {
+            *rq.lock() = None;
+        }
+        for cq in &self.cqs {
+            *cq.lock() = None;
+        }
+        for eq in &self.eqs {
+            *eq.lock() = None;
+        }
+    }
+
     fn sq(&self, sq_id: u32) -> Option<MappedMutexGuard<'_, Wq>> {
         MutexGuard::try_map(
             self.sqs

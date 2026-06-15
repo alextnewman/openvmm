@@ -380,7 +380,22 @@ impl ChangeDeviceState for GdmaDevice {
 
     async fn stop(&mut self) {}
 
-    async fn reset(&mut self) {}
+    async fn reset(&mut self) {
+        // Return the device to its freshly-constructed state so the guest can
+        // re-establish the HW channel after a reboot or function-level reset.
+        // The guest may have disappeared without issuing DESTROY_HWC, so any
+        // previously established channel, datapath tasks, and queue allocations
+        // must be torn down here. Without this, a re-probe observes the stale
+        // channel and ESTABLISH_HWC is rejected as already active.
+        self.hwc.stop().await;
+        self.hwc.task_mut().bnic.shutdown().await;
+        if self.hwc.has_state() {
+            self.hwc.remove();
+        }
+        self.queues.reset();
+        self.destroying_hwc = false;
+        self.shmem = Shmem(FromZeros::new_zeroed());
+    }
 }
 
 impl ChipsetDevice for GdmaDevice {

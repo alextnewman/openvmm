@@ -186,6 +186,11 @@ pub struct BnicConfig {
 pub struct BasicNic {
     vports: Vec<Vport>,
     config: BnicConfig,
+    /// Monotonic allocator for `wq_obj` handles returned by
+    /// `MANA_CREATE_WQ_OBJ`. Each work-queue object gets a distinct, opaque
+    /// handle so the guest can reference individual RX queues (e.g. in the RSS
+    /// indirection table) and destroy them independently.
+    next_wq_obj: u64,
 }
 
 impl InspectMut for BasicNic {
@@ -208,17 +213,25 @@ impl InspectMut for Vport {
         req.respond()
             .field("mac_address", self.mac_address)
             .field_mut("endpoint", self.endpoint.as_mut())
-            .field("tx_wq", self.queue_cfg.tx.map(|(wq, _cq)| wq))
-            .field("tx_cq", self.queue_cfg.tx.map(|(_wq, cq)| cq))
-            .field("rx_wq", self.queue_cfg.rx.map(|(wq, _cq)| wq))
-            .field("rx_cq", self.queue_cfg.rx.map(|(_wq, cq)| cq))
+            .field("tx_wqs", self.queue_cfg.tx.len())
+            .field("rx_wqs", self.queue_cfg.rx.len())
             .merge(&mut self.task);
     }
 }
 
+/// A work-queue object created via `MANA_CREATE_WQ_OBJ`: an associated
+/// work queue and completion queue, addressed by the opaque `wq_obj` handle
+/// returned to the guest.
+struct WqObject {
+    wq_obj: u64,
+    wq_id: u32,
+    cq_id: u32,
+}
+
+#[derive(Default)]
 struct QueueCfg {
-    tx: Option<(u32, u32)>,
-    rx: Option<(u32, u32)>,
+    tx: Vec<WqObject>,
+    rx: Vec<WqObject>,
 }
 
 impl BasicNic {
@@ -237,14 +250,18 @@ impl BasicNic {
                         mac_address,
                         endpoint,
                         task: TaskControl::new(TxRxState),
-                        queue_cfg: QueueCfg { tx: None, rx: None },
+                        queue_cfg: QueueCfg::default(),
                         serial_no: 0,
                     }
                 },
             )
             .collect();
 
-        Self { vports, config }
+        Self {
+            vports,
+            config,
+            next_wq_obj: 1,
+        }
     }
 
     /// Tears down every vport's datapath, returning the NIC to its initial
@@ -258,7 +275,7 @@ impl BasicNic {
                 vport.task.remove();
                 vport.endpoint.stop().await;
             }
-            vport.queue_cfg = QueueCfg { tx: None, rx: None };
+            vport.queue_cfg = QueueCfg::default();
             vport.serial_no = 0;
         }
     }
@@ -323,10 +340,6 @@ impl BasicNic {
             ManaCommandCode::MANA_CREATE_WQ_OBJ => {
                 let req: ManaCreateWqobjReq =
                     read.read_plain().context("reading create wq obj request")?;
-                let vport = self
-                    .vports
-                    .get_mut(req.vport as usize)
-                    .context("invalid vport")?;
 
                 let is_send = match req.wq_type {
                     GdmaQueueType::GDMA_RQ => false,
@@ -334,10 +347,9 @@ impl BasicNic {
                     ty => anyhow::bail!("unsupported queue type: {:?}", ty),
                 };
 
-                if (is_send && vport.queue_cfg.tx.is_some())
-                    || (!is_send && vport.queue_cfg.rx.is_some())
-                {
-                    anyhow::bail!("queue already created");
+                let vport_idx = req.vport as usize;
+                if vport_idx >= self.vports.len() {
+                    anyhow::bail!("invalid vport");
                 }
 
                 let wq_region = state.get_dma_region(req.wq_gdma_region, req.wq_size)?;
@@ -353,17 +365,31 @@ impl BasicNic {
                     .alloc_cq(cq_region.clone(), req.cq_parent_qid)
                     .context("failed to allocate cq")?;
 
+                // Allocate a distinct, opaque handle for this work-queue object.
+                // The guest uses it to address individual queues (notably in the
+                // RSS indirection table) and to destroy them, so it must be
+                // unique across all of a vport's queues rather than aliasing the
+                // vport index.
+                let wq_obj = self.next_wq_obj;
+                self.next_wq_obj += 1;
+
                 let resp = ManaCreateWqobjResp {
                     wq_id,
                     cq_id,
-                    wq_obj: req.vport, // use the vport # as the handle
+                    wq_obj,
                 };
 
-                *if is_send {
+                let vport = &mut self.vports[vport_idx];
+                let list = if is_send {
                     &mut vport.queue_cfg.tx
                 } else {
                     &mut vport.queue_cfg.rx
-                } = Some((wq_id, cq_id));
+                };
+                list.push(WqObject {
+                    wq_obj,
+                    wq_id,
+                    cq_id,
+                });
 
                 write.write(resp.as_bytes())?;
 
@@ -375,22 +401,32 @@ impl BasicNic {
                 let req: ManaDestroyWqobjReq = read
                     .read_plain()
                     .context("failed to read destroy wq obj request")?;
-                let vport = self
-                    .vports
-                    .get_mut(req.wq_obj_handle as usize)
-                    .context("invalid obj handle")?;
-
-                if vport.task.has_state() {
-                    anyhow::bail!("queue still in use");
-                }
-                let (is_send, queues) = match req.wq_type {
-                    GdmaQueueType::GDMA_RQ => (false, &mut vport.queue_cfg.rx),
-                    GdmaQueueType::GDMA_SQ => (true, &mut vport.queue_cfg.tx),
+                let is_send = match req.wq_type {
+                    GdmaQueueType::GDMA_RQ => false,
+                    GdmaQueueType::GDMA_SQ => true,
                     ty => anyhow::bail!("unsupported queue type: {:?}", ty),
                 };
-                let (wq_id, cq_id) = queues.take().context("specified queue does not exist")?;
-                state.queues.free_wq(is_send, wq_id).unwrap();
-                state.queues.free_cq(cq_id).unwrap();
+
+                // Look the object up by its handle across every vport, since the
+                // handle is no longer the vport index.
+                let mut removed = None;
+                for vport in &mut self.vports {
+                    let list = if is_send {
+                        &mut vport.queue_cfg.tx
+                    } else {
+                        &mut vport.queue_cfg.rx
+                    };
+                    if let Some(pos) = list.iter().position(|w| w.wq_obj == req.wq_obj_handle) {
+                        if vport.task.has_state() {
+                            anyhow::bail!("queue still in use");
+                        }
+                        removed = Some(list.remove(pos));
+                        break;
+                    }
+                }
+                let wq = removed.context("specified queue does not exist")?;
+                state.queues.free_wq(is_send, wq.wq_id).unwrap();
+                state.queues.free_cq(wq.cq_id).unwrap();
             }
             ManaCommandCode::MANA_CONFIG_VPORT_RX => {
                 let req: ManaCfgRxSteerReq = read
@@ -409,9 +445,11 @@ impl BasicNic {
                         vport.endpoint.stop().await;
                     }
                     Tristate::TRUE if !vport.task.is_running() => {
-                        if let (Some((sq_id, sq_cq_id)), Some((rq_id, rq_cq_id))) =
-                            (vport.queue_cfg.tx, vport.queue_cfg.rx)
+                        if let (Some(tx), Some(rx)) =
+                            (vport.queue_cfg.tx.first(), vport.queue_cfg.rx.first())
                         {
+                            let (sq_id, sq_cq_id) = (tx.wq_id, tx.cq_id);
+                            let (rq_id, rq_cq_id) = (rx.wq_id, rx.cq_id);
                             let mut queues = vec![];
                             vport
                                 .endpoint

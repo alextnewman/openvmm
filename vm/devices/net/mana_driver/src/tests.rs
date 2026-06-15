@@ -167,6 +167,123 @@ async fn test_gdma(driver: DefaultDriver) {
     arena.destroy(&mut gdma).await;
 }
 
+/// A vport must support more than one receive work-queue object so the guest
+/// can build an RSS indirection table that steers traffic across multiple
+/// queues. Each object must be addressed by a distinct `wq_obj` handle so it
+/// can be referenced and destroyed independently. This exercises creating two
+/// RX objects on one vport and destroying both by handle.
+#[async_test]
+async fn test_gdma_multiple_wq_objs(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_multiple_wq_objs");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let port_config = bnic.query_vport_config(0).await.unwrap();
+    let vport = port_config.vport;
+
+    let buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(0x6000)
+            .unwrap(),
+    );
+    let mut arena = ResourceArena::new();
+    let eq_gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+    let (eq_id, _) = gdma
+        .create_eq(
+            &mut arena,
+            dev_id,
+            eq_gdma_region,
+            PAGE_SIZE as u32,
+            device_props.pdid,
+            device_props.db_id,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // Create two receive work-queue objects on the same vport.
+    let mut wq_objs = Vec::new();
+    for i in 0..2 {
+        let wq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((1 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let cq_region = gdma
+            .create_dma_region(
+                &mut arena,
+                dev_id,
+                buffer.subblock((2 + i * 2) * PAGE_SIZE, PAGE_SIZE),
+            )
+            .await
+            .unwrap();
+        let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+        let resp = bnic
+            .create_wq_obj(
+                &mut arena,
+                vport,
+                GdmaQueueType::GDMA_RQ,
+                &WqConfig {
+                    wq_gdma_region: wq_region,
+                    cq_gdma_region: cq_region,
+                    wq_size: PAGE_SIZE as u32,
+                    cq_size: PAGE_SIZE as u32,
+                    cq_moderation_ctx_id: 0,
+                    eq_id,
+                },
+            )
+            .await
+            .unwrap();
+        wq_objs.push(resp.wq_obj);
+    }
+
+    // The two receive objects must have distinct handles.
+    assert_ne!(
+        wq_objs[0], wq_objs[1],
+        "receive work-queue objects must have distinct handles"
+    );
+
+    // Tearing the arena down destroys both objects by handle, which only
+    // succeeds if each handle resolves to its own queue.
+    arena.destroy(&mut gdma).await;
+}
+
 #[async_test]
 async fn test_gdma_save_restore(driver: DefaultDriver) {
     let mem = DeviceTestMemory::new(128, false, "test_gdma");

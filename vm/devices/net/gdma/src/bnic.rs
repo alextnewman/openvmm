@@ -48,6 +48,7 @@ use net_backend::BufferAccess;
 use net_backend::Endpoint;
 use net_backend::Queue;
 use net_backend::QueueConfig;
+use net_backend::RssConfig;
 use net_backend::RxBufferSegment;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
@@ -77,6 +78,16 @@ use zerocopy::IntoBytes;
 /// length (1514), which matches the driver's own V1-era default and yields a
 /// 1500-byte L3 MTU once the 14-byte Ethernet header is subtracted.
 const MANA_DEFAULT_ADAPTER_MTU: u16 = 1514;
+
+/// Number of entries in the RSS indirection table advertised to the guest.
+/// The guest hashes each received flow into this many buckets, then maps each
+/// bucket to a receive queue.
+const MANA_INDIRECTION_TABLE_SIZE: u32 = 128;
+
+/// Upper bound on the number of send/receive queues advertised per vport. The
+/// effective count is additionally clamped to what the backend endpoint
+/// supports.
+const MANA_MAX_QUEUES_PER_VPORT: u16 = 16;
 
 pub struct GuestBuffers {
     gm: GuestMemory,
@@ -203,7 +214,9 @@ impl InspectMut for BasicNic {
 struct Vport {
     mac_address: MacAddress,
     endpoint: Box<dyn Endpoint>,
-    task: TaskControl<TxRxState, TxRxTask>,
+    /// One datapath task per active queue pair. Empty when the receive path is
+    /// disabled.
+    tasks: Vec<TaskControl<TxRxState, TxRxTask>>,
     queue_cfg: QueueCfg,
     serial_no: u32,
 }
@@ -215,7 +228,25 @@ impl InspectMut for Vport {
             .field_mut("endpoint", self.endpoint.as_mut())
             .field("tx_wqs", self.queue_cfg.tx.len())
             .field("rx_wqs", self.queue_cfg.rx.len())
-            .merge(&mut self.task);
+            .fields_mut("queues", self.tasks.iter_mut().enumerate());
+    }
+}
+
+impl Vport {
+    /// Stops and tears down every datapath task, then stops the backend
+    /// endpoint. The backend's queues are owned by the tasks, so the tasks must
+    /// be dropped before the endpoint is stopped.
+    async fn stop_datapath(&mut self) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        for mut task in self.tasks.drain(..) {
+            if task.is_running() {
+                task.stop().await;
+            }
+            // Dropping the task releases its backend queue.
+        }
+        self.endpoint.stop().await;
     }
 }
 
@@ -249,7 +280,7 @@ impl BasicNic {
                     Vport {
                         mac_address,
                         endpoint,
-                        task: TaskControl::new(TxRxState),
+                        tasks: Vec::new(),
                         queue_cfg: QueueCfg::default(),
                         serial_no: 0,
                     }
@@ -270,11 +301,7 @@ impl BasicNic {
     /// be reset even when the guest never disabled them.
     pub async fn shutdown(&mut self) {
         for vport in &mut self.vports {
-            if vport.task.is_running() {
-                vport.task.stop().await;
-                vport.task.remove();
-                vport.endpoint.stop().await;
-            }
+            vport.stop_datapath().await;
             vport.queue_cfg = QueueCfg::default();
             vport.serial_no = 0;
         }
@@ -417,7 +444,7 @@ impl BasicNic {
                         &mut vport.queue_cfg.rx
                     };
                     if let Some(pos) = list.iter().position(|w| w.wq_obj == req.wq_obj_handle) {
-                        if vport.task.has_state() {
+                        if vport.tasks.iter().any(|t| t.has_state()) {
                             anyhow::bail!("queue still in use");
                         }
                         removed = Some(list.remove(pos));
@@ -439,35 +466,79 @@ impl BasicNic {
                     .context("invalid vport")?;
 
                 match req.rx_enable {
-                    Tristate::FALSE if vport.task.is_running() => {
-                        vport.task.stop().await;
-                        vport.task.remove();
-                        vport.endpoint.stop().await;
+                    Tristate::FALSE => {
+                        vport.stop_datapath().await;
                     }
-                    Tristate::TRUE if !vport.task.is_running() => {
-                        if let (Some(tx), Some(rx)) =
-                            (vport.queue_cfg.tx.first(), vport.queue_cfg.rx.first())
-                        {
-                            let (sq_id, sq_cq_id) = (tx.wq_id, tx.cq_id);
-                            let (rq_id, rq_cq_id) = (rx.wq_id, rx.cq_id);
-                            let mut queues = vec![];
-                            vport
-                                .endpoint
-                                .get_queues(
-                                    vec![QueueConfig {
-                                        driver: Box::new(state.queues.driver.clone()),
-                                    }],
-                                    None,
-                                    &mut queues,
-                                )
-                                .await?;
+                    Tristate::TRUE if vport.tasks.is_empty() => {
+                        let n = vport.queue_cfg.tx.len().min(vport.queue_cfg.rx.len());
+                        if n == 0 {
+                            anyhow::bail!("queues not configured");
+                        }
 
-                            vport.task.insert(
+                        // When RSS is enabled the indirection table follows the
+                        // request header in the payload as `num_indir_entries`
+                        // 64-bit work-queue object handles. Translate each handle
+                        // into the index of the receive queue it names. Steering
+                        // itself is performed by the backend (modeling the PF /
+                        // physical wire), so the device only has to plumb the
+                        // resolved table and hash key down to it.
+                        let rss = if matches!(req.rss_enable, Tristate::TRUE)
+                            && req.num_indir_entries > 0
+                        {
+                            let mut table = Vec::with_capacity(req.num_indir_entries as usize);
+                            for _ in 0..req.num_indir_entries {
+                                let handle: u64 = read
+                                    .read_plain()
+                                    .context("reading rss indirection entry")?;
+                                let idx = vport
+                                    .queue_cfg
+                                    .rx
+                                    .iter()
+                                    .position(|w| w.wq_obj == handle)
+                                    .context("indirection table references unknown rx queue")?;
+                                table.push(idx as u16);
+                            }
+                            Some((req.hashkey, table))
+                        } else {
+                            None
+                        };
+
+                        let configs = (0..n)
+                            .map(|_| QueueConfig {
+                                driver: Box::new(state.queues.driver.clone()),
+                            })
+                            .collect();
+
+                        let rss_cfg = rss.as_ref().map(|(key, table)| RssConfig {
+                            key: key.as_slice(),
+                            indirection_table: table.as_slice(),
+                            flags: 0,
+                        });
+
+                        let mut queues = vec![];
+                        vport
+                            .endpoint
+                            .get_queues(configs, rss_cfg.as_ref(), &mut queues)
+                            .await?;
+                        anyhow::ensure!(
+                            queues.len() == n,
+                            "backend returned {} queues, expected {n}",
+                            queues.len()
+                        );
+
+                        for (k, epqueue) in queues.into_iter().enumerate() {
+                            let (sq_id, sq_cq_id) =
+                                (vport.queue_cfg.tx[k].wq_id, vport.queue_cfg.tx[k].cq_id);
+                            let (rq_id, rq_cq_id) =
+                                (vport.queue_cfg.rx[k].wq_id, vport.queue_cfg.rx[k].cq_id);
+
+                            let mut task = TaskControl::new(TxRxState);
+                            task.insert(
                                 &state.queues.driver,
                                 "gdma-bnic",
                                 TxRxTask {
                                     queues: state.queues.clone(),
-                                    epqueue: queues.drain(..).next().unwrap(),
+                                    epqueue,
                                     pool: GuestBuffers {
                                         gm: state.queues.gm.clone(),
                                         rx_packets: Default::default(),
@@ -480,9 +551,8 @@ impl BasicNic {
                                     rx_buf_count: 0,
                                 },
                             );
-                            vport.task.start();
-                        } else {
-                            anyhow::bail!("queues not configured");
+                            task.start();
+                            vport.tasks.push(task);
                         }
                     }
                     _ => {}
@@ -516,10 +586,16 @@ impl BasicNic {
                     .get_mut(req.vport_index as usize)
                     .context("invalid vport")?;
 
+                // Advertise as many queues as the backend can service, capped to
+                // a sane maximum. The guest uses this to decide how many receive
+                // queues to create and steer across.
+                let max_queues = (vport.endpoint.multiqueue_support().max_queues)
+                    .clamp(1, MANA_MAX_QUEUES_PER_VPORT) as u32;
+
                 let resp = ManaQueryVportCfgResp {
-                    max_num_sq: 1,
-                    max_num_rq: 1,
-                    num_indirection_ent: 128,
+                    max_num_sq: max_queues,
+                    max_num_rq: max_queues,
+                    num_indirection_ent: MANA_INDIRECTION_TABLE_SIZE,
                     reserved1: 0,
                     mac_addr: vport.mac_address.to_bytes(),
                     reserved2: [0; 2],

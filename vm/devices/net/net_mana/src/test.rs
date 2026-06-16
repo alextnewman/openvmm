@@ -1597,6 +1597,144 @@ async fn rx_coalesced_cqe_delivers_batch(driver: DefaultDriver) {
     endpoint.stop().await;
 }
 
+/// RX CQE coalescing live toggle: enabling coalescing on an already-running
+/// vport must take effect on the live datapath WITHOUT cycling it.
+///
+/// This models the `ethtool -C eth0 rx-frames 4` path. On a running port the
+/// driver re-issues `MANA_CONFIG_VPORT_RX` (`rx_enable=TRUE`) with
+/// `cqe_coalescing_enable=1` but `update_indir_tab=0` / `update_hashkey=0`, so
+/// the device must not rebuild the datapath (that would drop the live RSS
+/// table) -- it instead flips the coalescing flag the running receive tasks
+/// share. The test starts the datapath with coalescing OFF, toggles it ON via a
+/// second `config_rx` that carries no indirection table, then drives a batch and
+/// asserts it was coalesced. If the running task did not observe the toggle it
+/// would deliver one CQE per packet (coalesced counter stays zero), so the
+/// `>= 2` assertion is a true regression guard for the shared-flag behavior.
+#[async_test]
+async fn rx_coalescing_live_toggle_engages_without_rebuild(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 500;
+    const NUM_PACKETS: usize = 4;
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_coalesce_toggle");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Start the receive datapath with coalescing OFF (the V1 request form). The
+    // device builds its receive task capturing the disabled flag.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    // Live toggle: re-issue config on the already-running vport with coalescing
+    // ON and no indirection table. This sends update_indir_tab=0 /
+    // update_hashkey=0, so the device must NOT rebuild the datapath -- it must
+    // flip the flag the running task already shares.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: true,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers, then send all four packets in a single batch so the
+    // device reflects them through loopback before producing completions -- the
+    // condition under which the emulator coalesces.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    let mut pkt_builder = TxPacketBuilder::new();
+    for _ in 0..NUM_PACKETS {
+        build_tx_segments(PACKET_LEN, 1, false, &mut pkt_builder);
+    }
+    let data_to_send = pkt_builder.packet_data();
+    payload_mem.write_at(0, &data_to_send).unwrap();
+    queue.tx_avail(&mut pool, pkt_builder.segments()).unwrap();
+
+    // Poll until all four packets are received (or the deadline trips).
+    let mut rx_ids = [RxId(0); NUM_PACKETS];
+    let mut rx_n = 0;
+    let mut tx_done = [TxId(0); NUM_PACKETS];
+    let mut tx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        tx_n += queue.tx_poll(&mut pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        if rx_n >= NUM_PACKETS {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, NUM_PACKETS, "all four packets must be delivered");
+    assert!(
+        queue.stats.rx_packets_coalesced.get() >= 2,
+        "the live coalescing toggle must engage on the running datapath \
+         (coalesced packets: {})",
+        queue.stats.rx_packets_coalesced.get()
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
 /// Per-queue state inside the [`SteeringSwitch`].
 #[derive(Default)]
 struct SteeringQueueState {

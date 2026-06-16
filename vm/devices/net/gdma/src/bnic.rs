@@ -9,6 +9,8 @@ use self::bnic_defs::MANA_CQE_COMPLETION;
 use self::bnic_defs::MANA_LONG_PKT_FMT;
 use self::bnic_defs::ManaCommandCode;
 use self::bnic_defs::ManaCqeHeader;
+use self::bnic_defs::ManaQueryPhyStatisticsRequest;
+use self::bnic_defs::ManaQueryPhyStatisticsResponse;
 use self::bnic_defs::ManaQueryStatisticsRequest;
 use self::bnic_defs::ManaQueryStatisticsResponse;
 use self::bnic_defs::ManaQueryVportCfgReq;
@@ -764,6 +766,28 @@ impl BasicNic {
                 // driver only requires a successful response whose
                 // `reported_statistics` mask covers what it asked for.
                 let resp = ManaQueryStatisticsResponse {
+                    reported_statistics: req.requested_statistics,
+                    ..FromZeros::new_zeroed()
+                };
+
+                let resp_bytes = resp.as_bytes();
+                let write_len = guest_resp_size.min(resp_bytes.len());
+                write.write(&resp_bytes[..write_len])?;
+            }
+            ManaCommandCode::MANA_QUERY_PHY_STAT => {
+                let req: ManaQueryPhyStatisticsRequest = read
+                    .read_plain()
+                    .context("reading query phy stats request")?;
+
+                // `ethtool -S` triggers this physical-port statistics query. The
+                // emulator models a virtual function with no physical port, so it
+                // has no PHY counters to report -- mirror a real PF that returns
+                // success with zeroed counters (the same path the host takes when
+                // device-stats reporting is disabled), echoing the requested
+                // bitmap so the driver's response validation passes. The driver
+                // (`mana_query_phy_stats`) copies the fields into its per-port
+                // stats unconditionally and tolerates them all being zero.
+                let resp = ManaQueryPhyStatisticsResponse {
                     reported_statistics: req.requested_statistics,
                     ..FromZeros::new_zeroed()
                 };

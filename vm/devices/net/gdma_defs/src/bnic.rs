@@ -21,6 +21,7 @@ open_enum! {
         MANA_FENCE_RQ = 0x20006,
         MANA_CONFIG_VPORT_RX = 0x20007,
         MANA_QUERY_VPORT_CONFIG = 0x20008,
+        MANA_QUERY_PHY_STAT = 0x2000c,
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
@@ -520,4 +521,32 @@ pub struct ManaQueryStatisticsResponse {
     pub hc_out_multicast_octets: u64,
     pub hc_out_broadcast_pkts: u64,
     pub hc_out_broadcast_octets: u64,
+}
+
+/// `MANA_QUERY_PHY_STAT` request. The driver (`ethtool -S`) asks for a bitmap of
+/// physical-port statistics; the device echoes the granted subset back in
+/// [`ManaQueryPhyStatisticsResponse::reported_statistics`].
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsRequest {
+    pub requested_statistics: u64,
+}
+
+/// `MANA_QUERY_PHY_STAT` response: physical-port (PHY) counters reported per
+/// traffic class. Each per-TC bank interleaves the receive then transmit
+/// counter for each class, i.e. `[rx_tc0, tx_tc0, rx_tc1, tx_tc1, ... rx_tc7,
+/// tx_tc7]`, matching the wire layout the driver consumes.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsResponse {
+    pub reported_statistics: u64,
+    /// Aggregate packets dropped at the PHY: receive, then transmit.
+    pub rx_pkt_drop_phy: u64,
+    pub tx_pkt_drop_phy: u64,
+    /// Per-traffic-class packet counts, interleaved rx/tx for TC0..TC7.
+    pub pkt_tc_phy: [u64; 16],
+    /// Per-traffic-class byte counts, interleaved rx/tx for TC0..TC7.
+    pub byte_tc_phy: [u64; 16],
+    /// Per-traffic-class pause-frame counts, interleaved rx/tx for TC0..TC7.
+    pub pause_tc_phy: [u64; 16],
 }

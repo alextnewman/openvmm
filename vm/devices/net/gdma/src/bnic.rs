@@ -67,6 +67,8 @@ use net_backend_resources::mac_address::MacAddress;
 use slab::Slab;
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use task_control::AsyncRun;
 use task_control::InspectTaskMut;
@@ -238,7 +240,14 @@ struct Vport {
     /// `GDMA_MESSAGE_V2` `MANA_CONFIG_VPORT_RX` request (`cqe_coalescing_enable`).
     /// When set, the datapath packs up to `MANA_RXCOMP_OOB_NUM_PPI` receive
     /// completions into a single `CQE_RX_COALESCED_4`.
-    cqe_coalescing: bool,
+    ///
+    /// Shared with the running [`TxRxTask`]s (each holds a clone) so a live
+    /// toggle -- the `ethtool -C rx-frames` path, which re-asserts
+    /// `rx_enable=TRUE` without updating the indirection table or hash key and
+    /// so does not cycle the datapath -- is observed by the receive path on its
+    /// next completion batch, matching a device that applies the coalescing
+    /// setting to in-flight traffic.
+    cqe_coalescing: Arc<AtomicBool>,
 }
 
 impl InspectMut for Vport {
@@ -289,7 +298,7 @@ async fn start_vport_datapath(
         anyhow::bail!("queues not configured");
     }
 
-    let cqe_coalescing = vport.cqe_coalescing;
+    let cqe_coalescing = vport.cqe_coalescing.clone();
 
     // When an indirection table is supplied it is located at `indir_tab_offset`
     // bytes from the start of the GDMA request (including the request header) --
@@ -372,7 +381,7 @@ async fn start_vport_datapath(
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
                 rx_buf_count: 0,
-                cqe_coalescing,
+                cqe_coalescing: cqe_coalescing.clone(),
             },
         );
         task.start();
@@ -414,7 +423,7 @@ impl BasicNic {
                         tasks: Vec::new(),
                         queue_cfg: QueueCfg::default(),
                         serial_no: 0,
-                        cqe_coalescing: false,
+                        cqe_coalescing: Arc::new(AtomicBool::new(false)),
                     }
                 },
             )
@@ -643,7 +652,11 @@ impl BasicNic {
                 if is_v2 && req.rx_enable != Tristate::FALSE {
                     let mut peek = read.clone();
                     let enable: u8 = peek.read_plain().context("reading cqe_coalescing_enable")?;
-                    vport.cqe_coalescing = enable != 0;
+                    // Store rather than rebuild: the running receive tasks share
+                    // this flag and read it on their next backend poll, so a pure
+                    // coalescing toggle takes effect on live traffic without
+                    // cycling the datapath (which would drop the RSS table).
+                    vport.cqe_coalescing.store(enable != 0, Ordering::Relaxed);
                 }
 
                 match req.rx_enable {
@@ -666,8 +679,13 @@ impl BasicNic {
                         // queues) and rebuild them with the new table/key. Without
                         // this the update falls through and is silently ignored --
                         // the device acks success but the steering never changes.
-                        // A coalescing toggle (ethtool -C rx-frames) arrives the
-                        // same way, so the rebuilt tasks pick up the new setting.
+                        //
+                        // A pure coalescing toggle (ethtool -C rx-frames) also
+                        // arrives here but carries no table or key, so it must
+                        // NOT rebuild -- doing so would drop the live RSS table.
+                        // The `cqe_coalescing` store above already updated the
+                        // flag the running tasks share, so the toggle is honored
+                        // without disturbing the datapath.
                         if !vport.tasks.is_empty()
                             && (req.update_indir_tab != 0 || req.update_hashkey != 0)
                         {
@@ -781,8 +799,10 @@ pub struct TxRxTask {
     rx_buf_count: u32,
     /// When set, pack up to `MANA_RXCOMP_OOB_NUM_PPI` ready receive completions
     /// into a single `CQE_RX_COALESCED_4` instead of posting one `CQE_RX_OKAY`
-    /// per packet. Negotiated per-vport via the V2 `MANA_CONFIG_VPORT_RX`.
-    cqe_coalescing: bool,
+    /// per packet. Negotiated per-vport via the V2 `MANA_CONFIG_VPORT_RX` and
+    /// shared with the owning [`Vport`], so a live toggle is observed here on
+    /// the next backend poll without rebuilding the task.
+    cqe_coalescing: Arc<AtomicBool>,
 }
 
 impl InspectTaskMut<TxRxTask> for TxRxState {
@@ -991,7 +1011,7 @@ impl TxRxTask {
         // driver has enabled coalescing, otherwise one at a time (the historic
         // one-CQE-per-packet behavior). Packets are returned in receive-queue
         // post order, which is the order the driver consumes its posted buffers.
-        let max = if self.cqe_coalescing {
+        let max = if self.cqe_coalescing.load(Ordering::Relaxed) {
             MANA_RXCOMP_OOB_NUM_PPI
         } else {
             1
@@ -1036,7 +1056,8 @@ impl TxRxTask {
                 .context("invalid rx id")?;
 
             let mut oob = first.oob;
-            let can_coalesce = self.cqe_coalescing && oob.cqe_hdr.cqe_type() == CQE_RX_OKAY;
+            let coalescing = self.cqe_coalescing.load(Ordering::Relaxed);
+            let can_coalesce = coalescing && oob.cqe_hdr.cqe_type() == CQE_RX_OKAY;
             let first_flags = oob.flags.into_bits();
 
             let mut count = 1;

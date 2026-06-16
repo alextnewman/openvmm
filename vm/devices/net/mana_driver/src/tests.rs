@@ -916,6 +916,58 @@ async fn test_gdma_query_stats(driver: DefaultDriver) {
     assert_eq!(stats.hc_out_octets, 0);
 }
 
+/// `ethtool -S` also drives `MANA_QUERY_PHY_STAT` (the physical-port counters).
+/// The emulated VF has no PHY, so the device must still service the command and
+/// return success with zeroed counters, echoing the requested-statistics bitmap.
+/// Before this was handled the command was rejected ("unsupported request"),
+/// which surfaced as a benign-but-noisy device warning on every stats poll.
+#[async_test]
+async fn test_gdma_query_phy_stats(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_phy_stats");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    // A non-zero request bitmap proves the device read and echoed the request
+    // field (the Linux driver itself sends 0 here, but the echo is the contract).
+    let requested = 0x1234_5678_9abc_def0;
+    let stats = bnic.query_phy_stats(requested).await.unwrap();
+
+    assert_eq!(stats.reported_statistics, requested);
+    assert_eq!(stats.rx_pkt_drop_phy, 0);
+    assert_eq!(stats.tx_pkt_drop_phy, 0);
+    assert_eq!(stats.pkt_tc_phy, [0; 16]);
+    assert_eq!(stats.byte_tc_phy, [0; 16]);
+    assert_eq!(stats.pause_tc_phy, [0; 16]);
+}
+
 /// A backend endpoint that records the RSS indirection table the device plumbs
 /// to it on every `get_queues` call, so a test can prove the device re-resolved
 /// and re-applied steering. Datapath behavior is delegated to a `NullEndpoint`.

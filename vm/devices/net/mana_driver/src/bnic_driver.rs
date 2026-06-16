@@ -31,6 +31,10 @@ use gdma_defs::bnic::ManaQueryDeviceCfgReq;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
 use gdma_defs::bnic::ManaQueryFilterStateReq;
 use gdma_defs::bnic::ManaQueryFilterStateResponse;
+#[cfg(test)]
+use gdma_defs::bnic::ManaQueryPhyStatisticsRequest;
+#[cfg(test)]
+use gdma_defs::bnic::ManaQueryPhyStatisticsResponse;
 use gdma_defs::bnic::ManaQueryStatisticsRequest;
 use gdma_defs::bnic::ManaQueryStatisticsResponse;
 use gdma_defs::bnic::ManaQueryVportCfgReq;
@@ -285,6 +289,27 @@ impl<'a, T: DeviceBacking> BnicDriver<'a, T> {
                 ManaCommandCode::MANA_QUERY_STATS.0,
                 self.dev_id,
                 ManaQueryStatisticsRequest {
+                    requested_statistics,
+                },
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Queries physical-port statistics (`MANA_QUERY_PHY_STAT`). Only the
+    /// conformance tests drive this directly; the Linux driver issues it from
+    /// `ethtool -S`.
+    #[cfg(test)]
+    pub async fn query_phy_stats(
+        &mut self,
+        requested_statistics: u64,
+    ) -> anyhow::Result<ManaQueryPhyStatisticsResponse> {
+        let resp: ManaQueryPhyStatisticsResponse = self
+            .gdma
+            .request(
+                ManaCommandCode::MANA_QUERY_PHY_STAT.0,
+                self.dev_id,
+                ManaQueryPhyStatisticsRequest {
                     requested_statistics,
                 },
             )

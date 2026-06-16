@@ -14,6 +14,7 @@ use gdma_defs::bnic::ManaQueryDeviceCfgResp;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use mana_driver::mana::ManaDevice;
+use mana_driver::mana::RxConfig;
 use mesh::CancelContext;
 use mesh::CancelReason;
 use net_backend::BufferAccess;
@@ -1449,6 +1450,151 @@ async fn test_vlan_mixed_batch(driver: DefaultDriver) {
             .drop_eligible_indicator(),
         false
     );
+}
+
+/// RX CQE coalescing: when the driver opts in (the `GDMA_MESSAGE_V2`
+/// `MANA_CONFIG_VPORT_RX` request with `cqe_coalescing_enable` set) the emulator
+/// packs up to `MANA_RXCOMP_OOB_NUM_PPI` receive completions that share
+/// identical OOB metadata into a single `CQE_RX_COALESCED_4`, and net_mana's
+/// `rx_poll` expands that one CQE back into the individual packets.
+///
+/// This drives four identical loopback packets through the real datapath and
+/// asserts that all four are delivered AND that the coalesced-packet counter
+/// advanced -- which is only possible if at least one CQE carried more than one
+/// packet. Without the coalescing emitter (one CQE per packet) the counter
+/// stays zero, so the `>= 2` assertion is a true regression guard.
+#[async_test]
+async fn rx_coalesced_cqe_delivers_batch(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 500;
+    const NUM_PACKETS: usize = 4;
+
+    // Build the full device stack directly (rather than via `new_test_queue`)
+    // so we can capture the payload memory and drive a concrete `ManaQueue`.
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_coalesce");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Opt into coalescing. This issues the V2 MANA_CONFIG_VPORT_RX request
+    // (cqe_coalescing_enable = 1) and starts the receive datapath to our single
+    // receive queue with coalescing armed.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: true,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers, then send all four packets in a single batch so the
+    // device reflects them through loopback before producing completions -- the
+    // condition under which the emulator coalesces.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    let mut pkt_builder = TxPacketBuilder::new();
+    for _ in 0..NUM_PACKETS {
+        build_tx_segments(PACKET_LEN, 1, false, &mut pkt_builder);
+    }
+    let data_to_send = pkt_builder.packet_data();
+    payload_mem.write_at(0, &data_to_send).unwrap();
+    queue.tx_avail(&mut pool, pkt_builder.segments()).unwrap();
+
+    // Poll until all four packets are received (or the deadline trips).
+    let mut rx_ids = [RxId(0); NUM_PACKETS];
+    let mut rx_n = 0;
+    let mut tx_done = [TxId(0); NUM_PACKETS];
+    let mut tx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        // GDMA errors surface as a TryRestart error here; ignore for polling.
+        tx_n += queue.tx_poll(&mut pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        if rx_n >= NUM_PACKETS {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, NUM_PACKETS, "all four packets must be delivered");
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        NUM_PACKETS as u64,
+        "rx_packets counts every delivered packet"
+    );
+    assert!(
+        queue.stats.rx_packets_coalesced.get() >= 2,
+        "coalescing must pack at least two packets into one CQE (got {})",
+        queue.stats.rx_packets_coalesced.get()
+    );
+
+    // Every delivered buffer must hold the exact bytes that were sent. Packets
+    // are consumed in receive-buffer post order, so packet i lands in RxId(i+1).
+    let mut offset = 0;
+    for (i, rx_id) in rx_ids.iter().take(rx_n).enumerate() {
+        assert_eq!(rx_id.0, (i + 1) as u32);
+        let buffer_size = pool.capacity(*rx_id) as u64;
+        let mut received = vec![0u8; PACKET_LEN];
+        payload_mem
+            .read_at(buffer_size * rx_id.0 as u64, &mut received)
+            .unwrap();
+        assert_eq!(
+            received,
+            data_to_send[offset..offset + PACKET_LEN],
+            "payload mismatch for {rx_id:?}"
+        );
+        offset += PACKET_LEN;
+    }
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
 }
 
 /// Per-queue state inside the [`SteeringSwitch`].

@@ -238,6 +238,22 @@ pub struct ManaCfgRxSteerReq {
     pub reserved: u8,
     pub default_rxobj: u64,
     pub hashkey: [u8; 40],
+    // A `GDMA_MESSAGE_V2` request (`mana_cfg_rx_steer_req_v2`) inserts
+    // `cqe_coalescing_enable: u8` followed by `reserved2: [u8; 7]` here, before
+    // the variable-length indirection table. The fixed struct stays at the V1
+    // layout; the table is located via `indir_tab_offset`, which accounts for
+    // the extra 8 bytes.
+}
+
+/// `GDMA_MESSAGE_V2` response body for `MANA_CONFIG_VPORT_RX`
+/// (`mana_cfg_rx_steer_resp`). Follows the `GdmaRespHdr` and reports the RX CQE
+/// coalescing window the device honors when the driver opts in via
+/// `cqe_coalescing_enable`.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaCfgRxSteerResp {
+    pub cqe_coalescing_timeout_ns: u32,
+    pub reserved1: u32,
 }
 
 #[repr(transparent)]
@@ -291,6 +307,11 @@ pub const CQE_TX_GDMA_ERR: u8 = 42;
 
 pub const MANA_CQE_COMPLETION: u8 = 1;
 
+/// Number of per-packet info entries in a receive completion OOB. A
+/// `CQE_RX_COALESCED_4` carries up to this many packets, each described by one
+/// `ManaRxcompPerpktInfo`; a zero `pkt_len` terminates the batch.
+pub const MANA_RXCOMP_OOB_NUM_PPI: usize = 4;
+
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct ManaTxCompOob {
@@ -310,7 +331,7 @@ pub struct ManaTxCompOobOffsets {
 }
 
 #[repr(C)]
-#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct ManaRxcompPerpktInfo {
     pub pkt_len: u16,
     pub reserved1: u16,
@@ -323,7 +344,7 @@ pub struct ManaRxcompPerpktInfo {
 pub struct ManaRxcompOob {
     pub cqe_hdr: ManaCqeHeader,
     pub flags: ManaRxcompOobFlags,
-    pub ppi: [ManaRxcompPerpktInfo; 4],
+    pub ppi: [ManaRxcompPerpktInfo; MANA_RXCOMP_OOB_NUM_PPI],
     pub rx_wqe_offset: u32,
 }
 

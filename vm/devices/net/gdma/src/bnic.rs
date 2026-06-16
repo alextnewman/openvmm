@@ -18,6 +18,7 @@ use self::bnic_defs::ManaSetVportSerialNo;
 use self::bnic_defs::ManaTxCompOob;
 use self::bnic_defs::ManaTxCompOobOffsets;
 use crate::VportConfig;
+use crate::bnic::bnic_defs::CQE_RX_COALESCED_4;
 use crate::bnic::bnic_defs::CQE_RX_OKAY;
 use crate::bnic::bnic_defs::ManaCfgRxSteerReq;
 use crate::bnic::bnic_defs::ManaConfigVportReq;
@@ -32,11 +33,14 @@ use crate::hwc::HwState;
 use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
+use gdma_defs::GDMA_MESSAGE_V2;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
 use gdma_defs::Wqe;
 use gdma_defs::access::WqeAccess;
 use gdma_defs::bnic as bnic_defs;
+use gdma_defs::bnic::MANA_RXCOMP_OOB_NUM_PPI;
+use gdma_defs::bnic::ManaCfgRxSteerResp;
 use gdma_defs::bnic::ManaDestroyWqobjReq;
 use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::ManaTxShortOob;
@@ -90,6 +94,15 @@ const MANA_INDIRECTION_TABLE_SIZE: u32 = 128;
 /// effective count is additionally clamped to what the backend endpoint
 /// supports.
 const MANA_MAX_QUEUES_PER_VPORT: u16 = 16;
+
+/// RX CQE coalescing window, in nanoseconds, reported to the driver in the
+/// `GDMA_MESSAGE_V2` `MANA_CONFIG_VPORT_RX` response. The hardware programs a
+/// 512-cycle timeout at 250 MHz (512 / 250e6 = 2048 ns); the Linux driver uses
+/// the same value (`MANA_RX_CQE_NSEC_DEF`) as its fallback default. The emulated
+/// datapath does not arm a real timer -- it coalesces whatever receive
+/// completions are ready in a single poll -- but reports the canonical window so
+/// the value the driver surfaces (e.g. via `ethtool -c`) matches real hardware.
+const MANA_RX_CQE_COALESCING_TIMEOUT_NS: u32 = 2048;
 
 pub struct GuestBuffers {
     gm: GuestMemory,
@@ -221,6 +234,11 @@ struct Vport {
     tasks: Vec<TaskControl<TxRxState, TxRxTask>>,
     queue_cfg: QueueCfg,
     serial_no: u32,
+    /// Whether the driver opted into RX CQE coalescing for this vport via the
+    /// `GDMA_MESSAGE_V2` `MANA_CONFIG_VPORT_RX` request (`cqe_coalescing_enable`).
+    /// When set, the datapath packs up to `MANA_RXCOMP_OOB_NUM_PPI` receive
+    /// completions into a single `CQE_RX_COALESCED_4`.
+    cqe_coalescing: bool,
 }
 
 impl InspectMut for Vport {
@@ -270,6 +288,8 @@ async fn start_vport_datapath(
     if n == 0 {
         anyhow::bail!("queues not configured");
     }
+
+    let cqe_coalescing = vport.cqe_coalescing;
 
     // When an indirection table is supplied it is located at `indir_tab_offset`
     // bytes from the start of the GDMA request (including the request header) --
@@ -352,6 +372,7 @@ async fn start_vport_datapath(
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
                 rx_buf_count: 0,
+                cqe_coalescing,
             },
         );
         task.start();
@@ -393,6 +414,7 @@ impl BasicNic {
                         tasks: Vec::new(),
                         queue_cfg: QueueCfg::default(),
                         serial_no: 0,
+                        cqe_coalescing: false,
                     }
                 },
             )
@@ -603,10 +625,27 @@ impl BasicNic {
                     .read_plain()
                     .context("reading config vport rx request")?;
                 tracing::debug!(?req, "rx config");
+
+                // The driver negotiates RX CQE coalescing through the
+                // `GDMA_MESSAGE_V2` form of this request. V2 inserts a
+                // `cqe_coalescing_enable` byte (followed by 7 reserved bytes)
+                // between the fixed request struct and the indirection table;
+                // it is meaningful only when the receive path is being enabled
+                // (`rx_enable != FALSE`). Peek the byte without disturbing the
+                // read cursor, which `start_vport_datapath` relies on to seek to
+                // the table at `indir_tab_offset`.
+                let is_v2 = hdr.req.msg_version >= GDMA_MESSAGE_V2;
+
                 let vport = self
                     .vports
                     .get_mut(req.vport as usize)
                     .context("invalid vport")?;
+
+                if is_v2 && req.rx_enable != Tristate::FALSE {
+                    let mut peek = read.clone();
+                    let enable: u8 = peek.read_plain().context("reading cqe_coalescing_enable")?;
+                    vport.cqe_coalescing = enable != 0;
+                }
 
                 match req.rx_enable {
                     Tristate::FALSE => {
@@ -628,6 +667,8 @@ impl BasicNic {
                         // queues) and rebuild them with the new table/key. Without
                         // this the update falls through and is silently ignored --
                         // the device acks success but the steering never changes.
+                        // A coalescing toggle (ethtool -C rx-frames) arrives the
+                        // same way, so the rebuilt tasks pick up the new setting.
                         if !vport.tasks.is_empty()
                             && (req.update_indir_tab != 0 || req.update_hashkey != 0)
                         {
@@ -635,6 +676,19 @@ impl BasicNic {
                             start_vport_datapath(vport, state, &req, &mut read).await?;
                         }
                     }
+                }
+
+                // V2 requests expect a response body reporting the coalescing
+                // window the device honors. V1 requests allocate no body, so the
+                // `min` collapses the write to nothing.
+                if is_v2 {
+                    let resp = ManaCfgRxSteerResp {
+                        cqe_coalescing_timeout_ns: MANA_RX_CQE_COALESCING_TIMEOUT_NS,
+                        reserved1: 0,
+                    };
+                    let resp_bytes = resp.as_bytes();
+                    let write_len = guest_resp_size.min(resp_bytes.len());
+                    write.write(&resp_bytes[..write_len])?;
                 }
             }
             ManaCommandCode::MANA_VTL2_MOVE_FILTER => {
@@ -725,6 +779,10 @@ pub struct TxRxTask {
     rq_cq_id: u32,
     tx_segment_buffer: Vec<TxSegment>,
     rx_buf_count: u32,
+    /// When set, pack up to `MANA_RXCOMP_OOB_NUM_PPI` ready receive completions
+    /// into a single `CQE_RX_COALESCED_4` instead of posting one `CQE_RX_OKAY`
+    /// per packet. Negotiated per-vport via the V2 `MANA_CONFIG_VPORT_RX`.
+    cqe_coalescing: bool,
 }
 
 impl InspectTaskMut<TxRxTask> for TxRxState {
@@ -929,19 +987,21 @@ impl TxRxTask {
     }
 
     fn process_backend(&mut self) -> anyhow::Result<()> {
-        let mut packets = [RxId(0)];
-        if self.epqueue.rx_poll(&mut self.pool, &mut packets)? > 0 {
-            tracing::trace!("rx complete");
-            let packet = self
-                .pool
-                .rx_packets
-                .try_remove(packets[0].0 as usize)
-                .context("invalid rx id")?;
-
-            self.queues
-                .post_cq(self.rq_cq_id, packet.oob.as_bytes(), self.rq_id, false);
-
-            self.rx_buf_count -= 1;
+        // Pull up to `MANA_RXCOMP_OOB_NUM_PPI` ready receive completions when the
+        // driver has enabled coalescing, otherwise one at a time (the historic
+        // one-CQE-per-packet behavior). Packets are returned in receive-queue
+        // post order, which is the order the driver consumes its posted buffers.
+        let max = if self.cqe_coalescing {
+            MANA_RXCOMP_OOB_NUM_PPI
+        } else {
+            1
+        };
+        let mut ids = [RxId(0); MANA_RXCOMP_OOB_NUM_PPI];
+        let n = self.epqueue.rx_poll(&mut self.pool, &mut ids[..max])?;
+        if n > 0 {
+            tracing::trace!(n, "rx complete");
+            self.post_rx_completions(&ids[..n])?;
+            self.rx_buf_count -= n as u32;
         }
 
         let mut packets = [TxId(0)];
@@ -950,6 +1010,63 @@ impl TxRxTask {
             self.post_tx_completion();
         }
 
+        Ok(())
+    }
+
+    /// Posts receive completions for `ids` (given in receive-queue post order).
+    ///
+    /// When coalescing is enabled a maximal run of consecutive packets that
+    /// carry identical completion metadata -- a `CQE_RX_OKAY` type and the same
+    /// OOB `flags` (checksum result, VLAN presence/tag, hash type), which the
+    /// driver reads once per CQE and applies to every packet in the batch -- is
+    /// packed into one `CQE_RX_COALESCED_4` carrying up to
+    /// `MANA_RXCOMP_OOB_NUM_PPI` per-packet lengths and hashes, zero-terminated.
+    /// A run of one, or any non-`CQE_RX_OKAY` completion (e.g. a truncation), is
+    /// posted as its own single CQE -- matching the device rule that a batch of
+    /// one is reported as `CQE_RX_OKAY`. The driver consumes one posted receive
+    /// buffer per packet, in order, so coalescing never changes which buffer a
+    /// packet lands in.
+    fn post_rx_completions(&mut self, ids: &[RxId]) -> anyhow::Result<()> {
+        let mut start = 0;
+        while start < ids.len() {
+            let first = self
+                .pool
+                .rx_packets
+                .try_remove(ids[start].0 as usize)
+                .context("invalid rx id")?;
+
+            let mut oob = first.oob;
+            let can_coalesce = self.cqe_coalescing && oob.cqe_hdr.cqe_type() == CQE_RX_OKAY;
+            let first_flags = oob.flags.into_bits();
+
+            let mut count = 1;
+            if can_coalesce {
+                while start + count < ids.len() && count < MANA_RXCOMP_OOB_NUM_PPI {
+                    let next = &self.pool.rx_packets[ids[start + count].0 as usize];
+                    if next.oob.cqe_hdr.cqe_type() != CQE_RX_OKAY
+                        || next.oob.flags.into_bits() != first_flags
+                    {
+                        break;
+                    }
+                    oob.ppi[count] = next.oob.ppi[0];
+                    count += 1;
+                }
+            }
+
+            if count > 1 {
+                oob.cqe_hdr = oob.cqe_hdr.with_cqe_type(CQE_RX_COALESCED_4);
+                for k in 1..count {
+                    self.pool
+                        .rx_packets
+                        .try_remove(ids[start + k].0 as usize)
+                        .context("invalid rx id")?;
+                }
+            }
+
+            self.queues
+                .post_cq(self.rq_cq_id, oob.as_bytes(), self.rq_id, false);
+            start += count;
+        }
         Ok(())
     }
 }

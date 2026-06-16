@@ -182,6 +182,7 @@ async fn test_gdma(driver: DefaultDriver) {
             hash_key: None,
             default_rxobj: None,
             indirection_table: None,
+            cqe_coalescing: false,
         },
     )
     .await
@@ -1070,6 +1071,7 @@ async fn test_gdma_live_rss_resteer(driver: DefaultDriver) {
             hash_key: None,
             default_rxobj: None,
             indirection_table: Some(&table_a),
+            cqe_coalescing: false,
         },
     )
     .await
@@ -1082,6 +1084,7 @@ async fn test_gdma_live_rss_resteer(driver: DefaultDriver) {
             hash_key: None,
             default_rxobj: None,
             indirection_table: Some(&table_b),
+            cqe_coalescing: false,
         },
     )
     .await

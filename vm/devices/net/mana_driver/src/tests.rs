@@ -992,6 +992,78 @@ async fn test_gdma_dma_region_add_pages(driver: DefaultDriver) {
     arena.destroy(&mut gdma).await;
 }
 
+/// The driver splits a DMA region whose page list does not fit in one HW
+/// channel message into a `GDMA_CREATE_DMA_REGION` plus follow-up
+/// `GDMA_DMA_REGION_ADD_PAGES` messages, and the device reassembles them into a
+/// single usable region. This drives the high-level `create_dma_region` path
+/// with a 32-page region (two 16-page messages) and binds the result to an EQ,
+/// which the device accepts only once every page has arrived and the region's
+/// length matches the queue size. Before the split the driver could describe at
+/// most one message's worth of pages.
+#[async_test]
+async fn test_gdma_large_dma_region_split(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_large_dma_region_split");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    // 32 pages span two 16-page messages and form a power-of-two ring size.
+    const REGION_PAGES: usize = 32;
+    let region_buffer = gdma
+        .device()
+        .dma_client()
+        .allocate_dma_buffer(REGION_PAGES * PAGE_SIZE)
+        .unwrap();
+
+    let mut arena = ResourceArena::new();
+    let gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, region_buffer)
+        .await
+        .unwrap();
+
+    // The reassembled region must be complete and correctly sized: binding it to
+    // an EQ exercises the device's region lookup end to end.
+    gdma.create_eq(
+        &mut arena,
+        dev_id,
+        gdma_region,
+        (REGION_PAGES * PAGE_SIZE) as u32,
+        device_props.pdid,
+        device_props.db_id,
+        0,
+    )
+    .await
+    .unwrap();
+
+    arena.destroy(&mut gdma).await;
+}
+
 /// `ethtool -S` drives `MANA_QUERY_STATS`; the device must service it and return
 /// a response whose `reported_statistics` mask covers what the driver requested.
 /// Before this was handled the command was rejected and stats reporting failed.

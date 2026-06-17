@@ -99,7 +99,11 @@ impl<T: Ord> ContainsRange<T> for Range<T> {
     }
 
     fn overlaps_range(&self, r: &Range<T>) -> bool {
-        r.end >= self.start && self.end >= r.start
+        // Half-open ranges `[a, b)` and `[c, d)` overlap iff `a < d && c < b`.
+        // Using `>=` would treat *adjacent* ranges as overlapping, which makes
+        // the SMC handler fire on a write to the dword just below the header
+        // dword (see `write_shmem`), reading a not-yet-written header.
+        r.end > self.start && self.end > r.start
     }
 }
 
@@ -458,5 +462,43 @@ impl PciConfigSpace for GdmaDevice {
 
     fn pci_cfg_write(&mut self, offset: u16, value: u32) -> IoResult {
         self.config.write_u32(offset, value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SMC handler must fire only when a guest write actually touches the
+    /// final header dword `[SHMEM_LEN - 4, SHMEM_LEN)`. The driver fills the
+    /// shared-memory aperture one dword at a time and writes the header dword
+    /// last, so a write to the immediately-preceding dword is *adjacent* to the
+    /// trigger range, not overlapping it. Treating adjacency as overlap makes
+    /// the device read the not-yet-written (all-zero) header and reject it as
+    /// `msg_type` 0, emitting a spurious "unsupported request 0x0" error just
+    /// before the real ESTABLISH_HWC.
+    #[test]
+    fn smc_trigger_excludes_adjacent_dword() {
+        let trigger = (SHMEM_LEN - 4)..SHMEM_LEN;
+
+        // Writes that genuinely touch the header dword must trigger the handler.
+        assert!(trigger.overlaps_range(&((SHMEM_LEN - 4)..SHMEM_LEN)));
+        assert!(trigger.overlaps_range(&((SHMEM_LEN - 4)..(SHMEM_LEN - 3))));
+        assert!(trigger.overlaps_range(&(0..SHMEM_LEN)));
+
+        // The dword immediately below the header is adjacent, not overlapping,
+        // and must NOT trigger the handler.
+        assert!(!trigger.overlaps_range(&((SHMEM_LEN - 8)..(SHMEM_LEN - 4))));
+        assert!(!trigger.overlaps_range(&(0..4)));
+    }
+
+    /// `contains_range` is likewise half-open: a sub-range that ends exactly at
+    /// the container's end is contained, but one byte past is not.
+    #[test]
+    fn contains_range_is_half_open() {
+        let region = 0..SHMEM_LEN;
+        assert!(region.contains_range(&((SHMEM_LEN - 4)..SHMEM_LEN)));
+        assert!(region.contains_range(&(0..SHMEM_LEN)));
+        assert!(!region.contains_range(&(0..(SHMEM_LEN + 1))));
     }
 }

@@ -2721,6 +2721,7 @@ dependencies = [
  "gdma_resources",
  "guestmem",
  "inspect",
+ "mesh",
  "net_backend",
  "net_backend_resources",
  "parking_lot",

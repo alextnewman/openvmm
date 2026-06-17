@@ -277,6 +277,11 @@ impl Vport {
             }
             // Dropping the task releases its backend queue.
         }
+        // The receive tasks are gone, so drop their fence senders: any future
+        // fence has nothing in flight to order against and is posted inline.
+        for rx in &mut self.queue_cfg.rx {
+            rx.fence_tx = None;
+        }
         self.endpoint.stop().await;
     }
 }
@@ -366,6 +371,11 @@ async fn start_vport_datapath(
         let (sq_id, sq_cq_id) = (vport.queue_cfg.tx[k].wq_id, vport.queue_cfg.tx[k].cq_id);
         let (rq_id, rq_cq_id) = (vport.queue_cfg.rx[k].wq_id, vport.queue_cfg.rx[k].cq_id);
 
+        // Route fences for this receive object through its task so the fence
+        // CQE is ordered after the task's prior receive completions.
+        let (fence_tx, fence_rx) = mesh::channel();
+        vport.queue_cfg.rx[k].fence_tx = Some(fence_tx);
+
         let mut task = TaskControl::new(TxRxState);
         task.insert(
             &state.queues.driver,
@@ -384,6 +394,7 @@ async fn start_vport_datapath(
                 tx_segment_buffer: Vec::new(),
                 rx_buf_count: 0,
                 cqe_coalescing: cqe_coalescing.clone(),
+                fence_rx,
             },
         );
         task.start();
@@ -399,6 +410,13 @@ struct WqObject {
     wq_obj: u64,
     wq_id: u32,
     cq_id: u32,
+    /// Set while the receive datapath task for this object is live. The
+    /// `MANA_FENCE_RQ` handler sends on this channel to route the fence through
+    /// the owning task, so the `CQE_RX_OBJECT_FENCE` is posted strictly after
+    /// every receive completion the task has already produced (a true ordering
+    /// barrier). `None` for send objects and whenever the datapath is stopped,
+    /// in which case the fence is posted inline (nothing is in flight to order).
+    fence_tx: Option<mesh::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -559,6 +577,7 @@ impl BasicNic {
                     wq_obj,
                     wq_id,
                     cq_id,
+                    fence_tx: None,
                 });
 
                 write.write(resp.as_bytes())?;
@@ -605,31 +624,42 @@ impl BasicNic {
 
                 // The driver fences a receive queue (on RSS reconfiguration and
                 // on vport teardown) by sending this command and then blocking
-                // until a fence completion lands on the queue's CQ. Locate the
-                // receive object by its handle and post a CQE_RX_OBJECT_FENCE so
-                // the driver's fence_event completes instead of timing out.
-                let (cq_id, wq_id) = self
-                    .vports
-                    .iter()
-                    .find_map(|vport| {
-                        vport
-                            .queue_cfg
-                            .rx
-                            .iter()
-                            .find(|w| w.wq_obj == req.wq_obj_handle)
-                            .map(|w| (w.cq_id, w.wq_id))
-                    })
-                    .context("specified rq does not exist")?;
+                // until a fence completion lands on the queue's CQ. The fence is
+                // an ordering barrier: every receive completion already produced
+                // for the queue must be visible on its CQ ahead of the
+                // CQE_RX_OBJECT_FENCE. When the datapath is live, route the fence
+                // through the owning receive task (the sole producer of the CQ),
+                // which drains any ready receives and then posts the fence, so
+                // program order provides the barrier. With no live task (during
+                // teardown, or before rx_enable) nothing is in flight, so post
+                // the fence inline.
+                let target = self.vports.iter().find_map(|vport| {
+                    vport
+                        .queue_cfg
+                        .rx
+                        .iter()
+                        .find(|w| w.wq_obj == req.wq_obj_handle)
+                        .map(|w| (w.cq_id, w.wq_id, w.fence_tx.clone()))
+                });
+                let (cq_id, wq_id, fence_tx) = target.context("specified rq does not exist")?;
 
-                let fence = ManaRxcompOob {
-                    cqe_hdr: ManaCqeHeader::new()
-                        .with_cqe_type(CQE_RX_OBJECT_FENCE)
-                        .with_client_type(MANA_CQE_COMPLETION),
-                    ..FromZeros::new_zeroed()
+                let routed = match &fence_tx {
+                    Some(tx) if !tx.is_closed() => {
+                        tx.send(());
+                        true
+                    }
+                    _ => false,
                 };
-                state
-                    .queues
-                    .post_cq(cq_id, fence.as_bytes(), wq_id, false);
+
+                if !routed {
+                    let fence = ManaRxcompOob {
+                        cqe_hdr: ManaCqeHeader::new()
+                            .with_cqe_type(CQE_RX_OBJECT_FENCE)
+                            .with_client_type(MANA_CQE_COMPLETION),
+                        ..FromZeros::new_zeroed()
+                    };
+                    state.queues.post_cq(cq_id, fence.as_bytes(), wq_id, false);
+                }
             }
             ManaCommandCode::MANA_CONFIG_VPORT_RX => {
                 let req: ManaCfgRxSteerReq = read
@@ -827,6 +857,10 @@ pub struct TxRxTask {
     /// shared with the owning [`Vport`], so a live toggle is observed here on
     /// the next backend poll without rebuilding the task.
     cqe_coalescing: Arc<AtomicBool>,
+    /// Receives fence requests routed from the `MANA_FENCE_RQ` handler. Handling
+    /// a fence drains the backend's ready receives and then posts a
+    /// `CQE_RX_OBJECT_FENCE`, so the fence is ordered after them on the CQ.
+    fence_rx: mesh::Receiver<()>,
 }
 
 impl InspectTaskMut<TxRxTask> for TxRxState {
@@ -847,6 +881,7 @@ impl TxRxTask {
             Sqe(Wqe),
             Rqe(u32, Wqe),
             Ready,
+            Fence,
         }
 
         loop {
@@ -865,6 +900,12 @@ impl TxRxTask {
                 if self.epqueue.poll_ready(cx, &mut self.pool).is_ready() {
                     return Poll::Ready(Event::Ready);
                 }
+                // Poll the fence channel last so that any receive batch made
+                // ready above is drained in the same wake before the fence is
+                // handled, keeping the fence ordered after in-flight receives.
+                if let Poll::Ready(Ok(())) = self.fence_rx.poll_recv(cx) {
+                    return Poll::Ready(Event::Fence);
+                }
                 Poll::Pending
             })
             .await;
@@ -872,6 +913,7 @@ impl TxRxTask {
                 Event::Sqe(sqe) => self.process_sqe(sqe)?,
                 Event::Rqe(wqe_offset, wqe) => self.process_rqe(wqe, wqe_offset)?,
                 Event::Ready => self.process_backend()?,
+                Event::Fence => self.post_fence()?,
             }
         }
     }
@@ -1112,6 +1154,39 @@ impl TxRxTask {
                 .post_cq(self.rq_cq_id, oob.as_bytes(), self.rq_id, false);
             start += count;
         }
+        Ok(())
+    }
+
+    /// Drains every receive completion the backend has already produced and then
+    /// posts a `CQE_RX_OBJECT_FENCE`, making the fence a true ordering barrier:
+    /// because this task is the sole producer of the receive CQ, draining first
+    /// guarantees the driver observes all prior receive completions ahead of the
+    /// fence. The real hardware posts the fence after in-flight receives so the
+    /// driver's `fence_event` completes only once the queue has quiesced.
+    fn post_fence(&mut self) -> anyhow::Result<()> {
+        let max = if self.cqe_coalescing.load(Ordering::Relaxed) {
+            MANA_RXCOMP_OOB_NUM_PPI
+        } else {
+            1
+        };
+        loop {
+            let mut ids = [RxId(0); MANA_RXCOMP_OOB_NUM_PPI];
+            let n = self.epqueue.rx_poll(&mut self.pool, &mut ids[..max])?;
+            if n == 0 {
+                break;
+            }
+            self.post_rx_completions(&ids[..n])?;
+            self.rx_buf_count -= n as u32;
+        }
+
+        let fence = ManaRxcompOob {
+            cqe_hdr: ManaCqeHeader::new()
+                .with_cqe_type(CQE_RX_OBJECT_FENCE)
+                .with_client_type(MANA_CQE_COMPLETION),
+            ..FromZeros::new_zeroed()
+        };
+        self.queues
+            .post_cq(self.rq_cq_id, fence.as_bytes(), self.rq_id, false);
         Ok(())
     }
 }

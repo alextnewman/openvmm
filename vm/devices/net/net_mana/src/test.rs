@@ -2183,3 +2183,274 @@ async fn rx_fence_cqe_is_bare_completion(driver: DefaultDriver) {
     endpoint.vport.destroy(arena).await;
     endpoint.stop().await;
 }
+
+/// Backend state for [`FenceOrderEndpoint`]. Receive completions are injected
+/// by the test (via `staged`) rather than produced from transmitted frames, and
+/// -- unlike a loopback backend -- staging does NOT wake the device's receive
+/// task. That leaves staged receives "ready but unposted" until something else
+/// wakes the task, which is exactly the window a fence must not jump.
+#[derive(Default)]
+struct FenceOrderState {
+    /// Receive buffers the device has handed to the backend.
+    buffers: VecDeque<RxId>,
+    /// Number of identical packets staged to complete on the next poll.
+    staged: usize,
+    /// Bytes written into each completed receive buffer.
+    packet: Vec<u8>,
+    /// Waker registered by the device's receive task. The test never fires it,
+    /// so staging is silent.
+    waker: Option<Waker>,
+}
+
+/// A test backend whose receive completions are staged out-of-band by the test
+/// without waking the device's receive task, used to prove the fence is posted
+/// after in-flight receives.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct FenceOrderEndpoint {
+    state: Arc<Mutex<FenceOrderState>>,
+}
+
+#[async_trait]
+impl Endpoint for FenceOrderEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "fence-order-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        for _ in 0..config.len() {
+            queues.push(Box::new(FenceOrderQueue {
+                state: self.state.clone(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 128,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct FenceOrderQueue {
+    state: Arc<Mutex<FenceOrderState>>,
+}
+
+impl Queue for FenceOrderQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.staged > 0 && !state.buffers.is_empty() {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        self.state.lock().buffers.extend(done.iter().copied());
+    }
+
+    fn rx_poll(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let mut state = self.state.lock();
+        let mut n = 0;
+        while n < packets.len() && state.staged > 0 && !state.buffers.is_empty() {
+            let rx_id = state.buffers.pop_front().unwrap();
+            let data = state.packet.clone();
+            pool.write_packet(
+                rx_id,
+                &net_backend::RxMetadata {
+                    offset: 0,
+                    len: data.len(),
+                    ..Default::default()
+                },
+                &data,
+            );
+            state.staged -= 1;
+            packets[n] = rx_id;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let sent = segments
+            .iter()
+            .filter(|s| matches!(s.ty, net_backend::TxSegmentType::Head(_)))
+            .count();
+        Ok((true, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        Ok(0)
+    }
+}
+
+/// The fence is a drain barrier: a `CQE_RX_OBJECT_FENCE` must be posted strictly
+/// after every receive completion the device has already produced for the
+/// queue. This stages four receives that are ready in the backend but not yet
+/// posted (and that do NOT wake the receive task), fences the queue, and asserts
+/// that by the time net_mana observes the fence it has already delivered all
+/// four packets. If the device posts the fence inline (the pre-barrier
+/// behavior) the receive task is never woken to drain the staged receives, so
+/// the fence is observed with zero packets delivered -- a true regression guard.
+#[async_test]
+async fn rx_fence_orders_after_inflight_receives(driver: DefaultDriver) {
+    const NUM_PACKETS: usize = 4;
+    const PACKET_LEN: usize = 64;
+
+    let state = Arc::new(Mutex::new(FenceOrderState {
+        packet: vec![0xAB; PACKET_LEN],
+        ..Default::default()
+    }));
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_fence_order");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(FenceOrderEndpoint {
+                state: state.clone(),
+            }),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers and let the device's receive task drain them into the
+    // backend, so the backend can complete staged packets and the task is parked
+    // (poll_ready Pending) before we stage anything.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+    let mut handed = 0;
+    for _ in 0..40 {
+        handed = state.lock().buffers.len();
+        if handed >= NUM_PACKETS {
+            break;
+        }
+        run_executor_for(25).await;
+    }
+    assert!(
+        handed >= NUM_PACKETS,
+        "device must hand at least {NUM_PACKETS} receive buffers to the backend (got {handed})"
+    );
+
+    // Stage the receives WITHOUT waking the receive task: they are now ready in
+    // the backend but unposted, the precise window the fence must not overtake.
+    state.lock().staged = NUM_PACKETS;
+
+    // Fence the queue. With the drain barrier the fence is routed through the
+    // receive task, which drains the staged receives before posting the fence.
+    endpoint
+        .vport
+        .fence_rq(resources.rxq.wq_obj())
+        .await
+        .unwrap();
+
+    // Drive the queue until the fence is observed, counting delivered packets.
+    let mut rx_ids = [RxId(0); NUM_PACKETS + 4];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        if queue.stats.rx_fence.get() >= 1 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        queue.stats.rx_fence.get(),
+        1,
+        "the fence must be observed exactly once"
+    );
+    assert_eq!(
+        rx_n, NUM_PACKETS,
+        "every staged receive must be delivered before the fence is observed"
+    );
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        NUM_PACKETS as u64,
+        "all staged packets must be counted as received"
+    );
+    assert_eq!(
+        queue.stats.rx_errors.get(),
+        0,
+        "the fence path must not record a receive error"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}

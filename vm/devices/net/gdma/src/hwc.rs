@@ -3,6 +3,7 @@
 
 use crate::bnic::BasicNic;
 use crate::dma::DmaRegion;
+use crate::dma::DmaRegionBuilder;
 use crate::queues::QueueAllocError;
 use crate::queues::Queues;
 use anyhow::Context;
@@ -21,6 +22,7 @@ use gdma_defs::GdmaDestroyDmaRegionReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaDisableQueueReq;
+use gdma_defs::GdmaDmaRegionAddPagesReq;
 use gdma_defs::GdmaGenerateResetEventReq;
 use gdma_defs::GdmaGenerateTestEventReq;
 use gdma_defs::GdmaListDevicesResp;
@@ -99,7 +101,16 @@ pub struct Devices {
 
 pub struct HwState {
     pub queues: Arc<Queues>,
-    pub dma_regions: Slab<DmaRegion>,
+    pub dma_regions: Slab<DmaRegionState>,
+}
+
+/// A DMA region slot. A region whose page list spans multiple HW channel
+/// messages stays `Building` until every page has arrived, then becomes
+/// `Ready`; single-message regions are `Ready` immediately. Only `Ready`
+/// regions can be bound to a queue.
+pub enum DmaRegionState {
+    Building(DmaRegionBuilder),
+    Ready(DmaRegion),
 }
 
 impl HwState {
@@ -112,6 +123,12 @@ impl HwState {
             .dma_regions
             .get(gdma_region.wrapping_sub(1) as usize)
             .context("dma region not found")?;
+        let region = match region {
+            DmaRegionState::Ready(region) => region,
+            DmaRegionState::Building(_) => {
+                anyhow::bail!("dma region page list is incomplete")
+            }
+        };
         if region.len() != expected_size as usize {
             anyhow::bail!("dma region size does not match");
         }
@@ -425,22 +442,57 @@ impl HwControl {
             GdmaRequestType::GDMA_CREATE_DMA_REGION => {
                 let req: GdmaCreateDmaRegionReq =
                     read.read_plain().context("reading dma region request")?;
-                if req.page_addr_list_len != req.page_count {
-                    anyhow::bail!("large regions not supported");
-                }
                 let pages: Vec<u64> = read
                     .read_n(req.page_addr_list_len as usize)
                     .context("reading dma region pages")?;
 
-                let dma_region = DmaRegion::new(pages, req.offset_in_page, req.length)
-                    .context("failed to parse dma region input")?;
-                let gdma_region = self.state.dma_regions.insert(dma_region) as u64 + 1;
+                // The guest may deliver the page list across multiple messages:
+                // when `page_addr_list_len` is short of `page_count`, the rest
+                // arrive via GDMA_DMA_REGION_ADD_PAGES. Hold the region as
+                // `Building` until it is whole, then finalize it.
+                let builder =
+                    DmaRegionBuilder::new(pages, req.offset_in_page, req.length, req.page_count)
+                        .context("failed to parse dma region input")?;
+                let state = if builder.is_complete() {
+                    DmaRegionState::Ready(
+                        builder
+                            .build()
+                            .context("failed to parse dma region input")?,
+                    )
+                } else {
+                    DmaRegionState::Building(builder)
+                };
+                let gdma_region = self.state.dma_regions.insert(state) as u64 + 1;
 
                 let resp = GdmaCreateDmaRegionResp { gdma_region };
                 write
                     .write(resp.as_bytes())
                     .context("writing dma region response")?;
                 size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DMA_REGION_ADD_PAGES => {
+                let req: GdmaDmaRegionAddPagesReq =
+                    read.read_plain().context("reading add pages request")?;
+                let pages: Vec<u64> = read
+                    .read_n(req.page_addr_list_len as usize)
+                    .context("reading add pages list")?;
+
+                let slot = self
+                    .state
+                    .dma_regions
+                    .get_mut(req.gdma_region.wrapping_sub(1) as usize)
+                    .context("dma region not found")?;
+                let DmaRegionState::Building(builder) = slot else {
+                    anyhow::bail!("dma region is not awaiting more pages");
+                };
+                builder
+                    .add_pages(&pages)
+                    .context("adding pages to dma region")?;
+                if builder.is_complete() {
+                    let region = builder.build().context("finalizing dma region")?;
+                    *slot = DmaRegionState::Ready(region);
+                }
+                0
             }
             GdmaRequestType::GDMA_DESTROY_DMA_REGION => {
                 let req: GdmaDestroyDmaRegionReq = read

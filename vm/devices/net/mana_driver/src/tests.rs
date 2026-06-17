@@ -14,10 +14,16 @@ use crate::queues::DoorbellPage;
 use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
+use gdma_defs::GDMA_PAGE_TYPE_4K;
+use gdma_defs::GdmaCreateDmaRegionReq;
+use gdma_defs::GdmaCreateDmaRegionResp;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
+use gdma_defs::GdmaDmaRegionAddPagesReq;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
+use gdma_defs::GdmaRequestType;
+use gdma_defs::PAGE_SIZE64;
 use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
 use gdma_defs::bnic::ManaCommandCode;
@@ -867,6 +873,122 @@ async fn test_gdma_destroy_dma_region(driver: DefaultDriver) {
     // The region is now owned by neither side; tell the arena so it does not
     // attempt to destroy it again, then drop its remaining (host) resources.
     arena.take_dma_region(gdma_region);
+    arena.destroy(&mut gdma).await;
+}
+
+/// A DMA region whose page list is too large for one HW channel message is
+/// delivered as a `GDMA_CREATE_DMA_REGION` carrying the first page(s) plus one
+/// or more `GDMA_DMA_REGION_ADD_PAGES` messages supplying the rest. The device
+/// must hold the region incomplete until every page has arrived, then expose it.
+/// Before ADD_PAGES was handled the create itself was rejected ("large regions
+/// not supported") whenever `page_addr_list_len < page_count`, so a split page
+/// list could never be assembled.
+#[async_test]
+async fn test_gdma_dma_region_add_pages(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_dma_region_add_pages");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    // A two-page region whose pages are delivered across two messages.
+    let region_buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(2 * PAGE_SIZE)
+            .unwrap(),
+    );
+    let pfns = region_buffer.pfns();
+    assert_eq!(pfns.len(), 2);
+
+    // CREATE carries only the first page (page_addr_list_len=1 < page_count=2),
+    // so the device must hold the region incomplete.
+    #[repr(C)]
+    #[derive(IntoBytes, Immutable, KnownLayout)]
+    struct CreateReq {
+        req: GdmaCreateDmaRegionReq,
+        pages: [u64; 1],
+    }
+    let create = CreateReq {
+        req: GdmaCreateDmaRegionReq {
+            length: (2 * PAGE_SIZE) as u64,
+            offset_in_page: 0,
+            gdma_page_type: GDMA_PAGE_TYPE_4K,
+            page_count: 2,
+            page_addr_list_len: 1,
+        },
+        pages: [pfns[0] * PAGE_SIZE64],
+    };
+    let resp: GdmaCreateDmaRegionResp = gdma
+        .request(GdmaRequestType::GDMA_CREATE_DMA_REGION.0, dev_id, create)
+        .await
+        .unwrap();
+    let gdma_region = resp.gdma_region;
+
+    // ADD_PAGES supplies the remaining page, completing the region.
+    #[repr(C)]
+    #[derive(IntoBytes, Immutable, KnownLayout)]
+    struct AddReq {
+        req: GdmaDmaRegionAddPagesReq,
+        pages: [u64; 1],
+    }
+    let add = AddReq {
+        req: GdmaDmaRegionAddPagesReq {
+            gdma_region,
+            page_addr_list_len: 1,
+            reserved: 0,
+        },
+        pages: [pfns[1] * PAGE_SIZE64],
+    };
+    gdma.request::<_, ()>(GdmaRequestType::GDMA_DMA_REGION_ADD_PAGES.0, dev_id, add)
+        .await
+        .unwrap();
+
+    // The assembled region must now be usable. Binding it to an EQ exercises the
+    // device's region lookup, which validates that the page list is complete and
+    // that its length matches the queue size (two pages here).
+    let mut arena = ResourceArena::new();
+    arena.push(crate::resources::Resource::DmaRegion {
+        dev_id,
+        gdma_region,
+    });
+    gdma.create_eq(
+        &mut arena,
+        dev_id,
+        gdma_region,
+        (2 * PAGE_SIZE) as u32,
+        device_props.pdid,
+        device_props.db_id,
+        0,
+    )
+    .await
+    .unwrap();
+
     arena.destroy(&mut gdma).await;
 }
 

@@ -2059,3 +2059,123 @@ async fn test_rss_steering_distributes_across_queues(driver: DefaultDriver) {
     drop(queues);
     endpoint.stop().await;
 }
+
+/// Yields to the executor for up to `ms` milliseconds so spawned device tasks
+/// (the emulator's receive task) can make progress while the test holds no
+/// pending future of its own.
+async fn run_executor_for(ms: u64) {
+    let mut ctx = CancelContext::new().with_timeout(Duration::from_millis(ms));
+    let _ = ctx.until_cancelled(std::future::pending::<()>()).await;
+}
+
+/// A `MANA_FENCE_RQ` is an ordering barrier, not a packet: the device posts a
+/// bare `CQE_RX_OBJECT_FENCE` that consumes no posted receive buffer. This test
+/// fences a receive object with buffers posted but no traffic, then asserts
+/// net_mana's `rx_poll` reports the fence (via the `rx_fence` counter) without
+/// delivering a packet and, crucially, without recording a receive error --
+/// which is what happens if the fence falls through to the catch-all CQE arm
+/// (it pops a `posted_rx` and increments `rx_errors`). That makes `rx_errors ==
+/// 0` a regression guard for the dedicated fence arm.
+#[async_test]
+async fn rx_fence_cqe_is_bare_completion(driver: DefaultDriver) {
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_fence_bare");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers so there is a non-empty posted_rx that the fence
+    // would (incorrectly) consume if it were treated as a packet completion.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    // Fence the receive object. The device posts a single CQE_RX_OBJECT_FENCE.
+    endpoint
+        .vport
+        .fence_rq(resources.rxq.wq_obj())
+        .await
+        .unwrap();
+
+    // Drive the queue until the fence CQE is processed (or the deadline trips).
+    let mut rx_ids = [RxId(0); 8];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        let _ = queue.tx_poll(&mut pool, &mut [TxId(0); 1]);
+        if queue.stats.rx_fence.get() + queue.stats.rx_errors.get() >= 1 || rx_n > 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        queue.stats.rx_fence.get(),
+        1,
+        "the fence CQE must signal exactly one fence"
+    );
+    assert_eq!(rx_n, 0, "a fence carries no packet");
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        0,
+        "a fence delivers no packets"
+    );
+    assert_eq!(
+        queue.stats.rx_errors.get(),
+        0,
+        "a fence is a barrier, not a receive error"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}

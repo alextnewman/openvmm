@@ -24,7 +24,6 @@ use gdma_defs::bnic::ManaConfigVportResp;
 use gdma_defs::bnic::ManaCreateWqobjReq;
 use gdma_defs::bnic::ManaCreateWqobjResp;
 use gdma_defs::bnic::ManaDestroyWqobjReq;
-#[cfg(test)]
 use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::ManaMoveFilterVTL2PrivilegedReq;
 use gdma_defs::bnic::ManaQueryDeviceCfgReq;
@@ -166,9 +165,8 @@ impl<'a, T: DeviceBacking> BnicDriver<'a, T> {
     /// completion on the queue's CQ. The Linux driver issues this on RSS
     /// reconfiguration and on vport teardown to ensure in-flight receive
     /// completions have drained before the steering table changes. This Rust
-    /// driver does not fence on its datapath, so the method exists to exercise
-    /// the device-side handler from the conformance tests.
-    #[cfg(test)]
+    /// driver does not fence on its datapath, so the method exists to drive the
+    /// device-side fence barrier from the conformance tests.
     pub async fn fence_rq(&mut self, wq_obj_handle: u64) -> anyhow::Result<()> {
         self.gdma
             .request(

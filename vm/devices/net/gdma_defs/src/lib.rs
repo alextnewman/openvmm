@@ -558,6 +558,20 @@ pub struct GdmaCreateDmaRegionResp {
     pub gdma_region: u64,
 }
 
+/// Adds more pages to a DMA region whose `GDMA_CREATE_DMA_REGION` request
+/// carried fewer pages (`page_addr_list_len`) than the region's total
+/// (`page_count`). The driver sends one or more of these, each appending
+/// `page_addr_list_len` page addresses, until the region's page list is
+/// complete and the region becomes usable.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDmaRegionAddPagesReq {
+    pub gdma_region: u64,
+    pub page_addr_list_len: u32,
+    pub reserved: u32,
+    // Followed by a u64 page list of length `page_addr_list_len`.
+}
+
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct GdmaDestroyDmaRegionReq {

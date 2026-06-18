@@ -35,6 +35,7 @@ use crate::hwc::HwState;
 use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
+use futures::FutureExt;
 use gdma_defs::GDMA_MESSAGE_V2;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
@@ -284,6 +285,33 @@ impl Vport {
         }
         self.endpoint.stop().await;
     }
+
+    /// Poll-driven equivalent of [`Vport::stop_datapath`], for tearing the
+    /// datapath down from a synchronous context (a PCIe FLR) via
+    /// `poll_device`. Datapath tasks are stopped and dropped one at a time so
+    /// that progress is preserved across polls: a task that has not finished
+    /// stopping is left in place and re-polled on the next call.
+    fn poll_stop_datapath(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        while !self.tasks.is_empty() {
+            let task = &mut self.tasks[0];
+            if task.is_running() {
+                std::task::ready!(task.poll_stop(cx));
+            }
+            // Dropping the task releases its backend queue.
+            self.tasks.remove(0);
+        }
+        // The receive tasks are gone, so drop their fence senders: any future
+        // fence has nothing in flight to order against and is posted inline.
+        for rx in &mut self.queue_cfg.rx {
+            rx.fence_tx = None;
+        }
+        // The backend queues are released (tasks dropped above), so stop the
+        // endpoint. The emulated backends this device is built against stop
+        // promptly (for example `NullEndpoint::stop` is a no-op), so the
+        // residual stop completes without parking the poller.
+        self.endpoint.stop().now_or_never();
+        Poll::Ready(())
+    }
 }
 
 /// Builds and starts one datapath task per queue pair for `vport`, resolving the
@@ -466,6 +494,20 @@ impl BasicNic {
             vport.queue_cfg = QueueCfg::default();
             vport.serial_no = 0;
         }
+    }
+
+    /// Poll-driven equivalent of [`BasicNic::shutdown`], used to tear down every
+    /// vport datapath from a synchronous context (a PCIe FLR) via
+    /// `poll_device`. Returns `Poll::Pending` while any vport is still
+    /// stopping; earlier vports are already torn down and re-running over them
+    /// on a later poll is idempotent.
+    pub fn poll_shutdown(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        for vport in &mut self.vports {
+            std::task::ready!(vport.poll_stop_datapath(cx));
+            vport.queue_cfg = QueueCfg::default();
+            vport.serial_no = 0;
+        }
+        Poll::Ready(())
     }
 
     pub async fn handle_req(

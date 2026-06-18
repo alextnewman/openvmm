@@ -13,6 +13,8 @@ use crate::queues::Cq;
 use crate::queues::DoorbellPage;
 use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
+use chipset_device::pci::PciConfigSpace;
+use chipset_device::poll_device::PollDevice;
 use gdma::VportConfig;
 use gdma_defs::GDMA_PAGE_TYPE_4K;
 use gdma_defs::GdmaCreateDmaRegionReq;
@@ -42,7 +44,10 @@ use pal_async::async_test;
 use parking_lot::Mutex;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::MsiConnection;
+use pci_core::spec::cfg_space::Command;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
 use test_with_tracing::test;
 use user_driver::DeviceBacking;
 use user_driver::memory::MemoryBlock;
@@ -1569,4 +1574,113 @@ async fn test_gdma_rss_v2_indir_offset(driver: DefaultDriver) {
     );
 
     arena.destroy(&mut gdma).await;
+}
+
+/// Walks the PCI capability list and returns the configuration-space offset of
+/// the PCI Express capability (capability ID `0x10`), panicking if it is
+/// absent. This is the same discovery the guest's `pcie_has_flr()` performs.
+fn find_pci_express_cap(device: &mut gdma::GdmaDevice) -> u16 {
+    const CAP_ID_PCI_EXPRESS: u32 = 0x10;
+    let mut cap_ptr = 0;
+    device.pci_cfg_read(0x34, &mut cap_ptr).unwrap();
+    let mut offset = (cap_ptr & 0xff) as u16;
+    while offset != 0 {
+        let mut header = 0;
+        device.pci_cfg_read(offset, &mut header).unwrap();
+        if header & 0xff == CAP_ID_PCI_EXPRESS {
+            return offset;
+        }
+        offset = ((header >> 8) & 0xff) as u16;
+    }
+    panic!("PCI Express capability not advertised");
+}
+
+/// A guest-initiated PCIe Function Level Reset (the real Linux driver calls
+/// `pcie_flr()` to recover a wedged function in `mana_dealloc_queues`) must
+/// reset the device. The emulator advertises the PCI Express capability with
+/// FLR support and, when the guest writes the FLR bit in Device Control, routes
+/// it to the same teardown as a host reset plus a configuration-space reset.
+///
+/// The teardown is asynchronous (it stops the HW channel task) but the FLR is
+/// triggered from the synchronous config-write path, so it is serviced from
+/// `poll_device`. This test establishes the channel, leaves it active (modeling
+/// a guest that wedged), triggers FLR, pumps `poll_device` to completion, and
+/// asserts the configuration space was reset (memory decode disabled), which is
+/// the last step of the teardown and therefore proves the whole path ran.
+/// Without the FLR wiring there is no PCI Express capability at all, so the
+/// capability walk fails first.
+#[async_test]
+async fn test_gdma_flr_resets_device(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_flr_resets_device");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+
+    // The guest wedged with the channel still established (it never issued
+    // DESTROY_HWC), like the stuck-TX recovery path that calls pcie_flr().
+    abandon_channel(gdma).await;
+
+    let mmio_enabled = Command::new().with_mmio_enabled(true).into_bits() as u32;
+
+    // The device advertises FLR support, and the emulator has memory decode
+    // enabled from enumeration.
+    let cap = {
+        let mut dev = device_inner.lock();
+        let cap = find_pci_express_cap(&mut dev);
+        let mut device_caps = 0;
+        dev.pci_cfg_read(cap + 0x04, &mut device_caps).unwrap();
+        assert_ne!(
+            device_caps & (1 << 28),
+            0,
+            "the PCI Express capability must advertise Function Level Reset"
+        );
+        let mut command = 0;
+        dev.pci_cfg_read(0x4, &mut command).unwrap();
+        assert_ne!(
+            command & mmio_enabled,
+            0,
+            "memory decode should be enabled before the reset"
+        );
+        cap
+    };
+
+    // The guest initiates FLR by writing the FLR bit (bit 15) in Device Control,
+    // at offset 0x08 within the PCI Express capability.
+    device_inner
+        .lock()
+        .pci_cfg_write(cap + 0x08, 1 << 15)
+        .unwrap();
+
+    // Drive the asynchronous teardown that the FLR kicked off. The final step
+    // resets configuration space, so memory decode going low signals that the
+    // whole teardown (HW channel stop, datapath shutdown, config reset) ran.
+    poll_fn(|cx| {
+        let mut dev = device_inner.lock();
+        dev.poll_device(cx);
+        let mut command = 0;
+        dev.pci_cfg_read(0x4, &mut command).unwrap();
+        if command & mmio_enabled == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 }

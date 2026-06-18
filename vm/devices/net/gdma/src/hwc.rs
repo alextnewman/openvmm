@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::bnic::BasicNic;
+use crate::bnic::BnicStatusError;
 use crate::dma::DmaRegion;
 use crate::dma::DmaRegionBuilder;
 use crate::queues::QueueAllocError;
@@ -50,6 +51,7 @@ use gdma_defs::HwcRxOob;
 use gdma_defs::HwcTxOob;
 use gdma_defs::PAGE_SIZE64;
 use gdma_defs::access::WqeAccess;
+use gdma_defs::bnic::bnic_status;
 use guestmem::Limit;
 use guestmem::MemoryRead;
 use guestmem::MemoryWrite;
@@ -286,8 +288,26 @@ impl HwControl {
             let (status, response_len) = match r {
                 Ok(response_len) => (0, response_len),
                 Err(err) => {
-                    tracing::warn!(msg_type = hdr.req.msg_type, dev_id = ?hdr.dev_id, error = err.as_ref() as &dyn std::error::Error, "req error");
-                    (1, 0)
+                    // BNIC client messages carry device-specific status codes:
+                    // surface the code a handler tagged onto the error, else the
+                    // device's generic "not set by handler" default. Core GDMA
+                    // requests keep the generic non-zero failure code.
+                    let status = err.downcast_ref::<BnicStatusError>().map_or(
+                        if hdr.req.msg_type >> 16 != 0 && hdr.dev_id == BNIC_DEV_ID {
+                            bnic_status::NOT_SET_BY_HANDLER
+                        } else {
+                            1
+                        },
+                        |e| e.status,
+                    );
+                    tracing::warn!(
+                        msg_type = hdr.req.msg_type,
+                        dev_id = ?hdr.dev_id,
+                        status,
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "req error"
+                    );
+                    (status, 0)
                 }
             };
 

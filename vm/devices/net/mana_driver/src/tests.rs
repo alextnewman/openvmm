@@ -28,6 +28,7 @@ use gdma_defs::GdmaReqHdr;
 use gdma_defs::GdmaRequestType;
 use gdma_defs::PAGE_SIZE64;
 use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
+use gdma_defs::bnic::MANA_DEFAULT_LINK_SPEED_MBPS;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
 use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaCqeHeader;
@@ -1950,6 +1951,69 @@ async fn test_gdma_query_link_config(driver: DefaultDriver) {
     assert_eq!(
         resp.qos_speed_mbps, LINK_SPEED_MBPS,
         "qos_speed_mbps must report the configured adapter link speed"
+    );
+    assert_eq!(
+        resp.qos_unconfigured, 0,
+        "qos_unconfigured must be 0 or the driver rejects the response with -EINVAL"
+    );
+}
+
+/// With the default `BnicConfig` (no configured link speed) the device must
+/// still report a concrete, non-zero speed for `MANA_QUERY_LINK_CONFIG`. The
+/// guest's `mana_get_link_ksettings` copies `qos_speed_mbps` verbatim into
+/// `ethtool`, which renders 0 as "Unknown!"; a PF that implements this command
+/// always knows its speed, so the emulator reports its nominal line rate
+/// (`MANA_DEFAULT_LINK_SPEED_MBPS`) instead. This mirrors the production path,
+/// which constructs the device via `GdmaDevice::new` (default config).
+#[async_test]
+async fn test_gdma_query_link_config_default_speed(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_link_config_default");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let resp: ManaQueryLinkConfigResp = gdma
+        .request(
+            ManaCommandCode::MANA_QUERY_LINK_CONFIG.0,
+            dev_id,
+            ManaQueryLinkConfigReq { vport: 0 },
+        )
+        .await
+        .expect("query link config must succeed");
+
+    assert_eq!(
+        resp.link_speed_mbps, MANA_DEFAULT_LINK_SPEED_MBPS,
+        "an unconfigured adapter must report the nominal line rate, not 0"
+    );
+    assert_eq!(
+        resp.qos_speed_mbps, MANA_DEFAULT_LINK_SPEED_MBPS,
+        "qos_speed_mbps (ethtool speed) must be the nominal line rate, not 0"
     );
     assert_eq!(
         resp.qos_unconfigured, 0,

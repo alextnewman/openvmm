@@ -67,6 +67,12 @@ pub const MANA_VTL2_ASSIGN_SERIAL_NUMBER_RESPONSE_V1: u16 = 1;
 pub const MANA_VTL2_QUERY_FILTER_STATE_REQUEST_V1: u16 = 1;
 pub const MANA_VTL2_QUERY_FILTER_STATE_RESPONSE_V1: u16 = 1;
 
+/// The device's nominal link speed in Mbps (200 Gbps), reported when no specific
+/// adapter link speed has been configured. Used both as the `link_speed_bps()`
+/// fallback and by the emulated `MANA_QUERY_LINK_CONFIG` handler so the two
+/// link-speed surfaces agree and the guest never observes an unknown/zero speed.
+pub const MANA_DEFAULT_LINK_SPEED_MBPS: u32 = 200_000;
+
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct BasicNicDriverFlags {
@@ -146,7 +152,7 @@ impl ManaQueryDeviceCfgResp {
         if self.adapter_link_speed_mbps > 0 {
             self.adapter_link_speed_mbps as u64 * 1000 * 1000
         } else {
-            200 * 1000 * 1000 * 1000
+            MANA_DEFAULT_LINK_SPEED_MBPS as u64 * 1000 * 1000
         }
     }
 }

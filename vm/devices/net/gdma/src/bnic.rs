@@ -45,6 +45,7 @@ use gdma_defs::GdmaReqHdr;
 use gdma_defs::Wqe;
 use gdma_defs::access::WqeAccess;
 use gdma_defs::bnic as bnic_defs;
+use gdma_defs::bnic::MANA_DEFAULT_LINK_SPEED_MBPS;
 use gdma_defs::bnic::MANA_RXCOMP_OOB_NUM_PPI;
 use gdma_defs::bnic::ManaCfgRxSteerResp;
 use gdma_defs::bnic::ManaDestroyWqobjReq;
@@ -266,6 +267,21 @@ impl BufferAccess for GuestBuffers {
 pub struct BnicConfig {
     /// Adapter link speed in megabits per second.
     pub adapter_link_speed_mbps: u32,
+}
+
+impl BnicConfig {
+    /// The adapter's effective link speed in Mbps: the configured value, or the
+    /// device's nominal line rate ([`MANA_DEFAULT_LINK_SPEED_MBPS`]) when it is
+    /// left unconfigured (0). A modern PF that implements `MANA_QUERY_LINK_CONFIG`
+    /// always knows its link speed, so the handler reports this rather than a
+    /// zero the guest would render as an unknown speed.
+    fn link_speed_mbps(&self) -> u32 {
+        if self.adapter_link_speed_mbps > 0 {
+            self.adapter_link_speed_mbps
+        } else {
+            MANA_DEFAULT_LINK_SPEED_MBPS
+        }
+    }
 }
 
 pub struct BasicNic {
@@ -956,8 +972,12 @@ impl BasicNic {
                 // property in this device, so it is returned for every vport.
                 // `qos_unconfigured` MUST be 0 -- the driver rejects a non-zero
                 // value with -EINVAL -- and `qos_speed_mbps` is the shaper clamp
-                // (the full line rate when no narrower clamp is in effect).
-                let speed_mbps = self.config.adapter_link_speed_mbps;
+                // (the full line rate when no narrower clamp is in effect). When
+                // no speed is configured we report the device's nominal line
+                // rate rather than 0, which the guest would surface as an unknown
+                // link speed (ethtool "Unknown!"); a PF that implements this
+                // command always knows its speed.
+                let speed_mbps = self.config.link_speed_mbps();
                 let resp = ManaQueryLinkConfigResp {
                     qos_speed_mbps: speed_mbps,
                     qos_unconfigured: 0,

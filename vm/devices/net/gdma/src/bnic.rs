@@ -1044,6 +1044,19 @@ impl TxRxTask {
 
         loop {
             let event = poll_fn(|cx| {
+                // Handle a pending fence before servicing the datapath. The
+                // fence is a control-plane barrier the driver blocks on (with a
+                // bounded ~10s timeout per queue); polling it after the receive
+                // and transmit sources -- as this loop previously did -- lets
+                // sustained backend readiness starve it, so the driver's fence
+                // wait times out and `mana_config_rss` stalls (visible as a hang
+                // on, for example, an `ethtool` reconfigure). Poll it first.
+                // Ordering after in-flight receives is still guaranteed because
+                // `post_fence` drains every ready receive completion onto the CQ
+                // before posting the fence CQE.
+                if let Poll::Ready(Ok(())) = self.fence_rx.poll_recv(cx) {
+                    return Poll::Ready(Event::Fence);
+                }
                 // Fill rx before transmitting to avoid rx buffer starvation
                 // (particularly in tests, but seems reasonable in general).
                 if self.rx_buf_count < max_rx_buf {
@@ -1057,12 +1070,6 @@ impl TxRxTask {
                 }
                 if self.epqueue.poll_ready(cx, &mut self.pool).is_ready() {
                     return Poll::Ready(Event::Ready);
-                }
-                // Poll the fence channel last so that any receive batch made
-                // ready above is drained in the same wake before the fence is
-                // handled, keeping the fence ordered after in-flight receives.
-                if let Poll::Ready(Ok(())) = self.fence_rx.poll_recv(cx) {
-                    return Poll::Ready(Event::Fence);
                 }
                 Poll::Pending
             })

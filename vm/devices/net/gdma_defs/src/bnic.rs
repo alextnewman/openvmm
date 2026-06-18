@@ -21,6 +21,7 @@ open_enum! {
         MANA_FENCE_RQ = 0x20006,
         MANA_CONFIG_VPORT_RX = 0x20007,
         MANA_QUERY_VPORT_CONFIG = 0x20008,
+        MANA_QUERY_LINK_CONFIG = 0x2000A,
         MANA_QUERY_PHY_STAT = 0x2000c,
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
@@ -167,6 +168,28 @@ pub struct ManaQueryVportCfgResp {
     pub mac_addr: [u8; 6],
     pub reserved2: [u8; 2],
     pub vport: u64,
+}
+
+/// `MANA_QUERY_LINK_CONFIG` request: the driver asks the device for the link
+/// speed of a vport (surfaced through ethtool and used to seed the QoS shaper).
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryLinkConfigReq {
+    pub vport: u64,
+}
+
+/// `MANA_QUERY_LINK_CONFIG` response. `link_speed_mbps` is the operational link
+/// speed; `qos_speed_mbps` is the rate the QoS shaper is clamped to when
+/// `qos_unconfigured` is 0 (otherwise no clamp is in effect). Layout mirrors
+/// `struct mana_query_link_config_resp` in the Linux MANA driver's `mana.h`.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryLinkConfigResp {
+    pub qos_speed_mbps: u32,
+    pub qos_unconfigured: u8,
+    pub reserved1: [u8; 3],
+    pub link_speed_mbps: u32,
+    pub reserved2: [u8; 4],
 }
 
 /* Move Filter invoked from VTL2 to move filter from VTL2 to VTL0 and back*/

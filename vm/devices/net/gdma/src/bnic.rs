@@ -9,6 +9,8 @@ use self::bnic_defs::MANA_CQE_COMPLETION;
 use self::bnic_defs::MANA_LONG_PKT_FMT;
 use self::bnic_defs::ManaCommandCode;
 use self::bnic_defs::ManaCqeHeader;
+use self::bnic_defs::ManaQueryLinkConfigReq;
+use self::bnic_defs::ManaQueryLinkConfigResp;
 use self::bnic_defs::ManaQueryPhyStatisticsRequest;
 use self::bnic_defs::ManaQueryPhyStatisticsResponse;
 use self::bnic_defs::ManaQueryStatisticsRequest;
@@ -37,6 +39,7 @@ use anyhow::Context;
 use anyhow::anyhow;
 use futures::FutureExt;
 use gdma_defs::GDMA_MESSAGE_V2;
+use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
 use gdma_defs::Wqe;
@@ -942,6 +945,31 @@ impl BasicNic {
                 let write_len = guest_resp_size.min(resp_bytes.len());
                 write.write(&resp_bytes[..write_len])?;
             }
+            ManaCommandCode::MANA_QUERY_LINK_CONFIG => {
+                let _req: ManaQueryLinkConfigReq = read
+                    .read_plain()
+                    .context("reading query link config request")?;
+
+                // ethtool link queries (`mana_get_link_ksettings`) and the QoS
+                // shaper issue this to learn the vport's link speed. Report the
+                // adapter's tracked link speed; the speed is an adapter-wide
+                // property in this device, so it is returned for every vport.
+                // `qos_unconfigured` MUST be 0 -- the driver rejects a non-zero
+                // value with -EINVAL -- and `qos_speed_mbps` is the shaper clamp
+                // (the full line rate when no narrower clamp is in effect).
+                let speed_mbps = self.config.adapter_link_speed_mbps;
+                let resp = ManaQueryLinkConfigResp {
+                    qos_speed_mbps: speed_mbps,
+                    qos_unconfigured: 0,
+                    reserved1: [0; 3],
+                    link_speed_mbps: speed_mbps,
+                    reserved2: [0; 4],
+                };
+
+                let resp_bytes = resp.as_bytes();
+                let write_len = guest_resp_size.min(resp_bytes.len());
+                write.write(&resp_bytes[..write_len])?;
+            }
             ManaCommandCode::MANA_VTL2_ASSIGN_SERIAL_NUMBER => {
                 let req: ManaSetVportSerialNo =
                     read.read_plain().context("set vport serial number")?;
@@ -951,7 +979,21 @@ impl BasicNic {
                     .context("invalid vport")?;
                 vport.serial_no = req.serial_no;
             }
-            n => anyhow::bail!("unsupported request {:?}", n),
+            n => {
+                // A command with no handler is one this device does not
+                // implement. Report it with the GDMA core "command unsupported"
+                // status (0xffffffff) rather than the generic BNIC failure
+                // default: the guest's GDMA client maps this specific code to
+                // -EOPNOTSUPP and tolerates it (logging at most once), whereas
+                // any other non-zero status is a hard -EPROTO it logs on every
+                // occurrence. This distinguishes "command not implemented" from
+                // "an implemented handler failed", which keeps the generic
+                // NOT_SET_BY_HANDLER default and stays -EPROTO. The real driver
+                // probes optional commands (for example MANA_QUERY_LINK_CONFIG)
+                // and expects 0xffffffff for the ones the device lacks.
+                return Err(anyhow::anyhow!("unsupported request {:?}", n))
+                    .bnic_status(GDMA_STATUS_CMD_UNSUPPORTED);
+            }
         }
         Ok(guest_resp_size)
     }

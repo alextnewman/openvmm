@@ -30,8 +30,11 @@ use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
 use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaCqeHeader;
+use gdma_defs::bnic::ManaCreateWqobjReq;
+use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
 use gdma_defs::bnic::Tristate;
+use gdma_defs::bnic::bnic_status;
 use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend::MultiQueueSupport;
@@ -58,6 +61,7 @@ use vmcore::device_state::ChangeDeviceState;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
@@ -1683,4 +1687,139 @@ async fn test_gdma_flr_resets_device(driver: DefaultDriver) {
         }
     })
     .await;
+}
+
+/// The device returns a *specific* BNIC command status code on each negative
+/// path (the host's `_BNIC_COMMAND_STATUS`), not a single generic failure code.
+/// The Linux driver only tests status != 0, but the host's canonical test suite
+/// and command traces observe the exact code, so the emulator must report the
+/// code real hardware uses for each rejection.
+///
+/// Fencing a receive queue whose work-queue-object handle was never created is
+/// rejected with `BasicNicInvalidWQHandle` (29) -- the code the host returns
+/// when the handle lookup fails. (This is deliberately distinct from
+/// `BasicNicFenceRQFailed` (5), which the host uses only after a *successful*
+/// lookup when the fence operation itself fails -- a path the emulator does not
+/// produce.) The driver surfaces the device's status code in its error message,
+/// so assert on it.
+///
+/// A failed command latches the driver into `hwc_failure`, so each negative path
+/// is exercised by its own freshly established driver; see the companion
+/// `test_gdma_create_wqobj_bad_type_status` for a different command reporting a
+/// different, command-appropriate code (proving the codes are per-path rather
+/// than a single constant).
+#[async_test]
+async fn test_gdma_fence_unknown_handle_status(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_fence_unknown_handle_status");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    // Fence a work-queue-object handle that was never created: the handle lookup
+    // fails, so the device must reject the command with InvalidWQHandle (29).
+    let err = gdma
+        .request::<_, ()>(
+            ManaCommandCode::MANA_FENCE_RQ.0,
+            dev_id,
+            ManaFenceRqReq {
+                wq_obj_handle: 0xdead_beef,
+            },
+        )
+        .await
+        .expect_err("fencing an unknown rq handle must be rejected");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed with {:#x}",
+            bnic_status::INVALID_WQ_HANDLE
+        )),
+        "fence of an unknown handle must report BasicNicInvalidWQHandle ({:#x}); \
+         driver error was: {err:#}",
+        bnic_status::INVALID_WQ_HANDLE,
+    );
+}
+
+/// Companion to `test_gdma_fence_unknown_handle_status`: a *different* negative
+/// path reports a *different*, command-appropriate BNIC status code, proving the
+/// codes are per-path rather than a single constant. Creating a work-queue
+/// object with an unsupported queue type (a completion queue is not a valid work
+/// queue) is rejected with `BasicNicStatusUnsupportQueueType` (36).
+#[async_test]
+async fn test_gdma_create_wqobj_bad_type_status(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_create_wqobj_bad_type_status");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let err = gdma
+        .request::<_, ()>(
+            ManaCommandCode::MANA_CREATE_WQ_OBJ.0,
+            dev_id,
+            ManaCreateWqobjReq {
+                wq_type: GdmaQueueType::GDMA_CQ,
+                ..FromZeros::new_zeroed()
+            },
+        )
+        .await
+        .expect_err("creating a wq object with an unsupported queue type must be rejected");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed with {:#x}",
+            bnic_status::UNSUPPORTED_QUEUE_TYPE
+        )),
+        "create-wq with an unsupported queue type must report \
+         BasicNicStatusUnsupportQueueType ({:#x}); driver error was: {err:#}",
+        bnic_status::UNSUPPORTED_QUEUE_TYPE,
+    );
 }

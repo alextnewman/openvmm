@@ -15,6 +15,7 @@ use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::mmio::RegisterMmioIntercept;
 use chipset_device::pci::PciConfigSpace;
+use chipset_device::poll_device::PollDevice;
 use device_emulators::ReadWriteRequestType;
 use device_emulators::read_as_u32_chunks;
 use device_emulators::write_as_u32_chunks;
@@ -36,14 +37,18 @@ use gdma_defs::WqDoorbellValue;
 use guestmem::GuestMemory;
 use hwc::Devices;
 use hwc::HwControl;
+use inspect::Inspect;
 use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend_resources::mac_address::MacAddress;
 use pci_core::capabilities::msix::MsixEmulator;
+use pci_core::capabilities::pci_express::FlrHandler;
+use pci_core::capabilities::pci_express::PciExpressCapability;
 use pci_core::cfg_space_emu::BarMemoryKind;
 use pci_core::cfg_space_emu::ConfigSpaceType0Emulator;
 use pci_core::cfg_space_emu::DeviceBars;
 use pci_core::msi::MsiTarget;
+use pci_core::spec::caps::pci_express::DevicePortType;
 use pci_core::spec::hwid::ClassCode;
 use pci_core::spec::hwid::HardwareIds;
 use pci_core::spec::hwid::ProgrammingInterface;
@@ -51,6 +56,8 @@ use pci_core::spec::hwid::Subclass;
 use queues::Queues;
 use std::ops::Range;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use task_control::TaskControl;
 use thiserror::Error;
 use vmcore::device_state::ChangeDeviceState;
@@ -75,6 +82,32 @@ pub struct GdmaDevice {
     destroying_hwc: bool,
     queues: Arc<Queues>,
     hwc: TaskControl<Devices, HwControl>,
+    /// Receives a notification when the guest initiates a PCIe Function Level
+    /// Reset by writing the FLR bit in the PCI Express capability. The matching
+    /// sender lives in [`GdmaFlrHandler`], owned by that capability. The FLR is
+    /// serviced asynchronously from [`PollDevice::poll_device`] because the
+    /// teardown is async while [`FlrHandler::initiate_flr`] is synchronous.
+    flr_rx: mesh::Receiver<()>,
+    /// Set once an FLR has been observed and cleared when the teardown
+    /// completes. While set, [`PollDevice::poll_device`] keeps driving
+    /// [`GdmaDevice::poll_flr_reset`] to completion across polls.
+    flr_draining: bool,
+}
+
+/// Bridges the synchronous [`FlrHandler::initiate_flr`] callback (invoked from
+/// the PCI config-space write path) to the device's asynchronous reset, which
+/// is driven from [`PollDevice::poll_device`]. The callback only signals the
+/// channel; the actual teardown runs on the device's poll context.
+#[derive(Inspect)]
+struct GdmaFlrHandler {
+    #[inspect(skip)]
+    flr_tx: mesh::Sender<()>,
+}
+
+impl FlrHandler for GdmaFlrHandler {
+    fn initiate_flr(&self) {
+        self.flr_tx.send(());
+    }
 }
 
 impl InspectMut for GdmaDevice {
@@ -156,6 +189,16 @@ impl GdmaDevice {
     ) -> Self {
         let (msix, msix_capability) = MsixEmulator::new(4, 64, msi_target);
 
+        // Route a guest-initiated PCIe Function Level Reset to the device's
+        // async reset. The handler only signals `flr_rx`; `poll_device` runs
+        // the teardown. MSI-X stays first in the capability list so it keeps
+        // its expected configuration-space offset.
+        let (flr_tx, flr_rx) = mesh::channel();
+        let pci_express_capability = PciExpressCapability::new(
+            DevicePortType::Endpoint,
+            Some(Arc::new(GdmaFlrHandler { flr_tx })),
+        );
+
         let hardware_ids = HardwareIds {
             vendor_id: gdma_defs::VENDOR_ID,
             device_id: gdma_defs::DEVICE_ID,
@@ -167,7 +210,10 @@ impl GdmaDevice {
             type0_sub_system_id: 0,
         };
 
-        let capabilities = vec![Box::new(msix_capability) as _];
+        let capabilities = vec![
+            Box::new(msix_capability) as _,
+            Box::new(pci_express_capability) as _,
+        ];
 
         let bar0_mem = mmio_registration.new_io_region("regs", 8192);
         let bar2_mem = mmio_registration.new_io_region("msix", msix.bar_len());
@@ -208,6 +254,8 @@ impl GdmaDevice {
             hwc: TaskControl::new(Devices {
                 bnic: bnic::BasicNic::new(vports, bnic_config),
             }),
+            flr_rx,
+            flr_draining: false,
         }
     }
 
@@ -402,12 +450,66 @@ impl ChangeDeviceState for GdmaDevice {
     }
 }
 
+impl GdmaDevice {
+    /// Poll-driven function-level-reset teardown.
+    ///
+    /// This mirrors [`GdmaDevice::reset`] but is expressed as a state machine
+    /// that makes forward progress across `poll_device` invocations, because an
+    /// FLR is triggered synchronously from the guest's config-space write while
+    /// the teardown (stopping the HW channel and datapath tasks) is async. It
+    /// additionally resets PCI configuration state, which a real FLR does and
+    /// the VM-reset path deliberately does not: after this the guest must
+    /// re-enumerate the function (re-program BARs, command, MSI-X) before it
+    /// can drive the device again, exactly as it would after a hardware FLR.
+    fn poll_flr_reset(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        std::task::ready!(self.hwc.poll_stop(cx));
+        std::task::ready!(self.hwc.task_mut().bnic.poll_shutdown(cx));
+        if self.hwc.has_state() {
+            self.hwc.remove();
+        }
+        self.queues.reset();
+        self.destroying_hwc = false;
+        self.shmem = Shmem(FromZeros::new_zeroed());
+        self.config.reset();
+        Poll::Ready(())
+    }
+}
+
+impl PollDevice for GdmaDevice {
+    fn poll_device(&mut self, cx: &mut Context<'_>) {
+        loop {
+            // Pick up a guest-initiated FLR. The handler signals `flr_rx` from
+            // the synchronous config-space write path; the teardown runs here.
+            if !self.flr_draining {
+                match self.flr_rx.poll_recv(cx) {
+                    Poll::Ready(Ok(())) => self.flr_draining = true,
+                    // The sender lives as long as the device, so a closed
+                    // channel means there is nothing more to service.
+                    Poll::Ready(Err(_)) => return,
+                    Poll::Pending => return,
+                }
+            }
+            if self.poll_flr_reset(cx).is_pending() {
+                return;
+            }
+            self.flr_draining = false;
+            // Loop to re-arm `flr_rx` for the next FLR: like every pollable
+            // device, this must leave a waker registered before returning, or
+            // a later FLR would not wake the poller.
+        }
+    }
+}
+
 impl ChipsetDevice for GdmaDevice {
     fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
         Some(self)
     }
 
     fn supports_pci(&mut self) -> Option<&mut dyn PciConfigSpace> {
+        Some(self)
+    }
+
+    fn supports_poll_device(&mut self) -> Option<&mut dyn PollDevice> {
         Some(self)
     }
 }

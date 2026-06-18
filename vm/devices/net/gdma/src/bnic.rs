@@ -48,6 +48,7 @@ use gdma_defs::bnic::ManaDestroyWqobjReq;
 use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::ManaTxShortOob;
 use gdma_defs::bnic::Tristate;
+use gdma_defs::bnic::bnic_status;
 use guestmem::GuestMemory;
 use guestmem::Limit;
 use guestmem::MemoryRead;
@@ -80,6 +81,56 @@ use task_control::TaskControl;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
+
+/// A command-handler error tagged with the specific BNIC command status code the
+/// device reports for this failure. The HW channel dispatch downcasts to this to
+/// surface the code in the response header ([`GdmaRespHdr::status`]) instead of
+/// the generic failure code, keeping rejections faithful to real hardware (which
+/// returns a distinct code per negative path) and legible in command traces.
+///
+/// The wrapped [`anyhow::Error`] carries the human-readable cause; it is kept as
+/// the source so the chain still appears in logs.
+///
+/// [`GdmaRespHdr::status`]: gdma_defs::GdmaRespHdr
+#[derive(Debug)]
+pub(crate) struct BnicStatusError {
+    pub(crate) status: u32,
+    source: anyhow::Error,
+}
+
+impl BnicStatusError {
+    /// Wraps `source` with the BNIC command `status` the device reports for this
+    /// rejection. Convert with `.into()` to flow through the existing
+    /// `anyhow::Result` handler signatures.
+    fn new(status: u32, source: anyhow::Error) -> Self {
+        Self { status, source }
+    }
+}
+
+impl std::fmt::Display for BnicStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for BnicStatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// Attaches a BNIC command status code to the error path of a result, so a
+/// rejected command reports the code the device uses rather than the generic
+/// failure default.
+trait BnicStatusResultExt<T> {
+    fn bnic_status(self, status: u32) -> anyhow::Result<T>;
+}
+
+impl<T> BnicStatusResultExt<T> for anyhow::Result<T> {
+    fn bnic_status(self, status: u32) -> anyhow::Result<T> {
+        self.map_err(|source| BnicStatusError::new(status, source).into())
+    }
+}
 
 /// Default adapter MTU reported in the `MANA_QUERY_DEV_CONFIG` response.
 ///
@@ -558,7 +609,8 @@ impl BasicNic {
                 let _vport = self
                     .vports
                     .get_mut(req.vport as usize)
-                    .context("invalid vport")?;
+                    .context("invalid vport")
+                    .bnic_status(bnic_status::INVALID_VPORT_HANDLE)?;
 
                 let resp = ManaConfigVportResp {
                     tx_vport_offset: 0,
@@ -574,12 +626,22 @@ impl BasicNic {
                 let is_send = match req.wq_type {
                     GdmaQueueType::GDMA_RQ => false,
                     GdmaQueueType::GDMA_SQ => true,
-                    ty => anyhow::bail!("unsupported queue type: {:?}", ty),
+                    ty => {
+                        return Err(BnicStatusError::new(
+                            bnic_status::UNSUPPORTED_QUEUE_TYPE,
+                            anyhow!("unsupported queue type: {:?}", ty),
+                        )
+                        .into());
+                    }
                 };
 
                 let vport_idx = req.vport as usize;
                 if vport_idx >= self.vports.len() {
-                    anyhow::bail!("invalid vport");
+                    return Err(BnicStatusError::new(
+                        bnic_status::INVALID_VPORT_HANDLE,
+                        anyhow!("invalid vport"),
+                    )
+                    .into());
                 }
 
                 let wq_region = state.get_dma_region(req.wq_gdma_region, req.wq_size)?;
@@ -635,7 +697,13 @@ impl BasicNic {
                 let is_send = match req.wq_type {
                     GdmaQueueType::GDMA_RQ => false,
                     GdmaQueueType::GDMA_SQ => true,
-                    ty => anyhow::bail!("unsupported queue type: {:?}", ty),
+                    ty => {
+                        return Err(BnicStatusError::new(
+                            bnic_status::INVALID_WQ_TYPE,
+                            anyhow!("unsupported queue type: {:?}", ty),
+                        )
+                        .into());
+                    }
                 };
 
                 // Look the object up by its handle across every vport, since the
@@ -655,7 +723,9 @@ impl BasicNic {
                         break;
                     }
                 }
-                let wq = removed.context("specified queue does not exist")?;
+                let wq = removed
+                    .context("specified queue does not exist")
+                    .bnic_status(bnic_status::INVALID_WQ_HANDLE)?;
                 state.queues.free_wq(is_send, wq.wq_id).unwrap();
                 state.queues.free_cq(wq.cq_id).unwrap();
             }
@@ -683,7 +753,9 @@ impl BasicNic {
                         .find(|w| w.wq_obj == req.wq_obj_handle)
                         .map(|w| (w.cq_id, w.wq_id, w.fence_tx.clone()))
                 });
-                let (cq_id, wq_id, fence_tx) = target.context("specified rq does not exist")?;
+                let (cq_id, wq_id, fence_tx) = target
+                    .context("specified rq does not exist")
+                    .bnic_status(bnic_status::INVALID_WQ_HANDLE)?;
 
                 let routed = match &fence_tx {
                     Some(tx) if !tx.is_closed() => {
@@ -722,7 +794,8 @@ impl BasicNic {
                 let vport = self
                     .vports
                     .get_mut(req.vport as usize)
-                    .context("invalid vport")?;
+                    .context("invalid vport")
+                    .bnic_status(bnic_status::INVALID_VPORT_HANDLE)?;
 
                 if is_v2 && req.rx_enable != Tristate::FALSE {
                     let mut peek = read.clone();
@@ -809,7 +882,8 @@ impl BasicNic {
                 let vport = self
                     .vports
                     .get_mut(req.vport_index as usize)
-                    .context("invalid vport")?;
+                    .context("invalid vport")
+                    .bnic_status(bnic_status::INVALID_VPORT_INDEX)?;
 
                 // Advertise as many queues as the backend can service, capped to
                 // a sane maximum. The guest uses this to decide how many receive

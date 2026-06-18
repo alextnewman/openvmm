@@ -28,6 +28,35 @@ open_enum! {
     }
 }
 
+/// BNIC command response status codes (`_BNIC_COMMAND_STATUS`), reported in the
+/// GDMA response header [`GdmaRespHdr::status`](super::GdmaRespHdr) for BNIC
+/// client messages. The device returns a distinct code per negative path; only
+/// the subset the emulator can produce is enumerated here.
+pub mod bnic_status {
+    /// The command completed successfully.
+    pub const SUCCESS: u32 = 0;
+    /// A receive-object fence operation failed: the work-queue-object handle was
+    /// valid but the fence itself could not be issued. Note this is *not* the
+    /// code for an unknown handle (that is [`INVALID_WQ_HANDLE`]); a handler
+    /// reaches this only after a successful handle lookup.
+    pub const FENCE_RQ_FAILED: u32 = 5;
+    /// The referenced vport handle does not exist (handle-addressed commands).
+    pub const INVALID_VPORT_HANDLE: u32 = 11;
+    /// The referenced vport index is out of range (index-addressed commands,
+    /// e.g. query vport configuration).
+    pub const INVALID_VPORT_INDEX: u32 = 28;
+    /// The referenced work-queue-object handle does not exist.
+    pub const INVALID_WQ_HANDLE: u32 = 29;
+    /// The work-queue type in the request is not valid for this command.
+    pub const INVALID_WQ_TYPE: u32 = 30;
+    /// A handler returned failure without setting a specific status. The device
+    /// pre-initializes every response to this code, so it is the generic BNIC
+    /// failure value.
+    pub const NOT_SET_BY_HANDLER: u32 = 31;
+    /// The queue type in the request is not supported by this command.
+    pub const UNSUPPORTED_QUEUE_TYPE: u32 = 36;
+}
+
 pub const MANA_QUERY_DEV_CONFIG_REQUEST_V1: u16 = 1;
 pub const MANA_QUERY_DEV_CONFIG_RESPONSE_V4: u16 = 4;
 pub const MANA_VTL2_MOVE_FILTER_REQUEST_V2: u16 = 2;

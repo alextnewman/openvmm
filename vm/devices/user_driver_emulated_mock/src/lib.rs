@@ -29,6 +29,8 @@ use user_driver::DeviceRegisterIo;
 use user_driver::DmaClient;
 use user_driver::interrupt::DeviceInterrupt;
 use user_driver::interrupt::DeviceInterruptSource;
+use user_driver::memory::MappedDmaTarget;
+use user_driver::memory::PAGE_SIZE;
 use user_driver::memory::PAGE_SIZE64;
 
 /// A wrapper around any user_driver device T. It provides device emulation by providing access to the memory shared with the device and thus
@@ -281,6 +283,79 @@ impl DeviceTestMemory {
     /// Returns [`PagePoolAllocator`] with access to the first half of the underlying memory.
     pub fn dma_client(&self) -> Arc<PagePoolAllocator> {
         self.allocator.clone()
+    }
+}
+
+/// A page-aligned, heap-backed [`MappedDmaTarget`] used by [`HeapDmaClient`].
+#[repr(C, align(4096))]
+struct HeapPage([u8; PAGE_SIZE]);
+
+struct HeapDmaBuffer {
+    pages: Vec<HeapPage>,
+    pfns: Vec<u64>,
+}
+
+// UNSAFETY: implementing `MappedDmaTarget`, an unsafe trait whose contract
+// requires a stable, correctly-sized mapped region.
+#[expect(unsafe_code)]
+// SAFETY: `pages` owns the backing allocation for the lifetime of `self`, so the
+// region `base()..base() + len()` stays mapped exactly as the trait requires.
+unsafe impl MappedDmaTarget for HeapDmaBuffer {
+    fn base(&self) -> *const u8 {
+        self.pages.as_ptr().cast()
+    }
+
+    fn len(&self) -> usize {
+        self.pages.len() * PAGE_SIZE
+    }
+
+    fn pfns(&self) -> &[u64] {
+        &self.pfns
+    }
+
+    fn pfn_bias(&self) -> u64 {
+        0
+    }
+}
+
+/// A host-page-size-agnostic [`DmaClient`] that satisfies allocations from the
+/// process heap.
+///
+/// Unlike [`DeviceTestMemory`], whose `page_pool_alloc`/`sparse_mmap` backing
+/// requires the host page size to equal the emulated 4K page size, this client
+/// works on 16K- and 64K-page hosts (e.g. macOS arm64). It is suitable for tests
+/// that exercise allocation bookkeeping but do not actually program a device with
+/// the returned PFNs. Allocations are zero-initialized.
+pub struct HeapDmaClient;
+
+impl Inspect for HeapDmaClient {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.ignore();
+    }
+}
+
+impl DmaClient for HeapDmaClient {
+    fn allocate_dma_buffer(
+        &self,
+        total_size: usize,
+    ) -> anyhow::Result<user_driver::memory::MemoryBlock> {
+        anyhow::ensure!(
+            total_size.is_multiple_of(PAGE_SIZE),
+            "dma buffer length {total_size} must be page-aligned"
+        );
+        let pages: Vec<HeapPage> = (0..total_size / PAGE_SIZE)
+            .map(|_| HeapPage([0; PAGE_SIZE]))
+            .collect();
+        let base_pfn = pages.as_ptr() as usize / PAGE_SIZE;
+        let pfns = (0..pages.len()).map(|i| (base_pfn + i) as u64).collect();
+        Ok(user_driver::memory::MemoryBlock::new(HeapDmaBuffer {
+            pages,
+            pfns,
+        }))
+    }
+
+    fn attach_pending_buffers(&self) -> anyhow::Result<Vec<user_driver::memory::MemoryBlock>> {
+        anyhow::bail!("attach_pending_buffers is not supported by HeapDmaClient")
     }
 }
 

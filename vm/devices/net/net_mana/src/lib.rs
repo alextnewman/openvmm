@@ -1719,13 +1719,17 @@ impl Inspect for ContiguousBufferManager {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow, ensure};
-    use user_driver_emulated_mock::DeviceTestMemory;
+    use user_driver_emulated_mock::HeapDmaClient;
 
     #[test]
     fn page_counts_powers_of_two_only() -> Result<()> {
+        // Use a host-page-agnostic heap allocator rather than the
+        // `page_pool_alloc`/`sparse_mmap` test backing: this test only exercises
+        // the power-of-two gate and never programs the device, and the heap
+        // allocator runs on 16K- and 64K-page hosts (e.g. macOS arm64) too.
+        let dma_client: Arc<dyn DmaClient> = Arc::new(HeapDmaClient);
         for i in 1..35 {
-            let dtm = DeviceTestMemory::new(Into::<u64>::into(i) * 2, false, "test");
-            match ContiguousBufferManager::new(dtm.dma_client(), i) {
+            match ContiguousBufferManager::new(dma_client.clone(), i) {
                 Ok(_) => {
                     ensure!(
                         i.is_power_of_two(),

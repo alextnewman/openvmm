@@ -17,6 +17,7 @@ use chipset_device::pci::PciConfigSpace;
 use chipset_device::poll_device::PollDevice;
 use gdma::VportConfig;
 use gdma_defs::GDMA_PAGE_TYPE_4K;
+use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
 use gdma_defs::GdmaDevId;
@@ -32,6 +33,8 @@ use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::ManaCreateWqobjReq;
 use gdma_defs::bnic::ManaFenceRqReq;
+use gdma_defs::bnic::ManaQueryLinkConfigReq;
+use gdma_defs::bnic::ManaQueryLinkConfigResp;
 use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
 use gdma_defs::bnic::Tristate;
 use gdma_defs::bnic::bnic_status;
@@ -1826,5 +1829,135 @@ async fn test_gdma_create_wqobj_bad_type_status(driver: DefaultDriver) {
         "create-wq with an unsupported queue type must report \
          BasicNicStatusUnsupportQueueType ({:#x}); driver error was: {err:#}",
         bnic_status::UNSUPPORTED_QUEUE_TYPE,
+    );
+}
+
+/// A BNIC command the device does not implement is rejected with the GDMA core
+/// `CMD_UNSUPPORTED` status (0xffffffff), NOT a generic non-zero failure code.
+/// The distinction is load-bearing: the guest's GDMA client (`hw_channel.c`)
+/// maps 0xffffffff to `-EOPNOTSUPP` and tolerates it (logging at most once),
+/// whereas any other non-zero status is a hard `-EPROTO` it logs on every
+/// occurrence -- the noisy "Command 0x... failed with status: 0x1f" spam an
+/// unimplemented command (e.g. an `ethtool` link-config query before this was
+/// fixed) would otherwise produce. `MANA_SET_BW_CLAMP` (0x2000B) is a real MANA
+/// command this device does not implement, so it exercises the catch-all.
+#[async_test]
+async fn test_gdma_unsupported_command_status(driver: DefaultDriver) {
+    const MANA_SET_BW_CLAMP: u32 = 0x2000B;
+
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_unsupported_command_status");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    // Send a command the device does not implement; the body is irrelevant
+    // because the catch-all does not read it.
+    let err = gdma
+        .request::<_, ()>(
+            MANA_SET_BW_CLAMP,
+            dev_id,
+            ManaFenceRqReq { wq_obj_handle: 0 },
+        )
+        .await
+        .expect_err("an unimplemented command must be rejected");
+    assert!(
+        err.to_string()
+            .contains(&format!("failed with {GDMA_STATUS_CMD_UNSUPPORTED:#x}")),
+        "an unimplemented command must report GDMA_STATUS_CMD_UNSUPPORTED ({GDMA_STATUS_CMD_UNSUPPORTED:#x}); \
+         driver error was: {err:#}",
+    );
+}
+
+/// `MANA_QUERY_LINK_CONFIG` (0x2000A) reports the adapter's link speed. ethtool
+/// link queries and the QoS shaper issue it; the host (oracle) implements it, so
+/// the emulator must too. Before this it fell through the catch-all and the
+/// driver's `mana_query_link_cfg` logged a query failure on every poll. Verify
+/// the configured link speed is echoed in both `link_speed_mbps` and
+/// `qos_speed_mbps`, and that `qos_unconfigured` is 0 (a non-zero value makes
+/// the driver reject the response with `-EINVAL`).
+#[async_test]
+async fn test_gdma_query_link_config(driver: DefaultDriver) {
+    const LINK_SPEED_MBPS: u32 = 200_000;
+
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_link_config");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            adapter_link_speed_mbps: LINK_SPEED_MBPS,
+        },
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let resp: ManaQueryLinkConfigResp = gdma
+        .request(
+            ManaCommandCode::MANA_QUERY_LINK_CONFIG.0,
+            dev_id,
+            ManaQueryLinkConfigReq { vport: 0 },
+        )
+        .await
+        .expect("query link config must succeed");
+
+    assert_eq!(
+        resp.link_speed_mbps, LINK_SPEED_MBPS,
+        "link_speed_mbps must report the configured adapter link speed"
+    );
+    assert_eq!(
+        resp.qos_speed_mbps, LINK_SPEED_MBPS,
+        "qos_speed_mbps must report the configured adapter link speed"
+    );
+    assert_eq!(
+        resp.qos_unconfigured, 0,
+        "qos_unconfigured must be 0 or the driver rejects the response with -EINVAL"
     );
 }

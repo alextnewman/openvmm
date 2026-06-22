@@ -572,6 +572,14 @@ impl BindProcessor for HvfProcessorBinder {
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
         // Enable GICv3 system registers.
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, 1 << 24)?;
+        // Hide the PMU from the guest. Windows-on-ARM64 reads
+        // ID_AA64DFR0_EL1.PMUVer and, when it is non-zero, drives PMU system
+        // registers (PMCR_EL0, PMCCNTR_EL0, ...) that this backend does not
+        // model, which wedges early boot. Clear only PMUVer[11:8] via
+        // read-modify-write so DebugVer and the other mandatory debug ID fields
+        // are preserved.
+        let dfr0 = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
+        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1, dfr0 & !(0xf << 8))?;
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 

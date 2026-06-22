@@ -279,6 +279,14 @@ impl GdmaDevice {
     fn write_shmem(&mut self, offset: usize, data: &[u8]) {
         self.shmem.0.as_mut_bytes()[offset..offset + data.len()].copy_from_slice(data);
         if (SHMEM_LEN - 4..SHMEM_LEN).overlaps_range(&(offset..offset + data.len())) {
+            // The final-dword write hands shared-memory possession to the PF
+            // (this device); the guest then polls for the possession bit to
+            // clear, which `complete_smc` does once the request is serviced.
+            // Holding possession here is what keeps the guest polling across an
+            // asynchronous DESTROY_HWC instead of racing ahead and reading the
+            // bare request header as if it were the response.
+            let hdr = SmcProtoHdr::from(self.shmem.0[SHMEM_LEN / 4 - 1]).with_owner_is_pf(true);
+            self.shmem.0[SHMEM_LEN / 4 - 1] = hdr.into();
             let status = match self.handle_smc() {
                 Ok(true) => 0,
                 Ok(false) => return,
@@ -294,7 +302,8 @@ impl GdmaDevice {
     fn complete_smc(&mut self, status: u8) {
         let hdr = SmcProtoHdr::from(self.shmem.0[SHMEM_LEN / 4 - 1])
             .with_status(status)
-            .with_is_response(true);
+            .with_is_response(true)
+            .with_owner_is_pf(false);
         self.shmem.0[SHMEM_LEN / 4 - 1] = hdr.into();
     }
 

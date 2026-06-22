@@ -317,7 +317,7 @@ impl virt::irqcon::ControlGic for HvfPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
         if let Some(vp) = self.gicd.set_pending(irq_id, high) {
             if let Some(vp) = self.vps.get(vp as usize) {
-                vp.wake();
+                vp.kick();
             }
         }
     }
@@ -334,7 +334,7 @@ impl virt::synic::Synic for HvfPartitionInner {
                 .message_queues
                 .enqueue_message(sint, &HvMessage::new(HvMessageType(typ), 0, payload))
             {
-                vp.wake();
+                vp.kick();
             }
         }
     }
@@ -387,7 +387,7 @@ impl GuestEventPort for HvfEventPort {
                         .signal_event(vp, sint, flag, &mut |vector, _auto_eoi| {
                             if partition.gicd.raise_ppi(vp, vector) {
                                 tracing::debug!(vector, "ppi from event");
-                                partition.vps[vp.index() as usize].wake();
+                                partition.vps[vp.index() as usize].kick();
                             }
                         });
             }
@@ -539,6 +539,17 @@ impl HvfVpInner {
         if let Some(waker) = &*self.waker.read() {
             waker.wake_by_ref();
         }
+    }
+
+    /// Forces the target vCPU to observe a cross-VP event (interrupt, IPI,
+    /// synic message): re-arm its async waker in case it is parked, *and* force
+    /// it out of `hv_vcpu_run` via `cancel_run` in case it is executing guest
+    /// code. Using only `wake()` loses the wakeup whenever the target is
+    /// actively running, which deadlocks SMP interrupt/IPI delivery under
+    /// contention.
+    fn kick(&self) {
+        self.wake();
+        self.cancel_run();
     }
 }
 
@@ -1101,7 +1112,7 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     &mut self.gicr,
                                     reg,
                                     value,
-                                    |index| self.partition.vps[index].wake(),
+                                    |index| self.partition.vps[index].kick(),
                                 ) {
                                     tracing::warn!(
                                         ?reg,

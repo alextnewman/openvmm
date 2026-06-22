@@ -27,6 +27,10 @@ use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
 use gdma_defs::GdmaRequestType;
 use gdma_defs::PAGE_SIZE64;
+use gdma_defs::RegMap;
+use gdma_defs::SMC_MSG_TYPE_DESTROY_HWC_VERSION;
+use gdma_defs::SmcMessageType;
+use gdma_defs::SmcProtoHdr;
 use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::MANA_DEFAULT_LINK_SPEED_MBPS;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
@@ -57,6 +61,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use test_with_tracing::test;
 use user_driver::DeviceBacking;
+use user_driver::DeviceRegisterIo;
 use user_driver::memory::MemoryBlock;
 use user_driver::memory::PAGE_SIZE;
 use user_driver_emulated_mock::DeviceTestMemory;
@@ -828,6 +833,132 @@ async fn test_gdma_reset_allows_reestablish(driver: DefaultDriver) {
         .await
         .unwrap();
     gdma.test_eq().await.unwrap();
+}
+
+/// Tearing down the HW channel must follow the SMC shared-memory possession
+/// handshake. The driver writes the `DESTROY_HWC` request header *without*
+/// setting the possession bit (BIT 31); the device is responsible for taking
+/// possession so the guest keeps polling while the asynchronous HWC teardown
+/// runs, then releasing it with a well-formed response. Before this was
+/// modelled, the asynchronous `DESTROY_HWC` path left the bare request header in
+/// shared memory (possession clear, direction=request), so the guest read the
+/// request back as if it were the response and logged
+/// `Wrong SMC response 0x2, type=2, ver=0` / `Error when tearing down HWC: -71`
+/// at shutdown.
+///
+/// This drives the teardown through a second handle to the emulated device's
+/// BAR0 (the way the guest's shared-memory writes reach the device) so the
+/// response header can be inspected directly, which the driver's own `Drop`
+/// only logs.
+#[async_test]
+async fn test_gdma_destroy_hwc_possession_handshake(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_destroy_hwc_possession");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    // A second handle to the same emulated device (shares the inner
+    // `Arc<Mutex<GdmaDevice>>`) used to drive the guest-side shared-memory
+    // protocol directly while `GdmaDriver` owns the established channel.
+    let mut probe = device.clone();
+
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    // ESTABLISH_HWC completes synchronously, so the device hands shared-memory
+    // possession back to the guest as part of bring-up.
+    let gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+
+    // Locate the SMC header exactly as the driver does: the final dword of the
+    // shared region at `vf_gdma_sriov_shared_reg_start + 28` in BAR0.
+    let bar0 = probe.map_bar(0).unwrap();
+    let mut regmap = RegMap::new_zeroed();
+    for i in 0..size_of_val(&regmap) / 4 {
+        regmap.as_mut_bytes()[i * 4..(i + 1) * 4]
+            .copy_from_slice(&bar0.read_u32(i * 4).to_ne_bytes());
+    }
+    let hdr_off = regmap.vf_gdma_sriov_shared_reg_start as usize + 28;
+
+    // After ESTABLISH_HWC the guest owns shared memory (possession bit clear).
+    let raw = bar0.read_u32(hdr_off);
+    assert!(
+        !SmcProtoHdr::from(raw).owner_is_pf(),
+        "guest should own shared memory after ESTABLISH_HWC, header={raw:#010x}",
+    );
+
+    // Issue DESTROY_HWC the way the driver's teardown does: write the request
+    // header without setting the possession bit.
+    let req = SmcProtoHdr::new()
+        .with_msg_type(SmcMessageType::SMC_MSG_TYPE_DESTROY_HWC.0)
+        .with_msg_version(SMC_MSG_TYPE_DESTROY_HWC_VERSION);
+    bar0.write_u32(hdr_off, u32::from(req));
+
+    // Regression assertion: the device must take possession on the request
+    // write. There is no await between the write and this read, so the
+    // asynchronous HWC stop cannot have progressed yet; the header therefore
+    // still reflects the in-flight request with possession held by the PF.
+    // Without the possession handshake the device left the bare request header
+    // (possession clear, direction=request) and the guest read it as a
+    // malformed response.
+    let raw = bar0.read_u32(hdr_off);
+    let hdr = SmcProtoHdr::from(raw);
+    assert!(
+        hdr.owner_is_pf(),
+        "device must take shared-memory possession on the DESTROY_HWC request, header={raw:#010x}",
+    );
+    assert!(
+        !hdr.is_response(),
+        "DESTROY_HWC is still pending; the response bit must not be set yet, header={raw:#010x}",
+    );
+
+    // Drive the asynchronous teardown to completion. Each shared-memory read
+    // polls whether the HWC task has stopped; yielding lets that task run.
+    let mut timer = pal_async::timer::PolledTimer::new(&driver);
+    let mut raw = bar0.read_u32(hdr_off);
+    for _ in 0..1000 {
+        if !SmcProtoHdr::from(raw).owner_is_pf() {
+            break;
+        }
+        timer.sleep(std::time::Duration::from_millis(1)).await;
+        raw = bar0.read_u32(hdr_off);
+    }
+
+    // The completed response hands possession back with a well-formed reply the
+    // guest accepts: direction=response, the original message type, status=0.
+    let hdr = SmcProtoHdr::from(raw);
+    assert!(
+        !hdr.owner_is_pf(),
+        "device never released possession after DESTROY_HWC, header={raw:#010x}",
+    );
+    assert!(
+        hdr.is_response(),
+        "DESTROY_HWC response bit not set, header={raw:#010x}",
+    );
+    assert_eq!(
+        hdr.msg_type(),
+        SmcMessageType::SMC_MSG_TYPE_DESTROY_HWC.0,
+        "wrong DESTROY_HWC response message type, header={raw:#010x}",
+    );
+    assert_eq!(
+        hdr.status(),
+        0,
+        "DESTROY_HWC reported failure, header={raw:#010x}",
+    );
+
+    // The HW channel is already torn down. Suppress the driver's own DESTROY_HWC
+    // (it would race a redundant second teardown) and drop it so the executor
+    // shuts down cleanly.
+    abandon_channel(gdma).await;
 }
 
 /// The driver allocates DMA regions for queue memory and, when a region is not

@@ -847,6 +847,7 @@ impl HvfProcessor<'_> {
                 }) {
                     let mut cpu_on = vp.cpu_on.lock();
                     if cpu_on.is_some() {
+                        tracing::info!(target_cpu, "RACEDBG cpu_on: ON_PENDING (already set)");
                         PsciError::ON_PENDING.0
                     } else {
                         // TODO check already on
@@ -855,10 +856,16 @@ impl HvfProcessor<'_> {
                             x0: context_id,
                         });
                         drop(cpu_on);
+                        tracing::info!(
+                            target_cpu,
+                            target_vp = vp.vp_info.base.vp_index.index(),
+                            "RACEDBG cpu_on: set+wake"
+                        );
                         vp.wake();
                         PsciError::SUCCESS.0
                     }
                 } else {
+                    tracing::info!(target_cpu, "RACEDBG cpu_on: target not found");
                     PsciError::INVALID_PARAMETERS.0
                 }
             }
@@ -931,7 +938,7 @@ impl<'p> Processor for HvfProcessor<'p> {
                         if self.on {
                             todo!("block this");
                         } else {
-                            tracing::debug!(x0 = cpu_on.x0, pc = cpu_on.pc, "cpu on");
+                            tracing::info!(vp = vp_index.index(), x0 = cpu_on.x0, pc = cpu_on.pc, "RACEDBG cpu on: started");
                             self.vcpu.set_gp(0, cpu_on.x0);
                             self.vcpu.set_pc(cpu_on.pc);
                             self.on = true;

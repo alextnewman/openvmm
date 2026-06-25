@@ -597,6 +597,21 @@ struct VpInitState {
     gicr_range: Range<u64>,
 }
 
+/// `ID_AA64PFR0_EL1.GIC` field (bits [27:24]); the value `0b0001` advertises the
+/// GICv3/v4 system-register CPU interface (ICC_* sysregs) to the guest.
+const ID_AA64PFR0_EL1_GIC_CPUIF: u64 = 1 << 24;
+
+/// `ID_AA64DFR0_EL1.PMUVer` field (bits [11:8]); cleared to hide the PMU from the
+/// guest (see the PMU rationale in `bind`).
+const ID_AA64DFR0_EL1_PMUVER: u64 = 0xf << 8;
+
+/// `PMCR_EL0.E` (bit 0) — cycle counter enable.
+const PMCR_EL0_E: u64 = 1 << 0;
+/// `PMCR_EL0.C` (bit 2) — cycle counter reset (write-1 action).
+const PMCR_EL0_C: u64 = 1 << 2;
+/// `PMCR_EL0.LC` (bit 6) — 64-bit (long) cycle counter.
+const PMCR_EL0_LC: u64 = 1 << 6;
+
 impl BindProcessor for HvfProcessorBinder {
     type Processor<'a> = HvfProcessor<'a>;
     type Error = Error;
@@ -611,7 +626,7 @@ impl BindProcessor for HvfProcessorBinder {
         // Set 40 bit physical address width.
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
         // Enable GICv3 system registers.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, 1 << 24)?;
+        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, ID_AA64PFR0_EL1_GIC_CPUIF)?;
         // Hide the PMU from the guest. Windows-on-ARM64 reads
         // ID_AA64DFR0_EL1.PMUVer and, when it is non-zero, drives PMU system
         // registers (PMCR_EL0, PMCCNTR_EL0, ...) that this backend does not
@@ -619,7 +634,7 @@ impl BindProcessor for HvfProcessorBinder {
         // read-modify-write so DebugVer and the other mandatory debug ID fields
         // are preserved.
         let dfr0 = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1, dfr0 & !(0xf << 8))?;
+        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1, dfr0 & !ID_AA64DFR0_EL1_PMUVER)?;
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
@@ -718,7 +733,7 @@ impl PmuState {
             SystemReg::PMCCNTR_EL0 => self.pmccntr(now_100ns),
             // Report a 64-bit cycle counter (LC, bit 6) and no event counters
             // (N == 0); reflect only the enable bit.
-            SystemReg::PMCR_EL0 => (1 << 6) | u64::from(self.enabled),
+            SystemReg::PMCR_EL0 => PMCR_EL0_LC | if self.enabled { PMCR_EL0_E } else { 0 },
             SystemReg::PMCNTENSET_EL0 | SystemReg::PMCNTENCLR_EL0 => self.counter_enable.into(),
             SystemReg::PMINTENSET_EL1 | SystemReg::PMINTENCLR_EL1 => self.int_enable.into(),
             SystemReg::PMUSERENR_EL0 => self.userenr.into(),
@@ -740,10 +755,10 @@ impl PmuState {
                 // Snapshot the current count, then re-base, so toggling the
                 // enable bit never makes the counter jump.
                 let cur = self.pmccntr(now_100ns);
-                self.enabled = value & 1 != 0;
+                self.enabled = value & PMCR_EL0_E != 0;
                 self.rebase(cur, now_100ns);
                 // C (bit 2): reset the cycle counter to zero.
-                if value & (1 << 2) != 0 {
+                if value & PMCR_EL0_C != 0 {
                     self.rebase(0, now_100ns);
                 }
             }

@@ -25,6 +25,11 @@ virt_whp = ["openvmm_core/virt_whp", "dep:virt_whp"]
 # Enable building with macOS hypervisor framework support.
 virt_hvf = ["dep:virt_hvf"]
 
+# Request a 4KB stage-2 (IPA) granule on macOS 26.0+ (off by default; implies
+# `virt_hvf`). See `virt_hvf`'s `hvf-4kb-ipa` feature — kept as a lever for
+# Windows-on-ARM64 re-tests; not a fix for the CloudMOS livelock.
+hvf-4kb-ipa = ["virt_hvf", "virt_hvf/hvf-4kb-ipa"]
+
 [dependencies]
 hypervisor_resources.workspace = true
 mesh_worker.workspace = true

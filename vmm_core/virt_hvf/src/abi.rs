@@ -74,6 +74,29 @@ impl HvfResult {
 unsafe extern "C" {
     pub fn hv_vm_create(config: *const ()) -> HvfResult;
     pub fn hv_vm_destroy() -> HvfResult;
+    /// Creates a VM configuration object (`hv_vm_config_t`). Available since
+    /// macOS 13.0. Returns a retained os_object; the openvmm CLI creates exactly
+    /// one VM per process so the single config is intentionally leaked for the
+    /// process lifetime rather than released.
+    ///
+    /// Only linked behind the off-by-default `hvf-4kb-ipa` feature (used solely
+    /// by the 4KB-granule path; see [`hv_vm_config_set_ipa_granule`]).
+    #[cfg(feature = "hvf-4kb-ipa")]
+    pub fn hv_vm_config_create() -> *mut c_void;
+    /// Sets the intermediate-physical-address (stage-2) granule in a VM config.
+    /// Available since **macOS 26.0** — building against this symbol raises the
+    /// runtime floor to macOS 26, so it is gated behind the off-by-default
+    /// `hvf-4kb-ipa` feature.
+    ///
+    /// Requesting [`HvIpaGranule::SIZE_4KB`] makes the host stage-2 granule match
+    /// a 4KB guest stage-1. This was investigated as a Windows-on-ARM64 fix but
+    /// does **not** resolve the CloudMOS `0x1E` spurious stage-1 store-translation
+    /// livelock: that fault is raised by Apple's nested stage-1 walker
+    /// independent of the configured granule (a matched 4KB/4KB nesting wedges
+    /// identically — see the session's cloudmos_livelock_analysis.md). Retained
+    /// as a correct, AZL-3-validated lever for future macOS re-tests.
+    #[cfg(feature = "hvf-4kb-ipa")]
+    pub fn hv_vm_config_set_ipa_granule(config: *mut c_void, granule: HvIpaGranule) -> HvfResult;
     pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> HvfResult;
     pub fn hv_vm_unmap(ipa: u64, size: usize) -> HvfResult;
     pub fn hv_vcpu_create(
@@ -115,6 +138,17 @@ open_enum! {
         MAXPROT_WRITE = 1 << 6,
         MAXPROT_EXEC = 1 << 7,
         MAXPROT_UEXEC = 1 << 8,
+    }
+}
+
+#[cfg(feature = "hvf-4kb-ipa")]
+open_enum! {
+    /// Supported intermediate-physical-address (stage-2) granules for
+    /// `hv_vm_config_set_ipa_granule` (macOS 26.0+). The framework default on
+    /// Apple Silicon is [`SIZE_16KB`](HvIpaGranule::SIZE_16KB).
+    pub enum HvIpaGranule: u32 {
+        SIZE_4KB = 0,
+        SIZE_16KB = 1,
     }
 }
 

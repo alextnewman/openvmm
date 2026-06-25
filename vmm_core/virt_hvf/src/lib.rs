@@ -136,8 +136,37 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
             }
         };
 
-        // SAFETY: no safety requirements.
-        unsafe { abi::hv_vm_create(null_mut()) }.chk()?;
+        // Create the VM. By default we use HVF's native Apple-Silicon 16KB
+        // intermediate-physical-address (stage-2) granule via a NULL config.
+        //
+        // With the off-by-default `hvf-4kb-ipa` feature we instead request a 4KB
+        // IPA granule (macOS 26.0+) so the host stage-2 granule matches a 4KB
+        // guest stage-1. This was investigated as a Windows-on-ARM64 fix: it is a
+        // correct, AZL-3-validated configuration but does NOT resolve the CloudMOS
+        // `0x1E` spurious stage-1 store-translation livelock. That fault is raised
+        // by Apple's nested stage-1 walker independent of the configured granule
+        // (a matched 4KB/4KB nesting wedges identically — see the session's
+        // cloudmos_livelock_analysis.md). The feature is therefore off by default
+        // to avoid raising the runtime floor to macOS 26 for the Linux/MANA dev
+        // loop, while preserving the lever for opportunistic future re-tests.
+        #[cfg(feature = "hvf-4kb-ipa")]
+        {
+            // SAFETY: no safety requirements.
+            let vm_config = unsafe { abi::hv_vm_config_create() };
+            // SAFETY: `vm_config` is a valid config object from `hv_vm_config_create`.
+            unsafe { abi::hv_vm_config_set_ipa_granule(vm_config, abi::HvIpaGranule::SIZE_4KB) }
+                .chk()?;
+            // SAFETY: `vm_config` is a valid config object; the single config is
+            // intentionally leaked (one VM per process).
+            unsafe { abi::hv_vm_create(vm_config.cast_const().cast()) }.chk()?;
+        }
+        // SAFETY: no safety requirements. NULL config selects HVF defaults
+        // (16KB IPA granule on Apple Silicon).
+        #[cfg(not(feature = "hvf-4kb-ipa"))]
+        unsafe {
+            abi::hv_vm_create(null_mut())
+        }
+        .chk()?;
 
         let hv1 = HvfHv1State::new(self.config.processor_topology.vp_count());
         let hv1_vps = self

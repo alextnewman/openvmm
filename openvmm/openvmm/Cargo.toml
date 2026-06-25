@@ -24,6 +24,10 @@ gdb = ["openvmm_resources/gdb"]
 vendored_crypto = ["crypto/vendored"]
 tpm = ["openvmm_resources/tpm"]
 virt_hvf = ["openvmm_resources/virt_hvf", "openvmm_hypervisors/virt_hvf"]
+# Off-by-default lever: request a 4KB stage-2 (IPA) granule on macOS 26.0+
+# (implies `virt_hvf`). Does NOT fix the CloudMOS/Windows livelock; preserved
+# for future macOS re-tests. Build: `cargo build -p openvmm --features hvf-4kb-ipa`.
+hvf-4kb-ipa = ["virt_hvf", "openvmm_resources/hvf-4kb-ipa"]
 virt_kvm = ["openvmm_resources/virt_kvm", "openvmm_hypervisors/virt_kvm"]
 virt_mshv = ["openvmm_resources/virt_mshv", "openvmm_hypervisors/virt_mshv"]
 virt_whp = ["openvmm_resources/virt_whp", "openvmm_hypervisors/virt_whp"]

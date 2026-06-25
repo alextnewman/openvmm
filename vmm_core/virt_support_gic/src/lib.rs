@@ -79,6 +79,33 @@ mod gicd {
             }
         }
 
+        /// Resets all distributor interrupt state to its initial
+        /// (post-construction) values, preserving the configured geometry
+        /// (intid count, MMIO ranges, and the set of attached redistributors).
+        pub fn reset(&self) {
+            let mut state = self.state.lock();
+            let DistributorState {
+                pending,
+                active,
+                group,
+                enable,
+                cfg,
+                priority,
+                route,
+                enable_grp0,
+                enable_grp1,
+            } = &mut *state;
+            pending.fill(0);
+            active.fill(0);
+            group.fill(0);
+            enable.fill(0);
+            cfg.fill(0);
+            priority.fill(0);
+            route.fill(0);
+            *enable_grp0 = false;
+            *enable_grp1 = false;
+        }
+
         pub fn add_redistributor(&mut self, mpidr: u64, last: bool) -> Redistributor {
             let mpidr = mpidr & u64::from(MpidrEl1::AFFINITY_MASK);
             let (gicr, state) = Redistributor::new(self.gicr.len(), mpidr, last);
@@ -168,7 +195,7 @@ mod gicd {
                 SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
                 SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
                 SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
-                _ => return false,
+                _ => return gicr.write_cpuif(reg, value),
             }
             true
         }
@@ -200,7 +227,7 @@ mod gicd {
             let v = match reg {
                 SystemReg::ICC_IAR0_EL1 => self.ack(gicr, false).into(),
                 SystemReg::ICC_IAR1_EL1 => self.ack(gicr, true).into(),
-                _ => return None,
+                _ => return gicr.read_cpuif(reg),
             };
             Some(v)
         }
@@ -498,11 +525,13 @@ mod gicd {
 
 mod gicr {
     use aarch64defs::MpidrEl1;
+    use aarch64defs::SystemReg;
     use aarch64defs::gic::GicrCtlr;
     use aarch64defs::gic::GicrRdRegister;
     use aarch64defs::gic::GicrSgiRegister;
     use aarch64defs::gic::GicrTyper;
     use aarch64defs::gic::GicrWaker;
+    use aarch64defs::gic::IccCtlrEl1;
     use inspect::Inspect;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -538,6 +567,19 @@ mod gicr {
         #[inspect(iter_by_index)]
         priority: [u32; 8],
         sleep: bool,
+        // GICv3 CPU-interface registers. Banked per-PE, so they live on the
+        // per-CPU redistributor state. Recorded for architectural read-back
+        // only; delivery (`irq_pending`/`ack`) does NOT yet consult them.
+        #[inspect(hex)]
+        icc_pmr: u8,
+        #[inspect(hex)]
+        icc_bpr0: u8,
+        #[inspect(hex)]
+        icc_bpr1: u8,
+        icc_grpen0: bool,
+        icc_grpen1: bool,
+        icc_cbpr: bool,
+        icc_eoimode: bool,
     }
 
     impl SharedState {
@@ -589,6 +631,7 @@ mod gicr {
                             false
                         }
                     }
+                    1 | 2 => self.sgi_read_subword(address, data),
                     _ => false,
                 };
                 if !handled {
@@ -635,6 +678,7 @@ mod gicr {
                         let data = u32::from_ne_bytes(data.try_into().unwrap());
                         self.sgi_write32(address, data)
                     }
+                    1 | 2 => self.sgi_write_subword(address, data),
                     _ => false,
                 };
                 if !handled {
@@ -745,6 +789,39 @@ mod gicr {
             tracing::debug!(?address, data, "gicr sgi write32");
             true
         }
+
+        /// Handles byte/halfword writes to the SGI-frame `IPRIORITYR` registers.
+        /// The architecture permits software to access priority registers at byte
+        /// granularity, and the guest does. This is restricted to `IPRIORITYR`
+        /// because the read-modify-write needed for sub-word access is only
+        /// correct for plain storage registers; the set/clear registers
+        /// (ISENABLER/ICENABLER/ISPENDR/...) must not be RMW'd this way.
+        fn sgi_write_subword(&self, address: GicrSgiRegister, data: &[u8]) -> bool {
+            if !GicrSgiRegister::IPRIORITYR.contains(&address.0) {
+                return false;
+            }
+            let word = GicrSgiRegister(address.0 & !0x3);
+            let mut bytes = self.sgi_read32(word).unwrap_or(0).to_ne_bytes();
+            let offset = (address.0 & 0x3) as usize;
+            bytes[offset..offset + data.len()].copy_from_slice(data);
+            self.sgi_write32(word, u32::from_ne_bytes(bytes))
+        }
+
+        /// Handles byte/halfword reads of the SGI-frame `IPRIORITYR` registers.
+        /// See [`Self::sgi_write_subword`] for why this is limited to `IPRIORITYR`.
+        fn sgi_read_subword(&self, address: GicrSgiRegister, data: &mut [u8]) -> bool {
+            if !GicrSgiRegister::IPRIORITYR.contains(&address.0) {
+                return false;
+            }
+            let word = GicrSgiRegister(address.0 & !0x3);
+            let Some(value) = self.sgi_read32(word) else {
+                return false;
+            };
+            let bytes = value.to_ne_bytes();
+            let offset = (address.0 & 0x3) as usize;
+            data.copy_from_slice(&bytes[offset..offset + data.len()]);
+            true
+        }
     }
 
     impl Redistributor {
@@ -760,6 +837,13 @@ mod gicr {
                     ppi_cfg: 0,
                     priority: [0; 8],
                     sleep: false,
+                    icc_pmr: 0,
+                    icc_bpr0: 0,
+                    icc_bpr1: 0,
+                    icc_grpen0: false,
+                    icc_grpen1: false,
+                    icc_cbpr: false,
+                    icc_eoimode: false,
                 }),
             });
             (
@@ -769,6 +853,96 @@ mod gicr {
                 },
                 shared,
             )
+        }
+
+        /// Resets this redistributor's interrupt state to its initial
+        /// (post-construction) values, preserving its identity (mpidr, index,
+        /// and last-in-region flag).
+        pub fn reset(&mut self) {
+            self.shared.pending.store(0, Ordering::Relaxed);
+            let mut state = self.shared.mutable.lock();
+            let SharedMutState {
+                active,
+                group,
+                enable,
+                ppi_cfg,
+                priority,
+                sleep,
+                icc_pmr,
+                icc_bpr0,
+                icc_bpr1,
+                icc_grpen0,
+                icc_grpen1,
+                icc_cbpr,
+                icc_eoimode,
+            } = &mut *state;
+            *active = 0;
+            *group = 0;
+            *enable = 0;
+            *ppi_cfg = 0;
+            *priority = [0; 8];
+            *sleep = false;
+            *icc_pmr = 0;
+            *icc_bpr0 = 0;
+            *icc_bpr1 = 0;
+            *icc_grpen0 = false;
+            *icc_grpen1 = false;
+            *icc_cbpr = false;
+            *icc_eoimode = false;
+        }
+
+        /// Records a write to one of the GICv3 CPU-interface system registers
+        /// (ICC_PMR/BPR/IGRPEN/CTLR). These are banked per-PE, so they live on
+        /// the redistributor's per-CPU state. Returns `true` if `reg` is a
+        /// CPU-interface register handled here.
+        ///
+        /// NOTE: this only records architectural state for honest read-back; it
+        /// does NOT gate interrupt delivery on PMR/IGRPEN (see `irq_pending`).
+        pub(crate) fn write_cpuif(&mut self, reg: SystemReg, value: u64) -> bool {
+            let mut state = self.shared.mutable.lock();
+            match reg {
+                SystemReg::ICC_PMR_EL1 => state.icc_pmr = value as u8,
+                SystemReg::ICC_BPR0_EL1 => state.icc_bpr0 = (value & 0x7) as u8,
+                SystemReg::ICC_BPR1_EL1 => state.icc_bpr1 = (value & 0x7) as u8,
+                SystemReg::ICC_IGRPEN0_EL1 => state.icc_grpen0 = value & 1 != 0,
+                SystemReg::ICC_IGRPEN1_EL1 => state.icc_grpen1 = value & 1 != 0,
+                SystemReg::ICC_CTLR_EL1 => {
+                    let ctlr = IccCtlrEl1::from(value);
+                    state.icc_cbpr = ctlr.cbpr();
+                    state.icc_eoimode = ctlr.eoi_mode();
+                }
+                _ => return false,
+            }
+            true
+        }
+
+        /// Reads one of the GICv3 CPU-interface system registers. Returns `None`
+        /// if `reg` is not a CPU-interface register handled here.
+        ///
+        /// The writable registers (PMR/BPR/IGRPEN) echo back what the guest
+        /// wrote, exactly as real hardware does. This is Linux-validated
+        /// (AZL-3 boots to login with these echoes live).
+        ///
+        /// ICC_CTLR_EL1 deliberately reads back 0. Its PRIbits/IDbits are
+        /// read-only capability fields, and we have a *degenerate* priority
+        /// model (delivery ignores priority entirely — see `irq_pending`).
+        /// Reporting PRIbits=0 ("1 implemented priority bit") is the honest
+        /// description of that. Bisection (2026-06-24) proved that fabricating a
+        /// larger PRIbits (=7) regressed AZL-3 Linux into a tight UEFI reset
+        /// loop, while CTLR=0 — the value the guest already saw historically —
+        /// boots cleanly. Do not advertise priority bits we do not honor.
+        pub(crate) fn read_cpuif(&self, reg: SystemReg) -> Option<u64> {
+            let state = self.shared.mutable.lock();
+            let value: u64 = match reg {
+                SystemReg::ICC_PMR_EL1 => state.icc_pmr.into(),
+                SystemReg::ICC_BPR0_EL1 => state.icc_bpr0.into(),
+                SystemReg::ICC_BPR1_EL1 => state.icc_bpr1.into(),
+                SystemReg::ICC_IGRPEN0_EL1 => state.icc_grpen0.into(),
+                SystemReg::ICC_IGRPEN1_EL1 => state.icc_grpen1.into(),
+                SystemReg::ICC_CTLR_EL1 => 0,
+                _ => return None,
+            };
+            Some(value)
         }
 
         pub fn raise(&mut self, intid: u32) {
@@ -809,6 +983,108 @@ mod gicr {
             assert!(intid < 32);
             tracing::trace!(intid, "eoi");
             self.shared.mutable.lock().active &= !(1 << intid);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Redistributor;
+        use aarch64defs::gic::GicrSgiRegister;
+
+        // Offset from a redistributor base to its SGI frame.
+        const SGI: u64 = 0x1_0000;
+        const IPRIORITYR0: u64 = GicrSgiRegister::IPRIORITYR0.0 as u64;
+        const ISENABLER0: u64 = GicrSgiRegister::ISENABLER0.0 as u64;
+        const ICENABLER0: u64 = GicrSgiRegister::ICENABLER0.0 as u64;
+
+        // Architecture permits byte access to IPRIORITYR; the guest uses it.
+        #[test]
+        fn ipriorityr_byte_write_read() {
+            let (_redist, shared) = Redistributor::new(0, 0, true);
+
+            // intid 20 (the vtimer PPI) sits at IPRIORITYR0 + 0x14.
+            shared.write(SGI + IPRIORITYR0 + 0x14, &[0x20]);
+
+            // Reads back at byte, halfword, and word granularity.
+            let mut b = [0u8; 1];
+            shared.read(SGI + IPRIORITYR0 + 0x14, &mut b);
+            assert_eq!(b[0], 0x20);
+
+            let mut w = [0u8; 4];
+            shared.read(SGI + IPRIORITYR0 + 0x14, &mut w);
+            assert_eq!(u32::from_ne_bytes(w) & 0xff, 0x20);
+        }
+
+        // Independent byte writes to one word must not clobber each other.
+        #[test]
+        fn ipriorityr_byte_writes_dont_clobber() {
+            let (_redist, shared) = Redistributor::new(0, 0, true);
+
+            shared.write(SGI + IPRIORITYR0, &[0x10]); // intid 0
+            shared.write(SGI + IPRIORITYR0 + 1, &[0x20]); // intid 1
+            shared.write(SGI + IPRIORITYR0 + 2, &[0x00]); // intid 2
+            shared.write(SGI + IPRIORITYR0 + 3, &[0x40]); // intid 3
+
+            let mut w = [0u8; 4];
+            shared.read(SGI + IPRIORITYR0, &mut w);
+            assert_eq!(w, [0x10, 0x20, 0x00, 0x40]);
+        }
+
+        // Sub-word access to set/clear registers must be rejected, not
+        // read-modify-written (which would corrupt the enable mask).
+        #[test]
+        fn subword_does_not_corrupt_set_clear_registers() {
+            let (_redist, shared) = Redistributor::new(0, 0, true);
+
+            // Enable all 32 SGI/PPI interrupts via a word write to ISENABLER0.
+            shared.write(SGI + ISENABLER0, &0xffff_ffffu32.to_ne_bytes());
+
+            // A stray byte write to ICENABLER0 must be ignored, not RMW'd
+            // (an RMW through ICENABLER would clear the whole enable mask).
+            shared.write(SGI + ICENABLER0, &[0xff]);
+
+            let mut w = [0u8; 4];
+            shared.read(SGI + ISENABLER0, &mut w);
+            assert_eq!(u32::from_ne_bytes(w), 0xffff_ffff);
+        }
+
+        // The GICv3 CPU-interface registers round-trip. ICC_CTLR_EL1 read-back
+        // is currently pinned to 0 (BISECTION 2026-06-24): fabricating PRIbits=7
+        // regressed Linux boot, so we are confirming CTLR is the sole culprit.
+        #[test]
+        fn icc_cpu_interface_round_trips() {
+            use aarch64defs::SystemReg;
+
+            let (mut redist, _shared) = Redistributor::new(0, 0, true);
+
+            // Writable registers read back what was written.
+            assert!(redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xf0));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_PMR_EL1), Some(0xf0));
+            assert!(redist.write_cpuif(SystemReg::ICC_BPR1_EL1, 0x3));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_BPR1_EL1), Some(0x3));
+            assert!(redist.write_cpuif(SystemReg::ICC_IGRPEN1_EL1, 0x1));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_IGRPEN1_EL1), Some(0x1));
+
+            // ICC_CTLR_EL1 is claimed by the CPU interface but currently reads
+            // back as 0 while we bisect the Linux regression.
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_CTLR_EL1), Some(0));
+
+            // A non-CPU-interface register is not claimed here.
+            assert!(!redist.write_cpuif(SystemReg::ICC_IAR1_EL1, 0));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_IAR1_EL1), None);
+        }
+
+        // reset() returns the CPU-interface registers to their defaults.
+        #[test]
+        fn reset_clears_cpu_interface() {
+            use aarch64defs::SystemReg;
+
+            let (mut redist, _shared) = Redistributor::new(0, 0, true);
+            redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xff);
+            redist.write_cpuif(SystemReg::ICC_IGRPEN1_EL1, 0x1);
+            redist.reset();
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_PMR_EL1), Some(0));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_IGRPEN1_EL1), Some(0));
         }
     }
 }

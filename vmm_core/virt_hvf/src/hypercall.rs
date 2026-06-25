@@ -12,9 +12,38 @@ use hv1_hypercall::SetVpRegisters;
 use hv1_hypercall::SignalEvent;
 use hvdef::HvArm64RegisterName;
 use hvdef::HvError;
+use hvdef::HvFeatures;
+use hvdef::HvPartitionPrivilege;
 use hvdef::Vtl;
 use hvdef::hypercall::HvRegisterAssoc;
 use std::sync::atomic::Ordering;
+
+/// The partition privileges this backend actually provides, advertised through
+/// `PrivilegesAndFeaturesInfo` (the AArch64 analogue of the x64 `HV_FEATURES`
+/// CPUID leaf).
+///
+/// This is deliberately a strict *subset* of `hv1_emulator`'s
+/// `SUPPORTED_PRIVILEGES`: we advertise only what `virt_hvf` genuinely backs, so
+/// the self-description stays coherent with observable behavior. In particular
+/// `access_partition_reference_tsc` is **false** — we return 0 for the
+/// `ReferenceTsc` register and do not implement the reference TSC page. We
+/// present the Hyper-V guest ABI (synic, hypercalls, synthetic timers, reference
+/// counter, vp index); we are not the Hyper-V hypervisor, so VSM, debugging,
+/// partition management, and hardware-assist privileges all remain false.
+///
+/// `guest_crash_regs_available` is **true**: we back the guest-crash
+/// enlightenment (`GuestCrashP0..P4`/`GuestCrashCtl`) in `set_vp_registers`, so
+/// the guest may report its bugcheck code + parameters through those registers.
+const PROVIDED_FEATURES: HvFeatures = HvFeatures::new()
+    .with_privileges(
+        HvPartitionPrivilege::new()
+            .with_access_partition_reference_counter(true)
+            .with_access_hypercall_msrs(true)
+            .with_access_vp_index(true)
+            .with_access_synic_msrs(true)
+            .with_access_synthetic_timer_msrs(true),
+    )
+    .with_guest_crash_regs_available(true);
 
 pub(crate) struct HvfHypercallHandler<'a, 'b> {
     vp: &'a mut HvfProcessor<'b>,
@@ -28,6 +57,7 @@ impl<'a, 'b> HvfHypercallHandler<'a, 'b> {
             hv1_hypercall::HvSetVpRegisters,
             hv1_hypercall::HvPostMessage,
             hv1_hypercall::HvSignalEvent,
+            hv1_hypercall::HvExtQueryCapabilities,
         ]
     );
 
@@ -69,7 +99,7 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
             return Err((HvError::InvalidParameter, 0));
         }
 
-        for (i, (&name, output)) in registers.iter().zip(output).enumerate() {
+        for (&name, output) in registers.iter().zip(output) {
             *output = match name.into() {
                 HvArm64RegisterName::TimeRefCount => {
                     self.vp.partition.vmtime.now().as_100ns().into()
@@ -93,16 +123,52 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                 }
 
                 HvArm64RegisterName::HypervisorVersion => 0u128.into(),
-                HvArm64RegisterName::PrivilegesAndFeaturesInfo => 0u128.into(),
+                // The partition privilege/feature self-description. Advertise the
+                // exact subset we back (see PROVIDED_FEATURES) so the guest's view
+                // of our enlightenments matches what it actually observes.
+                HvArm64RegisterName::PrivilegesAndFeaturesInfo => {
+                    PROVIDED_FEATURES.into_bits().into()
+                }
+                // Enlightenment *recommendations* (HvEnlightenmentInformation) and
+                // hardware-assist features. We recommend no specific enlightenment
+                // optimizations and expose no hardware virtualization assists, so
+                // zero is the coherent, honest answer for both.
                 HvArm64RegisterName::FeaturesInfo => 0u128.into(),
+                HvArm64RegisterName::HardwareFeaturesInfo => 0u128.into(),
+
+                // Synthetic timers (STIMERn_CONFIG/COUNT). Config sits at the
+                // even offset, Count at the odd offset, two registers per timer.
+                r if (HvArm64RegisterName::Stimer0Config..=HvArm64RegisterName::Stimer3Count)
+                    .contains(&r) =>
+                {
+                    let offset = (r.0 - HvArm64RegisterName::Stimer0Config.0) as usize;
+                    let timer = offset / 2;
+                    if offset.is_multiple_of(2) {
+                        self.vp.hv1.stimer_config(timer).into()
+                    } else {
+                        self.vp.hv1.stimer_count(timer).into()
+                    }
+                }
 
                 register => {
-                    tracing::warn!(?register, "unsupported register get");
-                    return Err((HvError::InvalidParameter, i));
+                    tracelimit::warn_ratelimited!(
+                        ?register,
+                        "unsupported register get; returning 0 to avoid failing the batch"
+                    );
+                    0u128.into()
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl hv1_hypercall::ExtendedQueryCapabilities for HvfHypercallHandler<'_, '_> {
+    fn query_extended_capabilities(&mut self) -> hvdef::HvResult<u64> {
+        // No extended hypercalls are supported; report an empty capability
+        // bitmap so the guest cleanly skips the extended-hypercall path
+        // instead of receiving HvInvalidHypercallCode.
+        Ok(0)
     }
 }
 
@@ -118,7 +184,7 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
             return Err((HvError::InvalidParameter, 0));
         }
 
-        for (i, &HvRegisterAssoc { name, value, .. }) in registers.iter().enumerate() {
+        for &HvRegisterAssoc { name, value, .. } in registers.iter() {
             match name.into() {
                 HvArm64RegisterName::GuestOsId => self
                     .vp
@@ -150,9 +216,65 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
                         value.as_u64(),
                     )
                 }
+                // Synthetic timers (STIMERn_CONFIG/COUNT). The synic emulator
+                // arms them; the run loop's `scan()` evaluates and delivers
+                // expiries to the configured SINT.
+                r if (HvArm64RegisterName::Stimer0Config..=HvArm64RegisterName::Stimer3Count)
+                    .contains(&r) =>
+                {
+                    let offset = (r.0 - HvArm64RegisterName::Stimer0Config.0) as usize;
+                    let timer = offset / 2;
+                    if offset.is_multiple_of(2) {
+                        self.vp.hv1.set_stimer_config(timer, value.as_u64());
+                    } else {
+                        self.vp.hv1.set_stimer_count(timer, value.as_u64());
+                    }
+                }
+                // Hyper-V guest-crash enlightenment. Windows latches the
+                // bugcheck code (`P0`) and its four parameters (`P1..P4`) into
+                // these sticky registers, then writes `GuestCrashCtl` with
+                // `crash_notify` set to signal the host. Surfacing them turns an
+                // opaque guest BSOD into an actionable stop code + parameters.
+                r if (HvArm64RegisterName::GuestCrashP0..=HvArm64RegisterName::GuestCrashP4)
+                    .contains(&r) =>
+                {
+                    let idx = (r.0 - HvArm64RegisterName::GuestCrashP0.0) as usize;
+                    self.vp.crash_params[idx] = value.as_u64();
+                }
+                HvArm64RegisterName::GuestCrashCtl => {
+                    let ctl = hvdef::GuestCrashCtl::from(value.as_u64());
+                    let [p0, p1, p2, p3, p4] = self.vp.crash_params;
+                    tracing::error!(
+                        vp_index,
+                        crash_message = ctl.crash_message(),
+                        no_crash_dump = ctl.no_crash_dump(),
+                        "guest reported a bugcheck: \
+                         code={p0:#x} p1={p1:#x} p2={p2:#x} p3={p3:#x} p4={p4:#x}"
+                    );
+                    // When `crash_message` is set, P3 is the GPA of a textual
+                    // crash message and P4 its length; surface it too.
+                    if ctl.crash_message() && p4 > 0 && p4 <= 4096 {
+                        let mut buf = vec![0u8; p4 as usize];
+                        if self
+                            .vp
+                            .partition
+                            .guest_memory
+                            .read_at(p3, &mut buf)
+                            .is_ok()
+                        {
+                            let text = String::from_utf8_lossy(&buf);
+                            tracing::error!(
+                                text = text.trim_end_matches(['\0', '\n', '\r']),
+                                "guest crash message"
+                            );
+                        }
+                    }
+                }
                 register => {
-                    tracing::warn!(?register, "unsupported register set");
-                    return Err((HvError::InvalidParameter, i));
+                    tracelimit::warn_ratelimited!(
+                        ?register,
+                        "unsupported register set; ignoring to avoid failing the batch"
+                    );
                 }
             }
         }

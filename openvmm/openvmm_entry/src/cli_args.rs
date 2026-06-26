@@ -840,6 +840,12 @@ flags:
     #[clap(long)]
     pub mana: Vec<NicConfigCli>,
 
+    /// present emulated MANA devices (from --mana) as a bare-metal physical
+    /// function (PCI id 1414:00b9) reporting bm_hostmode, exercising the Linux
+    /// driver's bare-metal-host code paths instead of the SR-IOV VF paths
+    #[clap(long)]
+    pub mana_bm_hostmode: bool,
+
     /// use a specific hypervisor interface, with optional backend-specific
     /// parameters.
     ///

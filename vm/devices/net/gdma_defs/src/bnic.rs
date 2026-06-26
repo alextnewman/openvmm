@@ -110,7 +110,11 @@ pub struct ManaQueryDeviceCfgResp {
     pub pf_cap_flags4: u64,
 
     pub max_num_vports: u16,
-    pub reserved: u16,
+    /// Set by a PF in bare-metal-host mode; valid only in
+    /// [`crate::GDMA_MESSAGE_V3`] and later responses (the byte was reserved in
+    /// earlier versions).
+    pub bm_hostmode: u8,
+    pub reserved: u8,
     pub max_num_eqs: u32,
 
     pub adapter_mtu: u16,
@@ -126,6 +130,7 @@ impl std::fmt::Debug for ManaQueryDeviceCfgResp {
             .field("pf_cap_flags3", &self.pf_cap_flags3)
             .field("pf_cap_flags4", &self.pf_cap_flags4)
             .field("max_num_vports", &self.max_num_vports)
+            .field("bm_hostmode", &self.bm_hostmode)
             .field("reserved", &self.reserved)
             .field("max_num_eqs", &self.max_num_eqs)
             .field("adapter_mtu", &self.adapter_mtu)

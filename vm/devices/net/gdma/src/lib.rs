@@ -162,6 +162,7 @@ impl FlrHandler for GdmaFlrHandler {
 impl InspectMut for GdmaDevice {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
+            .field("bm_hostmode", self.pf_regs.is_some())
             .field("config", &self.config)
             .field("queues", &self.queues)
             .merge(&mut self.hwc);
@@ -245,6 +246,12 @@ impl GdmaDevice {
         // driver can still bring up the HW channel against a PF-mode device.
         let bm_hostmode = bnic_config.bm_hostmode;
         let pf_regs = bm_hostmode.then(build_pf_regs);
+        if bm_hostmode {
+            tracing::info!(
+                device_id = format_args!("{:#06x}", gdma_defs::PF_DEVICE_ID),
+                "presenting MANA device as bare-metal physical function (bm_hostmode)"
+            );
+        }
 
         // Route a guest-initiated PCIe Function Level Reset to the device's
         // async reset. The handler only signals `flr_rx`; `poll_device` runs

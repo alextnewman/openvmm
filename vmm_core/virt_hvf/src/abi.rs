@@ -122,7 +122,6 @@ unsafe extern "C" {
         ty: HvInterruptType,
         pending: bool,
     ) -> HvfResult;
-    #[expect(dead_code)]
     pub fn hv_vcpu_get_vtimer_mask(vcpu: u64, vtimer_is_masked: *mut bool) -> HvfResult;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, vtimer_is_masked: bool) -> HvfResult;
 }

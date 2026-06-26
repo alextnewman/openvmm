@@ -671,6 +671,7 @@ async fn vm_config_from_command_line(
                     GdmaDeviceHandle {
                         vports: Vec::new(),
                         bm_hostmode: false,
+                        pf_caps: false,
                     },
                 )
             });
@@ -772,6 +773,7 @@ async fn vm_config_from_command_line(
                             GdmaDeviceHandle {
                                 vports: Vec::new(),
                                 bm_hostmode: opt.mana_bm_hostmode,
+                                pf_caps: opt.mana_pf_caps,
                             },
                         )
                     })
@@ -784,6 +786,7 @@ async fn vm_config_from_command_line(
                     .or_insert(GdmaDeviceHandle {
                         vports: Vec::new(),
                         bm_hostmode: opt.mana_bm_hostmode,
+                        pf_caps: opt.mana_pf_caps,
                     })
                     .vports
             }

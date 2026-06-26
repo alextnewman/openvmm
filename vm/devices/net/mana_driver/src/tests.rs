@@ -289,6 +289,69 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
     assert_eq!(dev_config.bm_hostmode, 1);
 }
 
+/// With `pf_caps` set, the device exposes a read-only PF capability register
+/// block in BAR0 advertising its resource limits. The block's queue maxima must
+/// match the `GDMA_QUERY_MAX_RESOURCES` response (single source of truth), and
+/// the fixed limits read back exactly. The block is disjoint from the VF
+/// register map, so the in-tree driver still brings up the HW channel.
+#[async_test]
+async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_registers");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            pf_caps: true,
+            ..Default::default()
+        },
+    );
+
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+
+    // Read the capability block. Field offsets are relative to the block base
+    // at BAR0 0x110.
+    let mut regs = device.clone();
+    let bar0 = regs.map_bar(0).unwrap();
+    let cap = |field: usize| bar0.read_u32(0x110 + field);
+    assert_eq!(cap(0x00), 0); // hw_capabilities
+    assert_eq!(cap(0x04), 0); // feature_flags
+    assert_eq!(cap(0x08), 64); // max_send_queues
+    assert_eq!(cap(0x10), 64); // max_receive_queues
+    assert_eq!(cap(0x18), 128); // max_completion_queues
+    assert_eq!(cap(0x20), 64); // max_event_queues
+    assert_eq!(cap(0x28), 0); // max_cq_moderation_contexts
+    assert_eq!(cap(0x30), 0); // num_virtual_functions
+    assert_eq!(cap(0x38), 1); // max_doorbell_pages
+    assert_eq!(cap(0x40), 0); // max_moderated_completion_queues
+    assert_eq!(cap(0x48), 1514); // max_tx_payload_len
+    assert_eq!(cap(0x50), 1); // num_physical_functions
+    assert_eq!(cap(0x58), 64); // max_msix_entries
+    assert_eq!(cap(0x60), 64); // pf_max_msix_entries
+
+    // The block's queue maxima must agree with GDMA_QUERY_MAX_RESOURCES.
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let max = gdma.query_max_resources().await.unwrap();
+    assert_eq!(cap(0x08), max.max_sq);
+    assert_eq!(cap(0x10), max.max_rq);
+    assert_eq!(cap(0x18), max.max_cq);
+    assert_eq!(cap(0x20), max.max_eq);
+    assert_eq!(cap(0x58), max.max_msix);
+}
+
 /// A vport must support more than one receive work-queue object so the guest
 /// can build an RSS indirection table that steers traffic across multiple
 /// queues. Each object must be addressed by a distinct `wq_obj` handle so it

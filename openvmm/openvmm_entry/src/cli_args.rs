@@ -846,6 +846,11 @@ flags:
     #[clap(long)]
     pub mana_bm_hostmode: bool,
 
+    /// expose a PF capability register block on emulated MANA devices (from
+    /// --mana) advertising the device's resource limits
+    #[clap(long)]
+    pub mana_pf_caps: bool,
+
     /// use a specific hypervisor interface, with optional backend-specific
     /// parameters.
     ///

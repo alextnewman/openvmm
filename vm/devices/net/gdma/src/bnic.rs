@@ -272,6 +272,9 @@ pub struct BnicConfig {
     /// driver's bare-metal-host paths. Paired with the PF PCI device id and PF
     /// register window set up by [`crate::GdmaDevice::new_with_config`].
     pub bm_hostmode: bool,
+    /// Expose a read-only PF capability register block in BAR0 advertising the
+    /// device's resource limits. Composes with [`Self::bm_hostmode`].
+    pub pf_caps: bool,
 }
 
 impl BnicConfig {

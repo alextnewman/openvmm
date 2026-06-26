@@ -119,6 +119,66 @@ fn build_pf_regs() -> [u8; PF_REGS_LEN] {
     regs
 }
 
+/// PF capability register block, exposed in BAR0 only when `pf_caps` is set. It
+/// is a read-only window advertising the device's resource limits. The window
+/// is disjoint from every other BAR0 region: it sits above [`PF_REGS`] and well
+/// below [`DOORBELLS`], so it composes with the VF [`RegMap`] and the PF window.
+const PF_CAP_REGS: Range<usize> = 0x110..0x178;
+const PF_CAP_REGS_LEN: usize = PF_CAP_REGS.end - PF_CAP_REGS.start;
+
+/// Field offsets within the PF capability register block ([`PF_CAP_REGS`]).
+/// Each field occupies an aligned 8-byte slot and holds a `u32`.
+mod pf_cap {
+    pub const HW_CAPABILITIES: usize = 0x00;
+    pub const FEATURE_FLAGS: usize = 0x04;
+    pub const MAX_SEND_QUEUES: usize = 0x08;
+    pub const MAX_RECEIVE_QUEUES: usize = 0x10;
+    pub const MAX_COMPLETION_QUEUES: usize = 0x18;
+    pub const MAX_EVENT_QUEUES: usize = 0x20;
+    pub const MAX_CQ_MODERATION_CONTEXTS: usize = 0x28;
+    pub const NUM_VIRTUAL_FUNCTIONS: usize = 0x30;
+    pub const MAX_DOORBELL_PAGES: usize = 0x38;
+    pub const MAX_MODERATED_COMPLETION_QUEUES: usize = 0x40;
+    pub const MAX_TX_PAYLOAD_LEN: usize = 0x48;
+    pub const NUM_PHYSICAL_FUNCTIONS: usize = 0x50;
+    pub const MAX_MSIX_ENTRIES: usize = 0x58;
+    pub const PF_MAX_MSIX_ENTRIES: usize = 0x60;
+}
+
+const PF_CAP_NUM_PHYSICAL_FUNCTIONS: u32 = 1;
+const PF_CAP_NUM_VIRTUAL_FUNCTIONS: u32 = 0;
+const PF_CAP_MAX_DOORBELL_PAGES: u32 = 1;
+const PF_CAP_MAX_MSIX_ENTRIES: u32 = 64;
+const PF_CAP_MAX_TX_PAYLOAD_LEN: u32 = 1514;
+
+/// Build the PF capability register block ([`PF_CAP_REGS`]). The queue maxima
+/// are taken from the live queue allocation so the block stays consistent with
+/// the `GDMA_QUERY_MAX_RESOURCES` response; the remaining limits are fixed.
+fn build_pf_cap_regs(queues: &Queues) -> [u8; PF_CAP_REGS_LEN] {
+    let mut regs = [0u8; PF_CAP_REGS_LEN];
+    let mut put = |off: usize, value: u32| {
+        regs[off..off + 4].copy_from_slice(&value.to_ne_bytes());
+    };
+    put(pf_cap::HW_CAPABILITIES, 0);
+    put(pf_cap::FEATURE_FLAGS, 0);
+    put(pf_cap::MAX_SEND_QUEUES, queues.max_sqs());
+    put(pf_cap::MAX_RECEIVE_QUEUES, queues.max_rqs());
+    put(pf_cap::MAX_COMPLETION_QUEUES, queues.max_cqs());
+    put(pf_cap::MAX_EVENT_QUEUES, queues.max_eqs());
+    put(pf_cap::MAX_CQ_MODERATION_CONTEXTS, 0);
+    put(pf_cap::NUM_VIRTUAL_FUNCTIONS, PF_CAP_NUM_VIRTUAL_FUNCTIONS);
+    put(pf_cap::MAX_DOORBELL_PAGES, PF_CAP_MAX_DOORBELL_PAGES);
+    put(pf_cap::MAX_MODERATED_COMPLETION_QUEUES, 0);
+    put(pf_cap::MAX_TX_PAYLOAD_LEN, PF_CAP_MAX_TX_PAYLOAD_LEN);
+    put(
+        pf_cap::NUM_PHYSICAL_FUNCTIONS,
+        PF_CAP_NUM_PHYSICAL_FUNCTIONS,
+    );
+    put(pf_cap::MAX_MSIX_ENTRIES, PF_CAP_MAX_MSIX_ENTRIES);
+    put(pf_cap::PF_MAX_MSIX_ENTRIES, PF_CAP_MAX_MSIX_ENTRIES);
+    regs
+}
+
 pub struct GdmaDevice {
     config: ConfigSpaceType0Emulator,
     msix: MsixEmulator,
@@ -141,6 +201,9 @@ pub struct GdmaDevice {
     /// as a bare-metal PF (`bm_hostmode`). `None` for a VF, keeping the VF
     /// register surface byte-identical.
     pf_regs: Option<[u8; PF_REGS_LEN]>,
+    /// The PF capability register window, present only when `pf_caps` is set.
+    /// `None` keeps the BAR0 register surface unchanged.
+    pf_cap_regs: Option<[u8; PF_CAP_REGS_LEN]>,
 }
 
 /// Bridges the synchronous [`FlrHandler::initiate_flr`] callback (invoked from
@@ -163,6 +226,7 @@ impl InspectMut for GdmaDevice {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
             .field("bm_hostmode", self.pf_regs.is_some())
+            .field("pf_caps", self.pf_cap_regs.is_some())
             .field("config", &self.config)
             .field("queues", &self.queues)
             .merge(&mut self.hwc);
@@ -245,12 +309,16 @@ impl GdmaDevice {
         // the Linux PF driver never reads the VF offsets), so the in-tree
         // driver can still bring up the HW channel against a PF-mode device.
         let bm_hostmode = bnic_config.bm_hostmode;
+        let pf_caps = bnic_config.pf_caps;
         let pf_regs = bm_hostmode.then(build_pf_regs);
         if bm_hostmode {
             tracing::info!(
                 device_id = format_args!("{:#06x}", gdma_defs::PF_DEVICE_ID),
                 "presenting MANA device as bare-metal physical function (bm_hostmode)"
             );
+        }
+        if pf_caps {
+            tracing::info!("exposing PF capability register block (pf_caps)");
         }
 
         // Route a guest-initiated PCIe Function Level Reset to the device's
@@ -311,6 +379,7 @@ impl GdmaDevice {
         };
 
         let queues = Arc::new(Queues::new(gm, driver_source.simple(), &msix));
+        let pf_cap_regs = pf_caps.then(|| build_pf_cap_regs(&queues));
 
         Self {
             config,
@@ -325,6 +394,7 @@ impl GdmaDevice {
             flr_rx,
             flr_draining: false,
             pf_regs,
+            pf_cap_regs,
         }
     }
 
@@ -490,6 +560,12 @@ impl GdmaDevice {
             .filter(|_| PF_REGS.contains_range(&range))
         {
             data.copy_from_slice(&pf[offset - PF_REGS.start..][..data.len()]);
+        } else if let Some(caps) = self
+            .pf_cap_regs
+            .as_ref()
+            .filter(|_| PF_CAP_REGS.contains_range(&range))
+        {
+            data.copy_from_slice(&caps[offset - PF_CAP_REGS.start..][..data.len()]);
         } else {
             tracing::warn!(offset, len = data.len(), "bad read");
             data.fill(!0);

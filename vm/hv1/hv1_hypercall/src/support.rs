@@ -128,7 +128,17 @@ impl<'a, T: HypercallIo> InnerDispatcher<'a, T> {
 
     /// Logs an unsupported hypercall and returns the appropriate error.
     fn unhandled(&self) -> Option<HypercallOutput> {
-        tracelimit::warn_ratelimited!(code = ?self.code(), "no handler for hypercall code");
+        // Log the numeric code as a structured field (`code = u16`), which the
+        // tracing field formatter renders as `0x`-prefixed hex. Passing the
+        // `HypercallCode` open_enum via `?` instead would defer to its Debug
+        // impl, which for codes without a named variant prints radix-less hex
+        // (e.g. `0x19` as `19`) and is easily misread as decimal. The symbolic
+        // name, when the code is known, is still surfaced through the message.
+        tracelimit::warn_ratelimited!(
+            code = self.code().0,
+            "no handler for hypercall code {:?}",
+            self.code()
+        );
         Some(HvError::InvalidHypercallCode.into())
     }
 
@@ -168,7 +178,7 @@ impl<'a, T: HypercallIo> InnerDispatcher<'a, T> {
     where
         T: AsHandler<H>,
     {
-        tracing::trace!(code = ?self.code(), "hypercall");
+        tracing::trace!(code = self.code().0, "hypercall {:?}", self.code());
         let control = self.control;
 
         let (input_len, output_start, output_len, out_elem_size) = match *data {

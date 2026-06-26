@@ -548,6 +548,16 @@ mod tests {
     }
 
     #[test]
+    fn cross_thread_socket_wakeup_works() {
+        EpollPool::run_with(executor_tests::cross_thread_socket_wakeup_tests)
+    }
+
+    #[test]
+    fn cross_thread_block_on_relay_works() {
+        executor_tests::cross_thread_block_on_relay_test(|name| EpollPool::spawn_on_thread(name))
+    }
+
+    #[test]
     fn process_works() {
         EpollPool::run_with(executor_tests::process_tests)
     }

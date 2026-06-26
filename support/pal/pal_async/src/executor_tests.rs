@@ -200,6 +200,235 @@ pub async fn socket_tests(driver: impl Driver) {
     }
 }
 
+/// Regression tests for cross-thread readiness wakeups on the polled-socket
+/// reactor.
+///
+/// These reproduce the shape of the OpenVMM serial relay, where one OS thread
+/// parks inside the reactor waiting for a socket to become writable (or
+/// readable) and a *different* OS thread produces the readiness edge by
+/// draining (or filling) the peer end. A lost edge there manifests as the guest
+/// wedging forever on a never-draining UART FIFO, so this guards the reactor's
+/// cross-thread wake path on every Unix backend (kqueue and epoll).
+///
+/// The reactor's readiness layer is purely event-driven: `poll_*_ready` reports
+/// readiness only from a *delivered* kernel event, never from the live socket
+/// state. So a wakeup that is genuinely lost can never be "rescued" by an
+/// unrelated re-poll of the same future — which is exactly what lets the
+/// watchdog timer below reliably distinguish a lost wakeup (hang) from a merely
+/// slow one: if the edge were lost, the write/read can never make progress, no
+/// matter how many times it is re-polled.
+#[cfg(unix)]
+pub async fn cross_thread_socket_wakeup_tests(driver: impl Driver) {
+    use std::io::Read as _;
+    use std::io::Write as _;
+
+    // Drive `fut` to completion, but fail loudly (rather than hang the whole
+    // test binary) if it makes no progress within the deadline — the signature
+    // of a lost cross-thread wakeup.
+    async fn with_watchdog<F: Future>(
+        driver: &impl Driver,
+        label: &str,
+        fut: F,
+    ) -> F::Output {
+        let mut timer = driver.new_dyn_timer();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut fut = std::pin::pin!(fut);
+        poll_fn(move |cx| {
+            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+                return Poll::Ready(v);
+            }
+            if timer.poll_timer(cx, Some(deadline)).is_ready() {
+                panic!("watchdog fired: cross-thread {label} wakeup was lost");
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    // Writable edge: the task parks on a full send buffer; a second thread
+    // drains the peer to make it writable. The drain delay is varied so the
+    // edge sometimes lands while the reactor is mid-poll and sometimes while it
+    // is already asleep in kevent/epoll_wait (the classic lost-wakeup window).
+    for i in 0..24 {
+        let delay = Duration::from_millis([0, 1, 2, 0][i % 4]);
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut a = PolledSocket::new(&driver, a).unwrap();
+
+        // Fill a's send buffer with direct non-blocking writes, bypassing the
+        // reactor entirely (a is already non-blocking). This parks the
+        // subsequent awaited write purely on the peer-drain edge.
+        let chunk = vec![0u8; 64 * 1024];
+        let mut filled = 0usize;
+        loop {
+            let mut s: &UnixStream = a.get();
+            match s.write(&chunk) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("fill write failed: {e}"),
+            }
+        }
+        assert!(filled > 0, "socket send buffer did not fill");
+
+        // On another thread, drain exactly the bytes we wrote so that `a`
+        // becomes writable again. Reading a known count never blocks past the
+        // available data, and returns the peer so it stays open meanwhile.
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let mut remaining = filled;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut s: &UnixStream = &b;
+            while remaining > 0 {
+                let want = remaining.min(buf.len());
+                match s.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => remaining -= n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("drain read failed: {e}"),
+                }
+            }
+            b
+        });
+
+        // This can only complete once the drainer frees buffer space AND the
+        // resulting writable edge actually wakes this task.
+        with_watchdog(&driver, "writable", a.write_all(b"done"))
+            .await
+            .unwrap();
+        let _b = drainer.join().unwrap();
+    }
+
+    // Readable edge: the task parks on an empty receive buffer; a second thread
+    // writes to the peer to make it readable.
+    for i in 0..12 {
+        let delay = Duration::from_millis([0, 1, 2][i % 3]);
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut a = PolledSocket::new(&driver, a).unwrap();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let mut s: &UnixStream = &b;
+            s.write_all(b"ping").unwrap();
+            b // keep the peer open until the read completes
+        });
+
+        let mut buf = [0u8; 4];
+        with_watchdog(&driver, "readable", a.read_exact(&mut buf))
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        let _b = writer.join().unwrap();
+    }
+}
+
+/// Regression test for the exact OpenVMM serial-console relay topology, end to
+/// end: a socketpair whose two ends are owned by TWO different reactors (each on
+/// its own thread), with both ends' I/O futures driven by `block_on` on yet other
+/// threads, and real backpressure forcing both ends to park and depend on a
+/// cross-thread readiness wakeup.
+///
+/// This mirrors `openvmm_entry`'s `setup_serial` plus the device side it feeds:
+/// - the console serial socket (`relay_side`) is registered on the `serial_driver`
+///   reactor and pumped to stdout by `block_on(io::copy(..))` on a separate
+///   per-port thread — the pump parks on a READABLE edge;
+/// - the device side (`device_side`) is registered on the VM's device driver and
+///   written by a PL011 `poll_tx`-style loop — when the socket send buffer fills
+///   (because the pump hasn't drained yet) that write parks on a WRITABLE edge,
+///   the exact "UART TX FIFO full / `UARTFR.TXFF` stuck" seam.
+///
+/// Sending far more than one socket buffer guarantees both ends repeatedly hit
+/// `WouldBlock` and park, so every byte of progress depends on a cross-thread
+/// wakeup being delivered by the *other* reactor. A single lost edge wedges the
+/// pipeline (the suspected cause of the rare release-build console hang); the dual
+/// watchdog below fails loudly instead of hanging the test binary.
+///
+/// `spawn_reactor` spawns a backend pool on its own thread and returns its join
+/// handle plus a cross-thread driver handle (i.e. `KqueuePool::spawn_on_thread`).
+/// It is called twice — once per reactor — so it takes `Fn`, not `FnOnce`.
+#[cfg(unix)]
+pub fn cross_thread_block_on_relay_test<D, F>(spawn_reactor: F)
+where
+    D: Driver,
+    F: Fn(&str) -> (std::thread::JoinHandle<()>, D),
+{
+    // Two reactors on two threads, exactly as openvmm_entry keeps the VM's device
+    // driver distinct from the `serial_driver` that owns the console socket.
+    let (dev_thread, dev_reactor) = spawn_reactor("dev-driver");
+    let (relay_thread, relay_reactor) = spawn_reactor("serial-driver");
+
+    let (device_side, relay_side) = UnixStream::pair().unwrap();
+    let device_side = PolledSocket::new(&dev_reactor, device_side).unwrap();
+    let relay_side = PolledSocket::new(&relay_reactor, relay_side).unwrap();
+
+    // Far more than one socket send buffer, so both ends are forced to park on
+    // `WouldBlock` hundreds of times and only resume via a cross-thread edge.
+    let chunk_len = 1024usize;
+    let chunk_count = 2048usize;
+    let total_bytes = (chunk_len * chunk_count) as u64;
+
+    // The relay pump (the "com1" thread): drains the guest's console output via a
+    // `block_on` bridge. Parks on a READABLE edge whenever the device is mid-pause
+    // or the buffer empties; resumes only via a cross-thread wake from
+    // `relay_reactor`. `io::copy` completes with the total once the peer hits EOF.
+    let (pump_tx, pump_rx) = std::sync::mpsc::channel();
+    let pump = std::thread::Builder::new()
+        .name("relay-pump".into())
+        .spawn(move || {
+            let mut relay_side = relay_side;
+            let mut sink = futures::io::sink();
+            let copied = block_on(futures::io::copy(&mut relay_side, &mut sink)).unwrap();
+            // Ignore send errors: on the lost-wakeup failure path the receiver
+            // has already timed out and gone away.
+            let _ = pump_tx.send(copied);
+        })
+        .unwrap();
+
+    // The device TX path (the PL011 `poll_tx` analogue): writes the whole stream
+    // into the device socket via a `block_on` bridge. When the send buffer fills
+    // (because the pump hasn't drained it yet) `write_all` parks on a WRITABLE
+    // edge — the TXFF-stuck seam — and resumes only when the pump reads
+    // `relay_side`, which the kernel surfaces as a writable edge that `dev_reactor`
+    // must deliver cross-thread. No artificial pauses are needed: the backpressure
+    // itself manufactures the park/wake churn on both ends.
+    let (dev_tx, dev_rx) = std::sync::mpsc::channel();
+    let device = std::thread::Builder::new()
+        .name("device-tx".into())
+        .spawn(move || {
+            let mut device_side = device_side;
+            block_on(async {
+                let buf = vec![0x5au8; chunk_len];
+                for _ in 0..chunk_count {
+                    device_side.write_all(&buf).await.unwrap();
+                }
+            });
+            // Drop to deliver EOF so the pump's copy future completes.
+            drop(device_side);
+            let _ = dev_tx.send(total_bytes);
+        })
+        .unwrap();
+
+    // Dual watchdog: a lost READABLE edge parks the pump forever (TXFF never
+    // clears for the guest); a lost WRITABLE edge parks the device TX forever.
+    // Either way the corresponding channel never reports. Gate on BOTH before
+    // joining — on the failure path the wedged thread would block `join` too.
+    let written = dev_rx.recv_timeout(Duration::from_secs(30)).expect(
+        "device TX stalled: a cross-thread WRITABLE wakeup was lost (UART TXFF would never clear)",
+    );
+    let copied = pump_rx.recv_timeout(Duration::from_secs(30)).expect(
+        "relay pump stalled: a cross-thread READABLE wakeup over the block_on bridge was lost",
+    );
+    assert_eq!(written, total_bytes);
+    assert_eq!(copied, total_bytes);
+
+    device.join().unwrap();
+    pump.join().unwrap();
+    drop(dev_reactor);
+    drop(relay_reactor);
+    dev_thread.join().unwrap();
+    relay_thread.join().unwrap();
+}
+
 /// Runs process wait tests.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub async fn process_tests(driver: impl Driver) {

@@ -136,6 +136,33 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                 HvArm64RegisterName::FeaturesInfo => 0u128.into(),
                 HvArm64RegisterName::HardwareFeaturesInfo => 0u128.into(),
 
+                // Isolation self-description (the AArch64 analogue of the x64
+                // CPUID leaf 0x4000000B). HVF is a non-isolating development
+                // hypervisor, so report `HvPartitionIsolationType::NONE` with no
+                // paravisor and no shared-GPA boundary: every guest page is
+                // plainly host-accessible. This is what keeps `vmbus.sys` on the
+                // non-isolated channel-setup path. (Zero already decodes to
+                // NONE; we spell it out so the intent is explicit and the
+                // generic "unsupported register" warning never fires for it.)
+                HvArm64RegisterName::IsolationConfiguration => {
+                    hvdef::HvIsolationConfiguration::new()
+                        .with_isolation_type(hvdef::HvPartitionIsolationType::NONE.0)
+                        .into_bits()
+                        .into()
+                }
+
+                // Implementation limits (the AArch64 analogue of the x64
+                // HV_IMPLEMENTATION_LIMITS CPUID leaf 0x40000005). Mirror the x64
+                // emulator: eax = max virtual processors, ebx = max logical
+                // processors (both the partition VP count), ecx/edx = 0. The
+                // little-endian register packing is eax | ebx<<32 | ecx<<64 |
+                // edx<<96. Returning 0 here (max VP count = 0) is nonsensical and
+                // can break the guest's early per-VP allocation sizing.
+                HvArm64RegisterName::ImplementationLimitsInfo => {
+                    let max_vps = self.vp.partition.vps.len() as u128;
+                    (max_vps | (max_vps << 32)).into()
+                }
+
                 // Synthetic timers (STIMERn_CONFIG/COUNT). Config sits at the
                 // even offset, Count at the odd offset, two registers per timer.
                 r if (HvArm64RegisterName::Stimer0Config

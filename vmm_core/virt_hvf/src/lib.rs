@@ -681,6 +681,8 @@ impl BindProcessor for HvfProcessorBinder {
             vmtime: state.vmtime,
             pmu: PmuState::default(),
             crash_params: [0; 5],
+            e0_last_wfi_pc: !0,
+            e0_wfi_count: 0,
         };
 
         // Set initial register state.
@@ -836,6 +838,34 @@ fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
     }
 }
 
+/// Reads the guest virtual-timer state (CNTV_CTL_EL0, CNTV_CVAL_EL0), the
+/// current virtual count, and the HVF vtimer mask, for diagnosing why a WFI is
+/// not woken. Returns a compact human-readable summary. Logging-only.
+fn vtimer_diag(vcpu: u64) -> String {
+    let mut ctl = 0u64;
+    let mut cval = 0u64;
+    let mut masked = false;
+    // SAFETY: simple register reads with out-params; no aliasing requirements.
+    unsafe {
+        let _ = abi::hv_vcpu_get_sys_reg(vcpu, abi::HvSysReg::CNTV_CTL_EL0, &mut ctl);
+        let _ = abi::hv_vcpu_get_sys_reg(vcpu, abi::HvSysReg::CNTV_CVAL_EL0, &mut cval);
+        let _ = abi::hv_vcpu_get_vtimer_mask(vcpu, &mut masked);
+    }
+    let now: u64;
+    // SAFETY: CNTVCT_EL0 is unprivileged-readable with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+    }
+    let enable = ctl & 1 != 0;
+    let imask = ctl & 2 != 0;
+    let istatus = ctl & 4 != 0;
+    let delta = cval.wrapping_sub(now) as i64;
+    format!(
+        "vtimer{{ ctl={ctl:#x} en={enable} imask={imask} istatus={istatus} \
+         cval={cval:#x} cntvct={now:#x} cval-now={delta} hvf_masked={masked} }}"
+    )
+}
+
 #[derive(InspectMut)]
 pub struct HvfProcessor<'a> {
     #[inspect(skip)]
@@ -855,6 +885,13 @@ pub struct HvfProcessor<'a> {
     /// writes `GuestCrashCtl` at `KeBugCheckEx` time.
     #[inspect(skip)]
     crash_params: [u64; 5],
+    /// E0 evidence-gate diagnostic state: last WFI guest-PC + a running WFI
+    /// count, used to dedup WFI-stall logging (collapse a spin to one line +
+    /// periodic heartbeat). Throwaway instrumentation — revert/fold before O5.
+    #[inspect(skip)]
+    e0_last_wfi_pc: u64,
+    #[inspect(skip)]
+    e0_wfi_count: u64,
 }
 
 #[derive(Debug, Inspect)]
@@ -983,6 +1020,55 @@ impl Drop for HvfVcpu {
 
 impl HvfProcessor<'_> {
     fn hypercall(&mut self, _dev: &impl CpuIo, smccc: bool) {
+        // HVF is a non-isolating development hypervisor: it is a dev vehicle for
+        // desktop virtualization, not a confidential-computing host. We never
+        // advertise VTL/CVM isolation (see `IsolationConfiguration` in
+        // `hypercall.rs`, which reports `HvPartitionIsolationType::NONE`), so
+        // all guest memory is plainly host-accessible at all times.
+        //
+        // Modern `vmbus.sys` on ARM64 nonetheless exercises the private SLAT
+        // host-access / host-visibility hypercall family during channel
+        // bring-up — the 0x00D6–0x00D8 band:
+        //
+        //   0x00D6  HvCallModifySparseGpaPageHostVisibility
+        //   0x00D7  HvCallAcquireSparseSpaPageHostAccess
+        //   0x00D8  HvCallReleaseSparseSpaPageHostAccess
+        //
+        // For a non-isolated partition these are semantic no-ops: the pages are
+        // already host-visible, so "make host-visible" / "(re)acquire host
+        // access" is trivially already satisfied. Returning
+        // `InvalidHypercallCode` (our default for unknown codes) makes
+        // `vmbus.sys` bugcheck — it cannot complete channel setup — after which
+        // the guest storms the call (~1500/s) and boot-loops. Answering SUCCESS
+        // lets channel setup proceed, which is the correct behavior for this
+        // non-isolating backend.
+        const HV_CALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY: u16 = 0x00D6;
+        const HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00D7;
+        const HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00D8;
+
+        // Control is X0 for the Hyper-V convention (hvc #1), X1 for SMCCC.
+        let control = hvdef::hypercall::Control::from(self.vcpu.gp(smccc as u8));
+        match control.code() {
+            HV_CALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY
+            | HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS
+            | HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS => {
+                // These are rep hypercalls; report every element processed so
+                // the guest observes a clean, complete success. The ARM HVC
+                // instruction already advanced PC (`pre_advanced`), so we only
+                // write the output word into X0 (the result register).
+                let output = hvdef::hypercall::HypercallOutput::SUCCESS
+                    .with_elements_processed(control.rep_count());
+                self.vcpu.set_gp(0, u64::from(output));
+                tracelimit::info_ratelimited!(
+                    code = control.code(),
+                    reps = control.rep_count(),
+                    "non-isolated no-op success for host-visibility/access hypercall"
+                );
+                return;
+            }
+            _ => {}
+        }
+
         let guest_memory = &self.partition.guest_memory;
         let handler = HvfHypercallHandler::new(self);
         HvfHypercallHandler::DISPATCHER.dispatch(
@@ -1221,7 +1307,20 @@ impl<'p> Processor for HvfProcessor<'p> {
                             self.vmtime.now().wrapping_add(Duration::from_millis(2)),
                         );
                         ready!(self.vmtime.poll_timeout(cx));
-                        self.gicr.raise(self.partition.virt_timer_ppi);
+                        // The 2ms vtimer backstop fired. HVF cannot raise
+                        // VTIMER_ACTIVATED while the vCPU is parked in WFI (it
+                        // only delivers as an exit *from* hv_vcpu_run), so the
+                        // VMM must periodically wake the guest. Rather than
+                        // blind-injecting the timer PPI here — a spurious
+                        // interrupt that a real guest OS (e.g. Windows) rejects
+                        // because CNTV_CTL.ISTATUS is still 0, wedging boot — we
+                        // clear the WFI wait and re-enter the guest. The WFI PC
+                        // was already advanced, so the guest resumes its idle
+                        // loop; before re-running we unmask the vtimer (below),
+                        // letting HVF deliver a *genuine* VTIMER_ACTIVATED iff
+                        // the virtual timer has actually expired. The loop head
+                        // re-scans SynIC/SPI/SGI wake sources before we break.
+                        self.wfi = false;
                         continue;
                     }
 
@@ -1348,16 +1447,53 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     value
                                 } else if let Some(value) = self.pmu.read_sysreg(reg, now) {
                                     value
+                                } else if reg == SystemReg::OSLSR_EL1 {
+                                    // ARMv8 mandates the OS Lock; its reset value is
+                                    // OSLM=0b10 (bits[3,0]) ⇒ 0x8, OSLK=0 (unlocked).
+                                    // Previously this fell through and returned 0
+                                    // (OSLM=0b00 = "OS Lock not implemented"), which
+                                    // is architecturally invalid. Report the lock as
+                                    // implemented-and-unlocked so the guest's debug
+                                    // init sees a sane register.
+                                    0x8
                                 } else {
                                     tracing::warn!(
                                         ?reg,
+                                        pc = self.vcpu.pc(),
                                         "returning zero for unknown system register"
                                     );
                                     0
                                 };
+                                // E0 evidence gate: trace generic-timer *control*
+                                // reads (CRn==14, CRm!=0 excludes the high-frequency
+                                // CNTxCT/CNTFRQ counters) to see what timer state
+                                // Windows queries while wedged.
+                                if reg.0.crn() == 14 && reg.0.crm() != 0 {
+                                    tracing::info!(
+                                        target: "e0_timer",
+                                        ?reg,
+                                        value,
+                                        pc = self.vcpu.pc(),
+                                        "E0 timer-sysreg READ"
+                                    );
+                                }
                                 self.vcpu.set_gp(iss.rt(), value);
                             } else {
                                 let value = self.vcpu.gp(iss.rt());
+                                // E0 evidence gate: trace generic-timer *control*
+                                // writes (CRn==14, CRm!=0 → CNTP_*/CNTV_*/CNTKCTL, not
+                                // the counters). A guest that arms CNTP_CVAL/CTL here
+                                // and then WFIs is the smoking gun for CNTP starvation
+                                // (→ O5 is the Windows-unblock).
+                                if reg.0.crn() == 14 && reg.0.crm() != 0 {
+                                    tracing::info!(
+                                        target: "e0_timer",
+                                        ?reg,
+                                        value,
+                                        pc = self.vcpu.pc(),
+                                        "E0 timer-sysreg WRITE"
+                                    );
+                                }
                                 let handled_by_gic = self.partition.gicd.write_sysreg(
                                     &mut self.gicr,
                                     reg,
@@ -1368,6 +1504,7 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     tracing::warn!(
                                         ?reg,
                                         value,
+                                        pc = self.vcpu.pc(),
                                         "ignoring write to unknown system register"
                                     );
                                 }
@@ -1425,6 +1562,35 @@ impl<'p> Processor for HvfProcessor<'p> {
                             }
                         }
                         ExceptionClass::WFI => {
+                            // E0 evidence gate: trace the WFI stall location, deduped
+                            // by guest PC (collapse a WFI spin to one line + a periodic
+                            // heartbeat) so we can tell whether Windows is parked
+                            // waiting on a timer interrupt that never arrives. Dump the
+                            // GIC SGI/PPI + CPU-interface state alongside so we can see
+                            // exactly which interrupt the guest enabled and is awaiting
+                            // (e.g. INTID 27 = architectural CNTV vs our 20).
+                            let pc = self.vcpu.pc();
+                            self.e0_wfi_count = self.e0_wfi_count.wrapping_add(1);
+                            if pc != self.e0_last_wfi_pc {
+                                tracing::info!(
+                                    target: "e0_wfi",
+                                    pc,
+                                    count = self.e0_wfi_count,
+                                    vtimer = %vtimer_diag(self.vcpu.vcpu),
+                                    diag = ?self.gicr.ppi_diag(),
+                                    "E0 WFI (pc changed)"
+                                );
+                                self.e0_last_wfi_pc = pc;
+                            } else if self.e0_wfi_count % 512 == 0 {
+                                tracing::info!(
+                                    target: "e0_wfi",
+                                    pc,
+                                    count = self.e0_wfi_count,
+                                    vtimer = %vtimer_diag(self.vcpu.vcpu),
+                                    diag = ?self.gicr.ppi_diag(),
+                                    "E0 WFI (spin heartbeat)"
+                                );
+                            }
                             self.wfi = true;
                             advance(&mut self.vcpu);
                         }

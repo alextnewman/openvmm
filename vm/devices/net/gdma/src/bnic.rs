@@ -267,6 +267,11 @@ impl BufferAccess for GuestBuffers {
 pub struct BnicConfig {
     /// Adapter link speed in megabits per second.
     pub adapter_link_speed_mbps: u32,
+    /// Present the device as a bare-metal physical function: report
+    /// `bm_hostmode=1` in the device-config response so the guest exercises the
+    /// driver's bare-metal-host paths. Paired with the PF PCI device id and PF
+    /// register window set up by [`crate::GdmaDevice::new_with_config`].
+    pub bm_hostmode: bool,
 }
 
 impl BnicConfig {
@@ -610,6 +615,7 @@ impl BasicNic {
                     pf_cap_flags3: 0,
                     pf_cap_flags4: 0,
                     max_num_vports: self.vports.len() as u16,
+                    bm_hostmode: self.config.bm_hostmode as u8,
                     reserved: 0,
                     max_num_eqs: 64,
                     adapter_mtu: MANA_DEFAULT_ADAPTER_MTU,

@@ -214,6 +214,81 @@ async fn test_gdma(driver: DefaultDriver) {
     arena.destroy(&mut gdma).await;
 }
 
+/// In bare-metal-host mode the device presents itself as a physical function
+/// rather than an SR-IOV VF, so the guest exercises the Linux driver's
+/// bare-metal-host code paths. Three facts are observable: (1) the PCI device id
+/// is `1414:00b9` (the PF id `mana_is_pf` keys on); (2) BAR0 exposes the PF
+/// register window `mana_gd_init_pf_regs` reads, resolving to the same
+/// shared-memory/doorbell regions the VF map exposes; and (3) the
+/// device-config response reports `bm_hostmode=1`. The VF register map stays in
+/// place, so the HW channel still establishes. Without the feature a VF device
+/// reports id `00ba`, leaves the PF window unmapped (reads return `!0`), and
+/// reports `bm_hostmode=0`.
+#[async_test]
+async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_bm_hostmode_pf");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let mut device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            bm_hostmode: true,
+            ..Default::default()
+        },
+    );
+
+    // (1) The function advertises the PF PCI id so the guest's `mana_is_pf`
+    // takes the bare-metal-host path.
+    let mut vendor_device = 0;
+    device.pci_cfg_read(0, &mut vendor_device).unwrap();
+    assert_eq!(
+        vendor_device,
+        (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
+    );
+
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+
+    // (2) Read the PF BAR0 register window the driver consumes. The driver
+    // computes `db_page_base = bar0 + db_page_off` and
+    // `shm_base = bar0 + sriov_base_off + sriov_shm_off`, so these resolve to
+    // the doorbell page (4096) and the shared-memory window (40) respectively.
+    let mut regs = device.clone();
+    let bar0 = regs.map_bar(0).unwrap();
+    assert_eq!(bar0.read_u32(0xD0), 4096); // GDMA_PF_REG_DB_PAGE_SIZE
+    assert_eq!(bar0.read_u64(0xC8), 4096); // GDMA_PF_REG_DB_PAGE_OFF
+    assert_eq!(bar0.read_u64(0x108), 0); // GDMA_SRIOV_REG_CFG_BASE_OFF
+    assert_eq!(bar0.read_u64(0x70), 40); // sriov base + GDMA_PF_REG_SHM_OFF
+
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    // (3) The device-config response carries `bm_hostmode=1`.
+    gdma.register_device(dev_id).await.unwrap();
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let dev_config = bnic.query_dev_config().await.unwrap();
+    assert_eq!(dev_config.bm_hostmode, 1);
+}
+
 /// A vport must support more than one receive work-queue object so the guest
 /// can build an RSS indirection table that steers traffic across multiple
 /// queues. Each object must be addressed by a distinct `wq_obj` handle so it
@@ -555,6 +630,7 @@ async fn verify_adapter_link_speed_expected(driver: DefaultDriver, link_speed_mb
         &mut ExternallyManagedMmioIntercepts,
         gdma::BnicConfig {
             adapter_link_speed_mbps: link_speed_mbps,
+            ..Default::default()
         },
     );
     let dma_client = mem.dma_client();
@@ -2050,6 +2126,7 @@ async fn test_gdma_query_link_config(driver: DefaultDriver) {
         &mut ExternallyManagedMmioIntercepts,
         gdma::BnicConfig {
             adapter_link_speed_mbps: LINK_SPEED_MBPS,
+            ..Default::default()
         },
     );
     let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());

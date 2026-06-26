@@ -21,6 +21,24 @@ use zerocopy::KnownLayout;
 
 pub const VENDOR_ID: u16 = 0x1414;
 pub const DEVICE_ID: u16 = 0x00BA;
+/// PCI device id for the physical function (PF). A device presented with this
+/// id (rather than the SR-IOV VF id [`DEVICE_ID`]) drives the Linux driver's
+/// bare-metal-host code paths (`mana_is_pf`).
+pub const PF_DEVICE_ID: u16 = 0x00B9;
+
+/// PF BAR0 register offsets read by the Linux driver's `mana_gd_init_pf_regs`.
+/// These name a register layout disjoint from the VF [`RegMap`], used only when
+/// the device is presented as a PF.
+pub mod pf_regs {
+    /// `u64` doorbell page region offset, relative to BAR0.
+    pub const DB_PAGE_OFF: usize = 0xC8;
+    /// `u32` doorbell page size (must be a page multiple).
+    pub const DB_PAGE_SIZE: usize = 0xD0;
+    /// `u64` shared-memory (SMC) window offset, relative to the SR-IOV base.
+    pub const SHM_OFF: usize = 0x70;
+    /// `u64` SR-IOV register config base offset, relative to BAR0.
+    pub const SRIOV_REG_CFG_BASE_OFF: usize = 0x108;
+}
 
 pub const PAGE_SIZE32: u32 = 4096;
 pub const PAGE_SIZE64: u64 = 4096;
@@ -343,6 +361,8 @@ pub const GDMA_STANDARD_HEADER_TYPE: u32 = 0;
 pub const GDMA_MESSAGE_V1: u16 = 1;
 
 pub const GDMA_MESSAGE_V2: u16 = 2;
+
+pub const GDMA_MESSAGE_V3: u16 = 3;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes, PartialEq, Eq)]

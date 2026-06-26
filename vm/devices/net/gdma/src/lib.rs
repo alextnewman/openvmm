@@ -74,6 +74,51 @@ const SHMEM: Range<usize> = 40..72;
 const SHMEM_LEN: usize = SHMEM.end - SHMEM.start;
 const DOORBELLS: Range<usize> = 4096..8192;
 
+/// PF (bare-metal host) BAR0 register window, exposed only when the device is
+/// presented as a physical function. It is disjoint from the VF [`RegMap`]
+/// (which stays at [`REGMAP`]) and sits just above [`SHMEM`]; the highest
+/// register the driver reads is the SR-IOV config base at
+/// [`gdma_defs::pf_regs::SRIOV_REG_CFG_BASE_OFF`] (a `u64`), so the window ends
+/// at `0x110`.
+const PF_REGS: Range<usize> = 0x48..0x110;
+const PF_REGS_LEN: usize = PF_REGS.end - PF_REGS.start;
+
+/// Build the PF BAR0 register window that the Linux driver's
+/// `mana_gd_init_pf_regs` reads. The driver computes
+/// `shm_base = bar0 + sriov_base_off + sriov_shm_off` and
+/// `db_page_base = bar0 + db_page_off`, then validates ranges/alignment. We
+/// place the SR-IOV config base at BAR0 itself (`sriov_base_off = 0`), the
+/// shared-memory window at [`SHMEM`], and the doorbell page at [`DOORBELLS`],
+/// so the PF view resolves to the very same SMC/doorbell regions the VF map
+/// exposes — keeping a single source of truth for the device's memory layout.
+fn build_pf_regs() -> [u8; PF_REGS_LEN] {
+    let mut regs = [0u8; PF_REGS_LEN];
+    let mut put = |abs: usize, bytes: &[u8]| {
+        let off = abs - PF_REGS.start;
+        regs[off..off + bytes.len()].copy_from_slice(bytes);
+    };
+    // sriov_shm_off (relative to the SR-IOV base, which is 0): SHMEM start.
+    put(
+        gdma_defs::pf_regs::SHM_OFF,
+        &(SHMEM.start as u64).to_ne_bytes(),
+    );
+    // Doorbell page region.
+    put(
+        gdma_defs::pf_regs::DB_PAGE_OFF,
+        &(DOORBELLS.start as u64).to_ne_bytes(),
+    );
+    put(
+        gdma_defs::pf_regs::DB_PAGE_SIZE,
+        &(DOORBELLS.len() as u32).to_ne_bytes(),
+    );
+    // The SR-IOV register block is the BAR base itself.
+    put(
+        gdma_defs::pf_regs::SRIOV_REG_CFG_BASE_OFF,
+        &0u64.to_ne_bytes(),
+    );
+    regs
+}
+
 pub struct GdmaDevice {
     config: ConfigSpaceType0Emulator,
     msix: MsixEmulator,
@@ -92,6 +137,10 @@ pub struct GdmaDevice {
     /// completes. While set, [`PollDevice::poll_device`] keeps driving
     /// [`GdmaDevice::poll_flr_reset`] to completion across polls.
     flr_draining: bool,
+    /// The PF BAR0 register window, present only when the device is presented
+    /// as a bare-metal PF (`bm_hostmode`). `None` for a VF, keeping the VF
+    /// register surface byte-identical.
+    pf_regs: Option<[u8; PF_REGS_LEN]>,
 }
 
 /// Bridges the synchronous [`FlrHandler::initiate_flr`] callback (invoked from
@@ -189,6 +238,14 @@ impl GdmaDevice {
     ) -> Self {
         let (msix, msix_capability) = MsixEmulator::new(4, 64, msi_target);
 
+        // In bare-metal-host mode the device presents the PF PCI id and a PF
+        // BAR0 register window; the BNIC reports `bm_hostmode=1`. The VF
+        // register map stays in place either way (the PF window is disjoint and
+        // the Linux PF driver never reads the VF offsets), so the in-tree
+        // driver can still bring up the HW channel against a PF-mode device.
+        let bm_hostmode = bnic_config.bm_hostmode;
+        let pf_regs = bm_hostmode.then(build_pf_regs);
+
         // Route a guest-initiated PCIe Function Level Reset to the device's
         // async reset. The handler only signals `flr_rx`; `poll_device` runs
         // the teardown. MSI-X stays first in the capability list so it keeps
@@ -201,7 +258,11 @@ impl GdmaDevice {
 
         let hardware_ids = HardwareIds {
             vendor_id: gdma_defs::VENDOR_ID,
-            device_id: gdma_defs::DEVICE_ID,
+            device_id: if bm_hostmode {
+                gdma_defs::PF_DEVICE_ID
+            } else {
+                gdma_defs::DEVICE_ID
+            },
             revision_id: 1,
             prog_if: ProgrammingInterface::NETWORK_CONTROLLER_ETHERNET_GDMA,
             sub_class: Subclass::NETWORK_CONTROLLER_ETHERNET,
@@ -256,6 +317,7 @@ impl GdmaDevice {
             }),
             flr_rx,
             flr_draining: false,
+            pf_regs,
         }
     }
 
@@ -415,6 +477,12 @@ impl GdmaDevice {
             self.read_regmap(offset, data);
         } else if SHMEM.contains_range(&range) {
             self.read_shmem(offset - SHMEM.start, data);
+        } else if let Some(pf) = self
+            .pf_regs
+            .as_ref()
+            .filter(|_| PF_REGS.contains_range(&range))
+        {
+            data.copy_from_slice(&pf[offset - PF_REGS.start..][..data.len()]);
         } else {
             tracing::warn!(offset, len = data.len(), "bad read");
             data.fill(!0);

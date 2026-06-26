@@ -17,6 +17,10 @@ use vm_resource::kind::PciDeviceHandleKind;
 pub struct GdmaDeviceHandle {
     /// The vports to instantiate on the NIC.
     pub vports: Vec<VportDefinition>,
+    /// Present the device as a bare-metal physical function (PCI id
+    /// `1414:00b9`) reporting `bm_hostmode`, to exercise the Linux driver's
+    /// bare-metal-host code paths instead of the SR-IOV VF paths.
+    pub bm_hostmode: bool,
 }
 
 impl ResourceId<PciDeviceHandleKind> for GdmaDeviceHandle {

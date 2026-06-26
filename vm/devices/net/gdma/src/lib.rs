@@ -494,9 +494,11 @@ impl GdmaDevice {
             tracing::warn!(offset, len = data.len(), "bad read");
             data.fill(!0);
         }
+        tracing::trace!(offset, len = data.len(), value = ?data, "bar0 read");
     }
 
     fn write_reg(&mut self, offset: usize, data: &[u8]) {
+        tracing::trace!(offset, len = data.len(), value = ?data, "bar0 write");
         let range = offset..offset + data.len();
         if SHMEM.contains_range(&range) {
             self.write_shmem(offset - SHMEM.start, data);

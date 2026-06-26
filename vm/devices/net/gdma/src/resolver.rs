@@ -3,6 +3,7 @@
 
 //! Resource resolver for the nvme controller.
 
+use crate::BnicConfig;
 use crate::GdmaDevice;
 use crate::VportConfig;
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaDeviceHandle> for GdmaDeviceR
         resource: GdmaDeviceHandle,
         input: ResolvePciDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let bm_hostmode = resource.bm_hostmode;
         let vports = try_join_all(resource.vports.into_iter().map(async |vport| {
             let endpoint = resolver
                 .resolve(
@@ -63,12 +65,16 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaDeviceHandle> for GdmaDeviceR
         }))
         .await?;
 
-        let device = GdmaDevice::new(
+        let device = GdmaDevice::new_with_config(
             input.driver_source,
             input.guest_memory.clone(),
             input.msi_target,
             vports,
             input.register_mmio,
+            BnicConfig {
+                bm_hostmode,
+                ..Default::default()
+            },
         );
         Ok(device.into())
     }

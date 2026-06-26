@@ -666,7 +666,13 @@ async fn vm_config_from_command_line(
                     subordinate_instance_id: None,
                     max_sub_channels: None,
                 });
-                (vpci_instance_id, GdmaDeviceHandle { vports: Vec::new() })
+                (
+                    vpci_instance_id,
+                    GdmaDeviceHandle {
+                        vports: Vec::new(),
+                        bm_hostmode: false,
+                    },
+                )
             });
             mana.1.vports.push(VportDefinition {
                 mac_address: vport.mac_address,
@@ -761,7 +767,13 @@ async fn vm_config_from_command_line(
             (vtl, None) => {
                 &mut vpci_mana_nics[vtl]
                     .get_or_insert_with(|| {
-                        (Guid::new_random(), GdmaDeviceHandle { vports: Vec::new() })
+                        (
+                            Guid::new_random(),
+                            GdmaDeviceHandle {
+                                vports: Vec::new(),
+                                bm_hostmode: opt.mana_bm_hostmode,
+                            },
+                        )
                     })
                     .1
                     .vports
@@ -769,7 +781,10 @@ async fn vm_config_from_command_line(
             (0, Some(pcie_port)) => {
                 &mut pcie_mana_nics
                     .entry(pcie_port)
-                    .or_insert(GdmaDeviceHandle { vports: Vec::new() })
+                    .or_insert(GdmaDeviceHandle {
+                        vports: Vec::new(),
+                        bm_hostmode: opt.mana_bm_hostmode,
+                    })
                     .vports
             }
             _ => anyhow::bail!("PCIe NICs only supported to VTL0"),

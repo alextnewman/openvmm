@@ -289,16 +289,18 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
     assert_eq!(dev_config.bm_hostmode, 1);
 }
 
-/// With `pf_caps` set, the device exposes a read-only PF capability register
-/// block in BAR0 advertising its resource limits. The block's queue maxima must
-/// match the `GDMA_QUERY_MAX_RESOURCES` response (single source of truth), and
-/// the fixed limits read back exactly. The block is disjoint from the VF
-/// register map, so the in-tree driver still brings up the HW channel.
+/// With `pf_caps` set, the device presents the PF PCI id and a discovery chain:
+/// the register map carries a cap pointer that directs a PF driver to a
+/// read-only capability block advertising the device's resource limits. The
+/// block's queue maxima must match the `GDMA_QUERY_MAX_RESOURCES` response
+/// (single source of truth). The SMC shared-memory window is relocated above
+/// the discovery block, advertised through the register map, so the in-tree
+/// driver still brings up the HW channel by following the pointer.
 #[async_test]
 async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
     let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_registers");
     let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
-    let device = gdma::GdmaDevice::new_with_config(
+    let mut device = gdma::GdmaDevice::new_with_config(
         &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
         mem.guest_memory(),
         msi_conn.target(),
@@ -313,14 +315,34 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
         },
     );
 
+    // (1) pf_caps presents the PF PCI id so a PF bus driver binds.
+    let mut vendor_device = 0;
+    device.pci_cfg_read(0, &mut vendor_device).unwrap();
+    assert_eq!(
+        vendor_device,
+        (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
+    );
+
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
 
-    // Read the capability block. Field offsets are relative to the block base
-    // at BAR0 0x110.
     let mut regs = device.clone();
     let bar0 = regs.map_bar(0).unwrap();
-    let cap = |field: usize| bar0.read_u32(0x110 + field);
+
+    // (2) The register map advertises the doorbell zone, the relocated
+    // shared-memory window, and a cap pointer (offset + size) to the block.
+    assert_eq!(bar0.read_u64(0x08), 4096); // doorbell zone offset
+    let shmem_base = bar0.read_u64(0x18); // relocated shared-memory base
+    assert_eq!(shmem_base, 0x40);
+    assert_eq!(bar0.read_u32(0x20) & 0xffff, 32); // shared-memory size
+    let cap_off = bar0.read_u64(0x28); // cap block offset
+    let cap_size = bar0.read_u32(0x30) & 0xffff; // cap block size
+    assert_eq!(cap_off, 0x110);
+    assert_eq!(cap_size, 0x68);
+
+    // (3) Follow the cap pointer to the block and read its fields. Field offsets
+    // are relative to the discovered block base.
+    let cap = |field: u64| bar0.read_u32((cap_off + field) as usize);
     assert_eq!(cap(0x00), 0); // hw_capabilities
     assert_eq!(cap(0x04), 0); // feature_flags
     assert_eq!(cap(0x08), 64); // max_send_queues
@@ -336,7 +358,9 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
     assert_eq!(cap(0x58), 64); // max_msix_entries
     assert_eq!(cap(0x60), 64); // pf_max_msix_entries
 
-    // The block's queue maxima must agree with GDMA_QUERY_MAX_RESOURCES.
+    // (4) The HW channel still comes up by following the register map to the
+    // relocated shared-memory window; the block's queue maxima must agree with
+    // GDMA_QUERY_MAX_RESOURCES.
     let dma_client = device.dma_client();
     let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
     let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))

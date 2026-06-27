@@ -179,11 +179,37 @@ fn build_pf_cap_regs(queues: &Queues) -> [u8; PF_CAP_REGS_LEN] {
     regs
 }
 
+/// In `pf_caps` mode the SMC shared-memory window is relocated above the
+/// discovery block so the discovery cap pointer (at [`PF_CAP_PTR`]) is not
+/// shadowed by it. The base is advertised through the register map's shared
+/// register field, so a driver follows the pointer rather than assuming a fixed
+/// offset.
+const PF_CAPS_SHMEM: Range<usize> = 0x40..0x40 + SHMEM_LEN;
+
+/// Discovery cap pointer, present in BAR0 only in `pf_caps` mode. It directs a
+/// physical-function driver to the capability block ([`PF_CAP_REGS`]): an
+/// 8-byte offset at the window start followed by a 2-byte size.
+const PF_CAP_PTR: Range<usize> = 0x28..0x38;
+const PF_CAP_PTR_LEN: usize = PF_CAP_PTR.end - PF_CAP_PTR.start;
+
+/// Build the discovery cap pointer ([`PF_CAP_PTR`]): the offset and size of the
+/// capability block ([`PF_CAP_REGS`]).
+fn build_pf_cap_ptr() -> [u8; PF_CAP_PTR_LEN] {
+    let mut ptr = [0u8; PF_CAP_PTR_LEN];
+    ptr[0..8].copy_from_slice(&(PF_CAP_REGS.start as u64).to_ne_bytes());
+    ptr[8..10].copy_from_slice(&(PF_CAP_REGS_LEN as u16).to_ne_bytes());
+    ptr
+}
+
 pub struct GdmaDevice {
     config: ConfigSpaceType0Emulator,
     msix: MsixEmulator,
     regmap: RegMap,
     shmem: Shmem,
+    /// BAR0 range of the SMC shared-memory window. Normally [`SHMEM`]; in
+    /// `pf_caps` mode it is relocated to [`PF_CAPS_SHMEM`] so the discovery cap
+    /// pointer can occupy [`PF_CAP_PTR`].
+    shmem_region: Range<usize>,
     destroying_hwc: bool,
     queues: Arc<Queues>,
     hwc: TaskControl<Devices, HwControl>,
@@ -201,6 +227,9 @@ pub struct GdmaDevice {
     /// as a bare-metal PF (`bm_hostmode`). `None` for a VF, keeping the VF
     /// register surface byte-identical.
     pf_regs: Option<[u8; PF_REGS_LEN]>,
+    /// The discovery cap pointer, present only when `pf_caps` is set. Directs a
+    /// PF driver from the register map to the capability window.
+    pf_cap_ptr: Option<[u8; PF_CAP_PTR_LEN]>,
     /// The PF capability register window, present only when `pf_caps` is set.
     /// `None` keeps the BAR0 register surface unchanged.
     pf_cap_regs: Option<[u8; PF_CAP_REGS_LEN]>,
@@ -310,7 +339,18 @@ impl GdmaDevice {
         // driver can still bring up the HW channel against a PF-mode device.
         let bm_hostmode = bnic_config.bm_hostmode;
         let pf_caps = bnic_config.pf_caps;
+        // `bm_hostmode` and `pf_caps` are two distinct physical-function
+        // presentations and are never combined.
+        debug_assert!(
+            !(bm_hostmode && pf_caps),
+            "bm_hostmode and pf_caps are mutually exclusive"
+        );
         let pf_regs = bm_hostmode.then(build_pf_regs);
+        // In `pf_caps` mode the shared-memory window moves above the discovery
+        // block so the discovery cap pointer can occupy its fixed offset; the
+        // new base is advertised through the register map.
+        let shmem_region = if pf_caps { PF_CAPS_SHMEM } else { SHMEM };
+        let pf_cap_ptr = pf_caps.then(build_pf_cap_ptr);
         if bm_hostmode {
             tracing::info!(
                 device_id = format_args!("{:#06x}", gdma_defs::PF_DEVICE_ID),
@@ -318,7 +358,10 @@ impl GdmaDevice {
             );
         }
         if pf_caps {
-            tracing::info!("exposing PF capability register block (pf_caps)");
+            tracing::info!(
+                device_id = format_args!("{:#06x}", gdma_defs::PF_DEVICE_ID),
+                "presenting MANA device as physical function with capability registers (pf_caps)"
+            );
         }
 
         // Route a guest-initiated PCIe Function Level Reset to the device's
@@ -333,7 +376,7 @@ impl GdmaDevice {
 
         let hardware_ids = HardwareIds {
             vendor_id: gdma_defs::VENDOR_ID,
-            device_id: if bm_hostmode {
+            device_id: if bm_hostmode || pf_caps {
                 gdma_defs::PF_DEVICE_ID
             } else {
                 gdma_defs::DEVICE_ID
@@ -372,8 +415,8 @@ impl GdmaDevice {
             vf_db_page_sz: DOORBELLS.len() as u16,
             reserved2: 0,
             reserved3: 0,
-            vf_gdma_sriov_shared_reg_start: SHMEM.start as u64,
-            vf_gdma_sriov_shared_sz: SHMEM.len() as u16,
+            vf_gdma_sriov_shared_reg_start: shmem_region.start as u64,
+            vf_gdma_sriov_shared_sz: shmem_region.len() as u16,
             reserved4: 0,
             reserved5: 0,
         };
@@ -385,6 +428,7 @@ impl GdmaDevice {
             config,
             msix,
             shmem: Shmem(FromZeros::new_zeroed()),
+            shmem_region,
             regmap,
             queues,
             destroying_hwc: false,
@@ -394,6 +438,7 @@ impl GdmaDevice {
             flr_rx,
             flr_draining: false,
             pf_regs,
+            pf_cap_ptr,
             pf_cap_regs,
         }
     }
@@ -552,8 +597,15 @@ impl GdmaDevice {
         let range = offset..offset + data.len();
         if REGMAP.contains_range(&range) {
             self.read_regmap(offset, data);
-        } else if SHMEM.contains_range(&range) {
-            self.read_shmem(offset - SHMEM.start, data);
+        } else if self.shmem_region.contains_range(&range) {
+            let base = self.shmem_region.start;
+            self.read_shmem(offset - base, data);
+        } else if let Some(ptr) = self
+            .pf_cap_ptr
+            .as_ref()
+            .filter(|_| PF_CAP_PTR.contains_range(&range))
+        {
+            data.copy_from_slice(&ptr[offset - PF_CAP_PTR.start..][..data.len()]);
         } else if let Some(pf) = self
             .pf_regs
             .as_ref()
@@ -576,8 +628,9 @@ impl GdmaDevice {
     fn write_reg(&mut self, offset: usize, data: &[u8]) {
         tracing::trace!(offset, len = data.len(), value = ?data, "bar0 write");
         let range = offset..offset + data.len();
-        if SHMEM.contains_range(&range) {
-            self.write_shmem(offset - SHMEM.start, data);
+        if self.shmem_region.contains_range(&range) {
+            let base = self.shmem_region.start;
+            self.write_shmem(offset - base, data);
         } else if DOORBELLS.contains_range(&range) && data.len() == 8 {
             self.write_doorbell(
                 offset - DOORBELLS.start,

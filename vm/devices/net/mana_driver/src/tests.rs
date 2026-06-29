@@ -36,9 +36,15 @@ use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::MANA_DEFAULT_LINK_SPEED_MBPS;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
 use gdma_defs::bnic::ManaCommandCode;
+use gdma_defs::bnic::ManaConfigVportReq;
+use gdma_defs::bnic::ManaConfigVportResp;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::ManaCreateWqobjReq;
 use gdma_defs::bnic::ManaFenceRqReq;
+use gdma_defs::bnic::ManaPfCreateFilterReq;
+use gdma_defs::bnic::ManaPfCreateFilterResp;
+use gdma_defs::bnic::ManaPfCreateVportReq;
+use gdma_defs::bnic::ManaPfCreateVportResp;
 use gdma_defs::bnic::ManaQueryFilterCapResponse;
 use gdma_defs::bnic::ManaQueryLinkConfigReq;
 use gdma_defs::bnic::ManaQueryLinkConfigResp;
@@ -2459,6 +2465,182 @@ async fn test_gdma_query_filter_cap(driver: DefaultDriver) {
     assert_eq!(
         resp.max_num_rx_objects, 64,
         "device must report 64 receive objects for a basic NIC"
+    );
+}
+
+/// `MANA_PF_CREATE_VPORT` (0x28003) is a privileged command a physical-function
+/// client issues to create the vport it manages, obtaining the opaque handle it
+/// then passes to the shared vport commands (config-vport-tx, create-wq-obj,
+/// config-vport-rx). A virtual function never sends it -- it learns its vport
+/// handle from `MANA_QUERY_VPORT_CONFIG` instead. Before this the command fell
+/// through the catch-all and the host miniport looped in
+/// `CM_PROB_NOT_CONFIGURED`. The emulator addresses its single vport by index
+/// and returns that index (0) as the handle; verify both that the handle is 0
+/// and -- the whole point of the handle -- that it resolves through a shared
+/// command (`MANA_CONFIG_VPORT_TX`).
+#[async_test]
+async fn test_gdma_pf_create_vport(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_create_vport");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let resp: ManaPfCreateVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_PF_CREATE_VPORT.0,
+            dev_id,
+            ManaPfCreateVportReq {
+                attached_gf_id: 0,
+                is_pvf_default_vport: 0,
+                allow_vlan_tagging: 1,
+                allow_all_ethertypes: 1,
+                allow_src_mac_spoofing: 0,
+                mask_vlan_tag: 0,
+                strip_vlan_tag: 0,
+                msix_table_size_hint: 0,
+                mac_address_set: 1,
+                enable_tx_vport: 1,
+                mac_address: [1, 2, 3, 4, 5, 6],
+            },
+        )
+        .await
+        .expect("pf create vport must succeed");
+
+    assert_eq!(
+        resp.vport_handle, 0,
+        "the single vport's handle is its index (0)"
+    );
+
+    // The returned handle must resolve through the shared vport commands the
+    // privileged client issues next; configuring the vport TX path with the
+    // handle proves it.
+    let cfg: ManaConfigVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_CONFIG_VPORT_TX.0,
+            dev_id,
+            ManaConfigVportReq {
+                vport: resp.vport_handle,
+                pdid: 0,
+                doorbell_pageid: 0,
+            },
+        )
+        .await
+        .expect("config vport with the created vport handle must succeed");
+    assert_eq!(cfg.short_form_allowed, 1);
+}
+
+/// `MANA_PF_CREATE_FILTER` (0x28000) is a privileged command a physical-function
+/// client issues to create a receive filter (typically the default MAC filter)
+/// on a vport, receiving an opaque filter handle to track. A virtual function
+/// never sends it. The emulator keeps no filter table (its single vport receives
+/// all backend traffic) but must return a distinct, non-invalid handle for the
+/// privileged bring-up to proceed, and must reject a filter referencing an
+/// unknown vport handle. Verify both.
+#[async_test]
+async fn test_gdma_pf_create_filter(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_create_filter");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let make_req = |vport_handle: u64| ManaPfCreateFilterReq {
+        vport_handle,
+        mac_address: [1, 2, 3, 4, 5, 6],
+        allow_any_vlan_tag: 1,
+        match_inner_mac_tni: 0,
+        require_vlan_tag: 0,
+        is_exception_filter: 0,
+        vlan: 0,
+        tni: 0,
+        reserved2: 0,
+        reserved3: 0,
+    };
+
+    // The single vport's handle is its index (0); creating a filter on it must
+    // succeed and yield a non-invalid (not all-ones) handle.
+    let resp: ManaPfCreateFilterResp = gdma
+        .request(
+            ManaCommandCode::MANA_PF_CREATE_FILTER.0,
+            dev_id,
+            make_req(0),
+        )
+        .await
+        .expect("pf create filter must succeed");
+    assert_ne!(
+        resp.filter_handle,
+        u64::MAX,
+        "the filter handle must not be the invalid sentinel"
+    );
+
+    // A filter referencing a vport handle that does not resolve must be
+    // rejected with the invalid-vport-handle status.
+    let err = gdma
+        .request::<_, ()>(
+            ManaCommandCode::MANA_PF_CREATE_FILTER.0,
+            dev_id,
+            make_req(99),
+        )
+        .await
+        .expect_err("a filter against an unknown vport handle must be rejected");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed with {:#x}",
+            bnic_status::INVALID_VPORT_HANDLE
+        )),
+        "an unknown vport handle must report INVALID_VPORT_HANDLE ({:#x}); driver error was: {err:#}",
+        bnic_status::INVALID_VPORT_HANDLE,
     );
 }
 

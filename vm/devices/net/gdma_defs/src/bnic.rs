@@ -28,6 +28,13 @@ open_enum! {
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
         // Privileged commands (0x28xxx): issued only by a physical function that
         // manages the NIC on behalf of the host, never by a virtual function.
+        // Creates a receive filter (for example the vport's default MAC filter)
+        // on a vport, returning a filter handle.
+        MANA_PF_CREATE_FILTER = 0x28000,
+        // Creates a vport on behalf of an attached function, returning a vport
+        // handle the function then uses to configure the vport and create its
+        // work queues.
+        MANA_PF_CREATE_VPORT = 0x28003,
         // Reports the device's receive-filter and receive-object capacity.
         MANA_QUERY_FILTER_CAP = 0x28007,
     }
@@ -249,6 +256,65 @@ pub struct ManaQueryFilterStateResponse {
 pub struct ManaQueryFilterCapResponse {
     pub max_num_filters: u32,
     pub max_num_rx_objects: u32,
+}
+
+/// Request body for [`ManaCommandCode::MANA_PF_CREATE_VPORT`] (20 bytes,
+/// following the 40-byte GDMA request header). This is the latest request
+/// version the host physical-function driver sends, carrying the full vport
+/// creation spec. The emulator presents a single vport and addresses it by
+/// index, so only the request's presence is required to allocate the handle;
+/// the spec fields are accepted but the device's configured vport is
+/// authoritative.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaPfCreateVportReq {
+    pub attached_gf_id: u16,
+    pub is_pvf_default_vport: u8,
+    pub allow_vlan_tagging: u8,
+    pub allow_all_ethertypes: u8,
+    pub allow_src_mac_spoofing: u8,
+    pub mask_vlan_tag: u8,
+    pub strip_vlan_tag: u8,
+    pub msix_table_size_hint: u32,
+    pub mac_address_set: u8,
+    pub enable_tx_vport: u8,
+    pub mac_address: [u8; 6],
+}
+
+/// Response to [`ManaCommandCode::MANA_PF_CREATE_VPORT`]. An 8-byte body
+/// (following the 32-byte GDMA response header for a 40-byte total) returning
+/// the opaque vport handle the function uses in subsequent vport commands.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaPfCreateVportResp {
+    pub vport_handle: u64,
+}
+
+/// Request body for [`ManaCommandCode::MANA_PF_CREATE_FILTER`] (32 bytes,
+/// following the 40-byte GDMA request header). Creates a receive filter
+/// (typically the vport's default MAC filter) on a previously created vport.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaPfCreateFilterReq {
+    pub vport_handle: u64,
+    pub mac_address: [u8; 6],
+    pub allow_any_vlan_tag: u8,
+    pub match_inner_mac_tni: u8,
+    pub require_vlan_tag: u8,
+    pub is_exception_filter: u8,
+    pub vlan: u16,
+    pub tni: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
+}
+
+/// Response to [`ManaCommandCode::MANA_PF_CREATE_FILTER`]. An 8-byte body
+/// (following the 32-byte GDMA response header for a 40-byte total) returning
+/// the opaque filter handle the function tracks for later teardown.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaPfCreateFilterResp {
+    pub filter_handle: u64,
 }
 
 #[repr(C)]

@@ -279,8 +279,16 @@ impl HwControl {
             let r = match hdr.req.msg_type >> 16 {
                 0 => self.handle_req(&hdr, read, write),
                 _ => {
-                    // Device specific.
-                    if hdr.dev_id == BNIC_DEV_ID && self.bnic_enabled {
+                    // Device specific. A BNIC client becomes usable through one
+                    // of two registration paths. A virtual function registers
+                    // explicitly with `GDMA_REGISTER_DEVICE` (tracked by
+                    // `bnic_enabled`). A physical function is registered by
+                    // enumeration: the client appears in the device list and is
+                    // usable at once, never sending an explicit register. Accept
+                    // commands when either path has made the client live.
+                    if hdr.dev_id == BNIC_DEV_ID
+                        && (self.bnic_enabled || devices.bnic.registered_by_enumeration())
+                    {
                         devices
                             .bnic
                             .handle_req(&mut self.state, &hdr, read, write)

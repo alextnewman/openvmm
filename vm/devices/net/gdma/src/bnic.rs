@@ -290,6 +290,16 @@ impl BnicConfig {
             MANA_DEFAULT_LINK_SPEED_MBPS
         }
     }
+
+    /// Whether this client is usable as soon as it is enumerated in the device
+    /// list, without an explicit `GDMA_REGISTER_DEVICE` first. A physical
+    /// function presents its client by enumeration and starts issuing device
+    /// commands immediately. A virtual function instead registers its client
+    /// explicitly before issuing commands, so it is not registered by
+    /// enumeration.
+    fn registered_by_enumeration(&self) -> bool {
+        self.pf_caps
+    }
 }
 
 pub struct BasicNic {
@@ -560,6 +570,13 @@ impl BasicNic {
             config,
             next_wq_obj: 1,
         }
+    }
+
+    /// Whether this client may issue device commands without first sending an
+    /// explicit `GDMA_REGISTER_DEVICE`. See
+    /// [`BnicConfig::registered_by_enumeration`].
+    pub fn registered_by_enumeration(&self) -> bool {
+        self.config.registered_by_enumeration()
     }
 
     /// Tears down every vport's datapath, returning the NIC to its initial
@@ -1399,5 +1416,40 @@ impl AsyncRun<TxRxTask> for TxRxState {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BnicConfig;
+
+    /// A physical-function presentation (`pf_caps`) makes its client usable by
+    /// enumeration, so device commands are accepted without an explicit
+    /// `GDMA_REGISTER_DEVICE`. Every other presentation -- a plain virtual
+    /// function, or a bare-metal physical function whose guest still registers
+    /// explicitly -- is not registered by enumeration.
+    #[test]
+    fn pf_caps_client_registered_by_enumeration() {
+        assert!(
+            BnicConfig {
+                pf_caps: true,
+                ..Default::default()
+            }
+            .registered_by_enumeration()
+        );
+        assert!(
+            !BnicConfig {
+                pf_caps: false,
+                ..Default::default()
+            }
+            .registered_by_enumeration()
+        );
+        assert!(
+            !BnicConfig {
+                bm_hostmode: true,
+                ..Default::default()
+            }
+            .registered_by_enumeration()
+        );
     }
 }

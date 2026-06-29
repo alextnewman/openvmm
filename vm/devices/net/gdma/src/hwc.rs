@@ -253,11 +253,17 @@ impl HwControl {
                 .read_plain()
                 .context("reading request message header")?;
 
-            if hdr.req.msg_size as u64 > PAGE_SIZE64 {
-                anyhow::bail!(
-                    "request message size {} exceeds page size {PAGE_SIZE64}",
-                    hdr.req.msg_size
-                );
+            // The authoritative request length is the work request's posted data
+            // length (its out-of-band length), not the header's self-reported
+            // `msg_size`. A physical function sets `msg_size` to the request's
+            // fixed base size and conveys the true length -- including a
+            // variable-length trailer such as a DMA region page array -- via the
+            // work-request length; bounding the read by `msg_size` would truncate
+            // that trailer. A virtual function posts the work request at exactly
+            // `msg_size` bytes, so the two are equivalent for it.
+            let req_len = MemoryRead::len(&read);
+            if req_len as u64 > PAGE_SIZE64 {
+                anyhow::bail!("request message length {req_len} exceeds page size {PAGE_SIZE64}");
             }
             if hdr.resp.msg_size as u64 > PAGE_SIZE64 {
                 anyhow::bail!(
@@ -266,7 +272,7 @@ impl HwControl {
                 );
             }
 
-            let mut read = MemoryRead::limit(read, hdr.req.msg_size as usize);
+            let mut read = MemoryRead::limit(read, req_len);
             read.skip(size_of_val(&hdr))
                 .context("message size too small")?;
 

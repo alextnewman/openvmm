@@ -16,6 +16,7 @@ use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use chipset_device::pci::PciConfigSpace;
 use chipset_device::poll_device::PollDevice;
 use gdma::VportConfig;
+use gdma_defs::GDMA_MESSAGE_V1;
 use gdma_defs::GDMA_PAGE_TYPE_4K;
 use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaCreateDmaRegionReq;
@@ -1391,6 +1392,119 @@ async fn test_gdma_dma_region_add_pages(driver: DefaultDriver) {
     // The assembled region must now be usable. Binding it to an EQ exercises the
     // device's region lookup, which validates that the page list is complete and
     // that its length matches the queue size (two pages here).
+    let mut arena = ResourceArena::new();
+    arena.push(crate::resources::Resource::DmaRegion {
+        dev_id,
+        gdma_region,
+    });
+    gdma.create_eq(
+        &mut arena,
+        dev_id,
+        gdma_region,
+        (2 * PAGE_SIZE) as u32,
+        device_props.pdid,
+        device_props.db_id,
+        0,
+    )
+    .await
+    .unwrap();
+
+    arena.destroy(&mut gdma).await;
+}
+
+/// A physical function frames `GDMA_CREATE_DMA_REGION` by setting the request
+/// header's `msg_size` to the request's fixed base size (header plus fixed
+/// fields, no page-array trailer) while the work request still carries the full
+/// page array, conveying the true length through the work-request length. The
+/// device must read the page list using the work-request length, not the
+/// header's `msg_size`: bounding the read by `msg_size` truncates the page array
+/// and the create fails ("out of range") even though every page is present. A
+/// virtual function always sizes the work request to exactly `msg_size`, so the
+/// undersized-header path is reachable only from a physical function -- this test
+/// reproduces it with `request_version_advertising`.
+#[async_test]
+async fn test_gdma_create_dma_region_underreported_size(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_create_dma_region_underreported_size");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    // A two-page region whose entire page list rides in the CREATE message, so
+    // the region finalizes immediately (page_addr_list_len == page_count).
+    let region_buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(2 * PAGE_SIZE)
+            .unwrap(),
+    );
+    let pfns = region_buffer.pfns();
+    assert_eq!(pfns.len(), 2);
+
+    #[repr(C)]
+    #[derive(IntoBytes, Immutable, KnownLayout)]
+    struct CreateReq {
+        req: GdmaCreateDmaRegionReq,
+        pages: [u64; 2],
+    }
+    let create = CreateReq {
+        req: GdmaCreateDmaRegionReq {
+            length: (2 * PAGE_SIZE) as u64,
+            offset_in_page: 0,
+            gdma_page_type: GDMA_PAGE_TYPE_4K,
+            page_count: 2,
+            page_addr_list_len: 2,
+        },
+        pages: [pfns[0] * PAGE_SIZE64, pfns[1] * PAGE_SIZE64],
+    };
+
+    // Advertise only the fixed base size (header + `GdmaCreateDmaRegionReq`, no
+    // page array) even though the work request carries the full page list --
+    // exactly how a physical function frames this command.
+    let advertised_base_size =
+        (size_of::<GdmaReqHdr>() + size_of::<GdmaCreateDmaRegionReq>()) as u32;
+    let (resp, _): (GdmaCreateDmaRegionResp, u32) = gdma
+        .request_version_advertising(
+            GdmaRequestType::GDMA_CREATE_DMA_REGION.0,
+            GDMA_MESSAGE_V1,
+            GdmaRequestType::GDMA_CREATE_DMA_REGION.0,
+            GDMA_MESSAGE_V1,
+            dev_id,
+            create,
+            advertised_base_size,
+        )
+        .await
+        .unwrap();
+    let gdma_region = resp.gdma_region;
+
+    // The region must be fully assembled despite the undersized header. Binding
+    // it to a two-page EQ exercises the device's region lookup, which rejects an
+    // incomplete page list or a length that does not match the queue size.
     let mut arena = ResourceArena::new();
     arena.push(crate::resources::Resource::DmaRegion {
         dev_id,

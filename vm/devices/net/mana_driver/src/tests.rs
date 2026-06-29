@@ -295,13 +295,20 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
     assert_eq!(dev_config.bm_hostmode, 1);
 }
 
-/// With `pf_caps` set, the device presents the PF PCI id and a discovery chain:
-/// the register map carries a cap pointer that directs a PF driver to a
-/// read-only capability block advertising the device's resource limits. The
-/// block's queue maxima must match the `GDMA_QUERY_MAX_RESOURCES` response
-/// (single source of truth). The SMC shared-memory window is relocated above
-/// the discovery block, advertised through the register map, so the in-tree
-/// driver still brings up the HW channel by following the pointer.
+/// With `pf_caps` set, the device presents the PF PCI id, an SR-IOV extended
+/// capability, and a true-PF BAR0 register surface: a region-descriptor table at
+/// the base of BAR0 that locates the capability, doorbell, and SR-IOV regions. A
+/// true-PF client validates that every advertised region resolves inside BAR0
+/// (`base_offset + size <= bar_len`) and follows the SR-IOV zone's shared-memory
+/// descriptor to the SMC window. This walks that structure: it asserts the
+/// version, that each populated region is in-bounds, that the SMC window is
+/// reachable and correctly sized, that the capability zone reports the queue
+/// maxima and fixed limits, and that unimplemented regions advertise size 0.
+///
+/// Unlike the VF tests, this does NOT bring up the HW channel through the
+/// in-tree (VF) `GdmaDriver`: the descriptor table shadows the VF register map,
+/// so the true-PF surface is validated structurally. HW-channel bring-up
+/// coverage lives in the VF (`test_gdma`) and `bm_hostmode` tests.
 #[async_test]
 async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
     let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_registers");
@@ -329,10 +336,8 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
         (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
     );
 
-    // (1b) pf_caps exposes an SR-IOV extended capability at the start of
-    // extended config space, which a PF client requires before it will start.
-    // It advertises zero virtual functions, so no VF infrastructure is
-    // requested.
+    // (1b) pf_caps exposes an SR-IOV extended capability advertising zero virtual
+    // functions, which a PF client requires before it will start.
     let mut sriov_header = 0;
     device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
     assert_eq!(sriov_header & 0xffff, 0x0010); // SR-IOV extended capability id
@@ -343,23 +348,45 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
 
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
-
     let mut regs = device.clone();
     let bar0 = regs.map_bar(0).unwrap();
 
-    // (2) The register map advertises the doorbell zone, the relocated
-    // shared-memory window, and a cap pointer (offset + size) to the block.
-    assert_eq!(bar0.read_u64(0x08), 4096); // doorbell zone offset
-    let shmem_base = bar0.read_u64(0x18); // relocated shared-memory base
-    assert_eq!(shmem_base, 0x40);
-    assert_eq!(bar0.read_u32(0x20) & 0xffff, 32); // shared-memory size
-    let cap_off = bar0.read_u64(0x28); // cap block offset
-    let cap_size = bar0.read_u32(0x30) & 0xffff; // cap block size
-    assert_eq!(cap_off, 0x110);
-    assert_eq!(cap_size, 0x68);
+    const BAR0_LEN: u64 = 8192;
+    // A region descriptor is a { u64 base_offset, u32 size } pair; the client
+    // requires base_offset + size <= bar_len for every advertised region.
+    let in_bounds = |off: u64, size: u64| off + size <= BAR0_LEN;
+    let region = |off_at: usize, sz_at: usize| {
+        let off = bar0.read_u64(off_at);
+        let size = bar0.read_u32(sz_at) as u64;
+        (off, size)
+    };
 
-    // (3) Follow the cap pointer to the block and read its fields. Field offsets
-    // are relative to the discovered block base.
+    // (2) Version: the major version (high byte) must be a supported value.
+    let version = bar0.read_u32(0x00);
+    assert_eq!((version >> 24) & 0xff, 2); // major version (emulated generation)
+
+    // (3) The capability, doorbell, and SR-IOV regions resolve inside BAR0.
+    let (cap_off, cap_size) = region(0x48, 0x50);
+    assert!(in_bounds(cap_off, cap_size));
+    assert_eq!(cap_size, 0x68); // capability zone size
+    let (db_off, db_size) = region(0xC8, 0xD0);
+    assert!(in_bounds(db_off, db_size));
+    assert_eq!(db_off, 4096); // doorbell zone offset
+    assert_eq!(db_size, 4096); // doorbell zone size
+    let (sriov_off, sriov_size) = region(0x108, 0x110);
+    assert!(in_bounds(sriov_off, sriov_size));
+
+    // (4) The SMC window is reachable: the SR-IOV zone's shared-memory descriptor
+    // (relative to the zone base) resolves in-bounds and is sized for the header.
+    let shmem_rel = bar0.read_u64((sriov_off + 0x70) as usize);
+    let shmem_size = bar0.read_u32((sriov_off + 0x78) as usize) as u64;
+    let shmem_abs = sriov_off + shmem_rel;
+    assert!(in_bounds(shmem_abs, shmem_size));
+    assert_eq!(shmem_size, 32); // shared-memory window size
+
+    // (5) The capability zone reports the device's queue maxima (sourced from the
+    // live queue allocation) and fixed limits. Field offsets are relative to the
+    // discovered capability-zone base.
     let cap = |field: u64| bar0.read_u32((cap_off + field) as usize);
     assert_eq!(cap(0x00), 0); // hw_capabilities
     assert_eq!(cap(0x04), 0); // feature_flags
@@ -376,22 +403,10 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
     assert_eq!(cap(0x58), 64); // max_msix_entries
     assert_eq!(cap(0x60), 64); // pf_max_msix_entries
 
-    // (4) The HW channel still comes up by following the register map to the
-    // relocated shared-memory window; the block's queue maxima must agree with
-    // GDMA_QUERY_MAX_RESOURCES.
-    let dma_client = device.dma_client();
-    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
-    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
-        .await
-        .unwrap();
-    gdma.test_eq().await.unwrap();
-    gdma.verify_vf_driver_version().await.unwrap();
-    let max = gdma.query_max_resources().await.unwrap();
-    assert_eq!(cap(0x08), max.max_sq);
-    assert_eq!(cap(0x10), max.max_rq);
-    assert_eq!(cap(0x18), max.max_cq);
-    assert_eq!(cap(0x20), max.max_eq);
-    assert_eq!(cap(0x58), max.max_msix);
+    // (6) Unimplemented regions advertise size 0 ("absent").
+    assert_eq!(bar0.read_u32(0x70), 0); // send wq context size
+    assert_eq!(bar0.read_u32(0xA0), 0); // event queue context size
+    assert_eq!(bar0.read_u32(0x100), 0); // address-translation context size
 }
 
 /// A vport must support more than one receive work-queue object so the guest

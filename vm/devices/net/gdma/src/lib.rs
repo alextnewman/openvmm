@@ -706,6 +706,17 @@ impl GdmaDevice {
                 );
                 Ok(true)
             }
+            SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY => {
+                // A stateless readiness query the host-management client issues
+                // before establishing the HW channel: "is the device out of
+                // reset and ready to serve?". The device is always ready, so it
+                // acknowledges with success. `complete_smc` echoes the message
+                // type/version, marks the header a response, and hands shared-
+                // memory possession back to the guest. No payload, no state
+                // change -- so it succeeds regardless of HW-channel state.
+                tracing::trace!("host_mgmt_ready");
+                Ok(true)
+            }
             req => Err(SmcError::UnsupportedRequest(req)),
         }
     }

@@ -26,6 +26,10 @@ open_enum! {
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
+        // Privileged commands (0x28xxx): issued only by a physical function that
+        // manages the NIC on behalf of the host, never by a virtual function.
+        // Reports the device's receive-filter and receive-object capacity.
+        MANA_QUERY_FILTER_CAP = 0x28007,
     }
 }
 
@@ -234,6 +238,17 @@ pub struct ManaQueryFilterStateReq {
 pub struct ManaQueryFilterStateResponse {
     pub direction_to_vtl0: u8,
     pub reserved: [u8; 7],
+}
+
+/// Response to [`ManaCommandCode::MANA_QUERY_FILTER_CAP`]. An 8-byte body that
+/// follows the 32-byte GDMA response header for a 40-byte total (the request is
+/// header-only). Reports the device's receive-filter and receive-object
+/// capacity to a privileged physical-function client.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryFilterCapResponse {
+    pub max_num_filters: u32,
+    pub max_num_rx_objects: u32,
 }
 
 #[repr(C)]

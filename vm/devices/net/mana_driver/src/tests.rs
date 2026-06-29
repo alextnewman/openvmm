@@ -38,6 +38,7 @@ use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::ManaCreateWqobjReq;
 use gdma_defs::bnic::ManaFenceRqReq;
+use gdma_defs::bnic::ManaQueryFilterCapResponse;
 use gdma_defs::bnic::ManaQueryLinkConfigReq;
 use gdma_defs::bnic::ManaQueryLinkConfigResp;
 use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
@@ -2288,6 +2289,62 @@ async fn test_gdma_unsupported_command_status(driver: DefaultDriver) {
             .contains(&format!("failed with {GDMA_STATUS_CMD_UNSUPPORTED:#x}")),
         "an unimplemented command must report GDMA_STATUS_CMD_UNSUPPORTED ({GDMA_STATUS_CMD_UNSUPPORTED:#x}); \
          driver error was: {err:#}",
+    );
+}
+
+/// `MANA_QUERY_FILTER_CAP` (0x28007) is a privileged command that a
+/// physical-function client managing the NIC issues to learn the device's
+/// receive-filter and receive-object capacity; a virtual function never sends
+/// it. The host miniport requires a successful response to finish bringing up
+/// the NIC. Before this it fell through the catch-all and was rejected as
+/// `GDMA_STATUS_CMD_UNSUPPORTED`, leaving the device unconfigured. Verify the
+/// device reports the basic-NIC limits (one MAC filter, 64 receive objects). The
+/// request carries no body beyond the header, so an empty request is sent.
+#[async_test]
+async fn test_gdma_query_filter_cap(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_filter_cap");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let resp: ManaQueryFilterCapResponse = gdma
+        .request(ManaCommandCode::MANA_QUERY_FILTER_CAP.0, dev_id, ())
+        .await
+        .expect("query filter cap must succeed");
+
+    assert_eq!(
+        resp.max_num_filters, 1,
+        "device must report one MAC filter for a basic NIC"
+    );
+    assert_eq!(
+        resp.max_num_rx_objects, 64,
+        "device must report 64 receive objects for a basic NIC"
     );
 }
 

@@ -41,6 +41,8 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend_resources::mac_address::MacAddress;
+use pci_core::capabilities::extended::PciExtendedCapability;
+use pci_core::capabilities::extended::sriov::SriovExtendedCapability;
 use pci_core::capabilities::msix::MsixEmulator;
 use pci_core::capabilities::pci_express::FlrHandler;
 use pci_core::capabilities::pci_express::PciExpressCapability;
@@ -394,13 +396,23 @@ impl GdmaDevice {
             Box::new(pci_express_capability) as _,
         ];
 
+        // A physical-function client (pf_caps) requires an SR-IOV extended
+        // capability to be present in config space before it will start. Expose
+        // one advertising zero virtual functions so the client starts without
+        // requesting any virtual-function infrastructure.
+        let extended_capabilities: Vec<Box<dyn PciExtendedCapability>> = if pf_caps {
+            vec![Box::new(SriovExtendedCapability::new()) as _]
+        } else {
+            Vec::new()
+        };
+
         let bar0_mem = mmio_registration.new_io_region("regs", 8192);
         let bar2_mem = mmio_registration.new_io_region("msix", msix.bar_len());
 
         let config = ConfigSpaceType0Emulator::new(
             hardware_ids,
             capabilities,
-            Vec::new(),
+            extended_capabilities,
             DeviceBars::new()
                 .bar0(8192, BarMemoryKind::Intercept(bar0_mem))
                 .bar4(msix.bar_len(), BarMemoryKind::Intercept(bar2_mem)),

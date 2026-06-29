@@ -1241,25 +1241,29 @@ pub mod caps {
             /// | Offset    | Bits 31-16              | Bits 15-0               |
             /// |-----------|-------------------------|-------------------------|
             /// | Ext + 0x0 | Next Cap Ptr + Version  | Extended Capability ID  |
-            /// | Ext + 0x4 | SR-IOV Control          | SR-IOV Capabilities     |
-            /// | Ext + 0x8 | Total VFs               | Initial VFs             |
-            /// | Ext + 0xC | Num VFs                 | Function Dep Link       |
-            /// | Ext + 0x10| First VF Offset         | VF Stride               |
-            /// | Ext + 0x14| VF Device ID            | Reserved                |
-            /// | Ext + 0x18| Supported Page Sizes                              |
-            /// | Ext + 0x1C| System Page Size                                  |
-            /// | Ext + 0x20| VF BAR0                                           |
-            /// | Ext + 0x24| VF BAR1                                           |
-            /// | Ext + 0x28| VF BAR2                                           |
-            /// | Ext + 0x2C| VF BAR3                                           |
-            /// | Ext + 0x30| VF BAR4                                           |
-            /// | Ext + 0x34| VF BAR5                                           |
-            /// | Ext + 0x38| VF Migration State Array Offset                   |
+            /// | Ext + 0x4 | SR-IOV Capabilities (32 bits)                     |
+            /// | Ext + 0x8 | SR-IOV Status           | SR-IOV Control          |
+            /// | Ext + 0xC | Total VFs               | Initial VFs             |
+            /// | Ext + 0x10| Function Dep Link       | Num VFs                 |
+            /// | Ext + 0x14| VF Stride               | First VF Offset         |
+            /// | Ext + 0x18| VF Device ID            | Reserved                |
+            /// | Ext + 0x1C| Supported Page Sizes (32 bits)                    |
+            /// | Ext + 0x20| System Page Size (32 bits)                        |
+            /// | Ext + 0x24| VF BAR0 (32 bits)                                 |
+            /// | Ext + 0x28| VF BAR1 (32 bits)                                 |
+            /// | Ext + 0x2C| VF BAR2 (32 bits)                                 |
+            /// | Ext + 0x30| VF BAR3 (32 bits)                                 |
+            /// | Ext + 0x34| VF BAR4 (32 bits)                                 |
+            /// | Ext + 0x38| VF BAR5 (32 bits)                                 |
+            /// | Ext + 0x3C| VF Migration State Array Offset (32 bits)         |
             pub enum SriovExtendedCapabilityHeader: u16 {
                 HEADER = 0x00,
-                CAPS_CONTROL = 0x04,
+                SRIOV_CAPS = 0x04,
+                CONTROL_STATUS = 0x08,
                 INITIAL_TOTAL_VFS = 0x0C,
                 VF_OFFSET_STRIDE = 0x14,
+                SUPPORTED_PAGE_SIZES = 0x1C,
+                SYSTEM_PAGE_SIZE = 0x20,
                 VF_BAR0 = 0x24,
             }
         }

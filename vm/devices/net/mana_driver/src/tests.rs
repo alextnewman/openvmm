@@ -252,6 +252,12 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
         (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
     );
 
+    // bm_hostmode does not expose a PCI SR-IOV extended capability (that is
+    // specific to the pf_caps client); extended config space reads back empty.
+    let mut sriov_header = 0;
+    device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
+    assert_eq!(sriov_header, 0);
+
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
 
@@ -322,6 +328,18 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
         vendor_device,
         (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
     );
+
+    // (1b) pf_caps exposes an SR-IOV extended capability at the start of
+    // extended config space, which a PF client requires before it will start.
+    // It advertises zero virtual functions, so no VF infrastructure is
+    // requested.
+    let mut sriov_header = 0;
+    device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
+    assert_eq!(sriov_header & 0xffff, 0x0010); // SR-IOV extended capability id
+    assert_eq!((sriov_header >> 16) & 0xf, 1); // capability version
+    let mut sriov_vfs = 0;
+    device.pci_cfg_read(0x10c, &mut sriov_vfs).unwrap();
+    assert_eq!(sriov_vfs, 0); // initial + total VFs both zero
 
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);

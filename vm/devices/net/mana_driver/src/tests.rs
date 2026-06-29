@@ -409,6 +409,73 @@ async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
     assert_eq!(bar0.read_u32(0x100), 0); // address-translation context size
 }
 
+/// Before it establishes the HW channel, the host-management client polls the
+/// device for readiness over the shared-memory channel: it writes a single
+/// header word -- message type "host management ready", request direction --
+/// to the last word of the SMC aperture, takes possession, and waits for the
+/// device to answer. The device must acknowledge: echo the message type, mark
+/// the word a successful response, and hand possession back. A device that
+/// rejects this query as an unknown request strands the client before bring-up
+/// (the symptom that motivated handling it). This drives that handshake end to
+/// end over the relocated (`pf_caps`) shared-memory window.
+#[async_test]
+async fn test_gdma_pf_caps_host_mgmt_ready(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_host_mgmt_ready");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            pf_caps: true,
+            ..Default::default()
+        },
+    );
+
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let mut regs = device.clone();
+    let bar0 = regs.map_bar(0).unwrap();
+
+    // Discover the shared-memory window through the descriptor table: the
+    // SR-IOV region descriptor, then its shared-memory sub-descriptor.
+    let sriov_off = bar0.read_u64(0x108);
+    let shmem_rel = bar0.read_u64((sriov_off + 0x70) as usize);
+    let shmem_size = bar0.read_u32((sriov_off + 0x78) as usize) as u64;
+    let shmem_abs = (sriov_off + shmem_rel) as usize;
+    // The protocol header occupies the last word of the SMC aperture.
+    let header_off = shmem_abs + shmem_size as usize - 4;
+
+    // Issue the readiness query. Writing the header word is what hands the
+    // device possession and triggers it to service the request.
+    let request = SmcProtoHdr::new()
+        .with_msg_type(SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY.0)
+        .with_msg_version(gdma_defs::SMC_MSG_TYPE_HOST_MGMT_READY_VERSION);
+    assert!(!request.is_response()); // sanity: a request, not a response
+    bar0.write_u32(header_off, u32::from(request));
+
+    // The device must answer in place: same message type, marked a response,
+    // success status, with a version no newer than requested and possession
+    // handed back to the guest.
+    let response = SmcProtoHdr::from(bar0.read_u32(header_off));
+    assert_eq!(
+        response.msg_type(),
+        SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY.0
+    );
+    assert!(response.is_response());
+    assert_eq!(
+        response.msg_version(),
+        gdma_defs::SMC_MSG_TYPE_HOST_MGMT_READY_VERSION
+    );
+    assert_eq!(response.status(), 0); // success
+    assert!(!response.owner_is_pf()); // possession returned to the guest
+}
+
 /// A vport must support more than one receive work-queue object so the guest
 /// can build an RSS indirection table that steers traffic across multiple
 /// queues. Each object must be addressed by a distinct `wq_obj` handle so it

@@ -920,6 +920,22 @@ impl BasicNic {
 
                 write.write(resp.as_bytes())?;
             }
+            ManaCommandCode::MANA_QUERY_FILTER_CAP => {
+                // Privileged query issued only by a physical-function client that
+                // manages the NIC on behalf of the host (a virtual function never
+                // sends it). The client uses the reported capacity to size its
+                // receive-filter and receive-object pools. Report the same modest
+                // limits the host miniport assumes for a basic NIC when it cannot
+                // query them (one MAC filter, 64 receive objects). One filter is
+                // consistent with the emulator presenting zero SR-IOV virtual
+                // functions and basic networking only.
+                let resp = gdma_defs::bnic::ManaQueryFilterCapResponse {
+                    max_num_filters: 1,
+                    max_num_rx_objects: 64,
+                };
+
+                write.write(resp.as_bytes())?;
+            }
             ManaCommandCode::MANA_QUERY_VPORT_CONFIG => {
                 let req: ManaQueryVportCfgReq = read
                     .read_plain()

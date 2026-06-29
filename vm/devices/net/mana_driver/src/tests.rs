@@ -108,6 +108,13 @@ async fn test_gdma(driver: DefaultDriver) {
         .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
         .unwrap();
 
+    // The MANA device must be reported at instance 0. Some drivers read this
+    // 16-bit field as a secondary client-instance index and drop any network
+    // client with a non-zero value, so a regression here would silently prevent
+    // the network child device from being enumerated -- even though drivers that
+    // treat it as an opaque device-id instance are indifferent to the value.
+    assert_eq!(dev_id.instance, 0);
+
     let device_props = gdma.register_device(dev_id).await.unwrap();
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     let _dev_config = bnic.query_dev_config().await.unwrap();

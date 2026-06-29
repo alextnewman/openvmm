@@ -29,6 +29,10 @@ use crate::bnic::bnic_defs::ManaConfigVportReq;
 use crate::bnic::bnic_defs::ManaConfigVportResp;
 use crate::bnic::bnic_defs::ManaCreateWqobjReq;
 use crate::bnic::bnic_defs::ManaCreateWqobjResp;
+use crate::bnic::bnic_defs::ManaPfCreateFilterReq;
+use crate::bnic::bnic_defs::ManaPfCreateFilterResp;
+use crate::bnic::bnic_defs::ManaPfCreateVportReq;
+use crate::bnic::bnic_defs::ManaPfCreateVportResp;
 use crate::bnic::bnic_defs::ManaQueryDeviceCfgReq;
 use crate::bnic::bnic_defs::ManaQueryDeviceCfgResp;
 use crate::bnic::bnic_defs::ManaQueryVportCfgResp;
@@ -310,6 +314,12 @@ pub struct BasicNic {
     /// handle so the guest can reference individual RX queues (e.g. in the RSS
     /// indirection table) and destroy them independently.
     next_wq_obj: u64,
+    /// Monotonic allocator for filter handles returned by
+    /// `MANA_PF_CREATE_FILTER`. The emulator keeps no filter table (its single
+    /// vport receives all traffic the backend delivers), but a privileged
+    /// physical-function client still expects a distinct, non-invalid handle to
+    /// track for later teardown.
+    next_filter_handle: u64,
 }
 
 impl InspectMut for BasicNic {
@@ -569,6 +579,7 @@ impl BasicNic {
             vports,
             config,
             next_wq_obj: 1,
+            next_filter_handle: 1,
         }
     }
 
@@ -917,6 +928,53 @@ impl BasicNic {
                     direction_to_vtl0: 0,
                     reserved: [0; 7],
                 };
+
+                write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_PF_CREATE_VPORT => {
+                let _req: ManaPfCreateVportReq = read
+                    .read_plain()
+                    .context("reading pf create vport request")?;
+
+                // Privileged command issued only by a physical-function client
+                // that manages the NIC on behalf of the host. The client creates
+                // a vport to obtain an operational handle, which it then passes
+                // back as the `vport` field of the shared vport commands
+                // (`MANA_CONFIG_VPORT_TX`, `MANA_CREATE_WQ_OBJ`,
+                // `MANA_CONFIG_VPORT_RX`). The emulator addresses vports by index
+                // and uses that index as the handle throughout (see
+                // `MANA_QUERY_VPORT_CONFIG`), so the vport handle is simply the
+                // index of the device's single vport. The creation-spec fields
+                // (MAC, VLAN policy) are accepted but the device's configured
+                // vport stays authoritative -- the client passes back the same
+                // MAC it read from `MANA_QUERY_VPORT_CONFIG`.
+                let resp = ManaPfCreateVportResp { vport_handle: 0 };
+
+                write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_PF_CREATE_FILTER => {
+                let req: ManaPfCreateFilterReq = read
+                    .read_plain()
+                    .context("reading pf create filter request")?;
+
+                // The handle must resolve to an existing vport (the emulator's
+                // handle is the vport index), mirroring the device rejecting an
+                // unknown vport handle.
+                let _vport = self
+                    .vports
+                    .get(req.vport_handle as usize)
+                    .context("invalid vport")
+                    .bnic_status(bnic_status::INVALID_VPORT_HANDLE)?;
+
+                // The emulator keeps no MAC-filter table -- its single vport
+                // receives all traffic the backend delivers -- so the filter is
+                // accepted and a distinct, non-invalid handle is returned for
+                // the privileged client to track. The handle is opaque to the
+                // client until teardown, which the host-NIC bring-up path does
+                // not reach.
+                let filter_handle = self.next_filter_handle;
+                self.next_filter_handle += 1;
+                let resp = ManaPfCreateFilterResp { filter_handle };
 
                 write.write(resp.as_bytes())?;
             }

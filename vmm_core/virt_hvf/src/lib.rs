@@ -1209,8 +1209,14 @@ impl HvfProcessor<'_> {
                 if let Some(vp) = self.partition.vps.iter().find(|vp| {
                     u64::from(vp.vp_info.mpidr) & u64::from(MpidrEl1::AFFINITY_MASK) == target_cpu
                 }) {
+                    let target_vp_index = vp.vp_info.base.vp_index.index();
                     let mut cpu_on = vp.cpu_on.lock();
                     if cpu_on.is_some() {
+                        tracing::info!(
+                            target_cpu,
+                            target_vp_index,
+                            "PSCI CPU_ON: request already pending (ON_PENDING)"
+                        );
                         PsciError::ON_PENDING.0
                     } else {
                         // TODO check already on
@@ -1220,14 +1226,37 @@ impl HvfProcessor<'_> {
                         });
                         drop(cpu_on);
                         vp.wake();
+                        tracing::info!(
+                            target_cpu,
+                            target_vp_index,
+                            entry_point = format!("{entry_point:#x}"),
+                            context_id,
+                            "PSCI CPU_ON: starting secondary VP (SUCCESS)"
+                        );
                         PsciError::SUCCESS.0
                     }
                 } else {
+                    tracing::warn!(
+                        target_cpu,
+                        "PSCI CPU_ON: no VP matches target affinity (INVALID_PARAMETERS)"
+                    );
                     PsciError::INVALID_PARAMETERS.0
                 }
             }
-            SmcCall::CPU_OFF => PsciError::DENIED.0,
-            SmcCall::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
+            SmcCall::CPU_OFF => {
+                tracing::info!("PSCI CPU_OFF (returning DENIED)");
+                PsciError::DENIED.0
+            }
+            SmcCall::AFFINITY_INFO => {
+                let target_affinity = self.vcpu.gp(1) & mask;
+                let lowest_affinity_level = self.vcpu.gp(2) & mask;
+                tracelimit::warn_ratelimited!(
+                    target_affinity,
+                    lowest_affinity_level,
+                    "PSCI AFFINITY_INFO (returning INVALID_PARAMETERS - unimplemented)"
+                );
+                PsciError::INVALID_PARAMETERS.0
+            }
             SmcCall::SYSTEM_RESET => {
                 return Err(VpHaltReason::Reset);
             }
@@ -1323,6 +1352,11 @@ impl<'p> Processor for HvfProcessor<'p> {
                             self.vcpu.set_gp(0, cpu_on.x0);
                             self.vcpu.set_pc(cpu_on.pc);
                             self.on = true;
+                            tracing::info!(
+                                vp_index = vp_index.index(),
+                                pc = format!("{:#x}", cpu_on.pc),
+                                "secondary VP came online (consumed CPU_ON)"
+                            );
                         }
                     }
 

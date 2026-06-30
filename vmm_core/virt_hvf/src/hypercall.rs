@@ -12,15 +12,14 @@ use hv1_hypercall::SetVpRegisters;
 use hv1_hypercall::SignalEvent;
 use hvdef::HvArm64RegisterName;
 use hvdef::HvError;
-use hvdef::HvFeatures;
 use hvdef::HvPartitionPrivilege;
 use hvdef::Vtl;
 use hvdef::hypercall::HvRegisterAssoc;
 use std::sync::atomic::Ordering;
 
 /// The partition privileges this backend actually provides, advertised through
-/// `PrivilegesAndFeaturesInfo` (the AArch64 analogue of the x64 `HV_FEATURES`
-/// CPUID leaf).
+/// the low 64 bits of `PrivilegesAndFeaturesInfo` (the AArch64 analogue of the
+/// x64 `HV_FEATURES` CPUID leaf 0x40000003).
 ///
 /// This is deliberately a strict *subset* of `hv1_emulator`'s
 /// `SUPPORTED_PRIVILEGES`: we advertise only what `virt_hvf` genuinely backs, so
@@ -31,19 +30,56 @@ use std::sync::atomic::Ordering;
 /// counter, vp index); we are not the Hyper-V hypervisor, so VSM, debugging,
 /// partition management, and hardware-assist privileges all remain false.
 ///
-/// `guest_crash_regs_available` is **true**: we back the guest-crash
-/// enlightenment (`GuestCrashP0..P4`/`GuestCrashCtl`) in `set_vp_registers`, so
-/// the guest may report its bugcheck code + parameters through those registers.
-const PROVIDED_FEATURES: HvFeatures = HvFeatures::new()
-    .with_privileges(
-        HvPartitionPrivilege::new()
-            .with_access_partition_reference_counter(true)
-            .with_access_hypercall_msrs(true)
-            .with_access_vp_index(true)
-            .with_access_synic_msrs(true)
-            .with_access_synthetic_timer_msrs(true),
-    )
-    .with_guest_crash_regs_available(true);
+/// The privilege mask (`_HV_PARTITION_PRIVILEGE_MASK`) is architecture-neutral —
+/// the same 64-bit union on x64 and ARM64 — so reusing `HvPartitionPrivilege`
+/// here is correct. The *feature* dword that follows it is NOT (see
+/// `arm64_privileges_and_features` below).
+const PROVIDED_PRIVILEGES: HvPartitionPrivilege = HvPartitionPrivilege::new()
+    .with_access_partition_reference_counter(true)
+    .with_access_hypercall_msrs(true)
+    .with_access_vp_index(true)
+    .with_access_synic_msrs(true)
+    .with_access_synthetic_timer_msrs(true);
+
+/// Builds the 128-bit `PrivilegesAndFeaturesInfo` value using the **ARM64**
+/// feature-dword packing from the private `_HV_ARM64_HYPERVISOR_FEATURES`
+/// header struct.
+///
+/// This is the subtle part. `hvdef::HvFeatures` models the *x64* CPUID
+/// 0x40000003 layout, where a 32-bit "power management" dword (`MaxSupportedC
+/// State`, …) sits between the 64-bit privilege mask and the 32-bit
+/// available-features dword. On ARM64 that power dword does **not exist** — the
+/// features dword begins immediately at bit 64:
+///
+/// ```text
+///   bit 64  GuestDebuggingAvailable
+///   bit 65  PerformanceMonitorsAvailable
+///   bit 66  CpuDynamicPartitioningAvailable
+///   bit 67  GuestIdleAvailable
+///   bit 68  HypervisorSleepStateSupportAvailable
+///   bit 69  NumaDistanceQueryAvailable
+///   bit 70  FrequencyRegsAvailable
+///   bit 71  SyntheticMachineCheckAvailable
+///   bit 72  GuestCrashRegsAvailable   <- the bit we need
+/// ```
+///
+/// So `GuestCrashRegsAvailable` lives at absolute **bit 72** on ARM64, whereas
+/// `HvFeatures::with_guest_crash_regs_available` (x64 layout) sets **bit 106**.
+/// Emitting the x64 value leaves an ARM64 Windows guest reading bit 72 as 0,
+/// which silently disables the guest-crash enlightenment: the kernel paints the
+/// BSOD but never writes `GuestCrashP0..P4`/`GuestCrashCtl`, so the bugcheck
+/// code and parameters never reach the host log. Building the ARM64 layout makes
+/// the crash enlightenment actually fire.
+///
+/// We advertise `GuestCrashRegsAvailable` and nothing else in this dword — it is
+/// the only feature in the band that `virt_hvf` truly backs (in
+/// `set_vp_registers`).
+fn arm64_privileges_and_features() -> u128 {
+    /// `GuestCrashRegsAvailable` is bit 8 of the ARM64 feature dword, which
+    /// itself starts at bit 64 of the 128-bit register.
+    const ARM64_GUEST_CRASH_REGS_AVAILABLE_BIT: u32 = 64 + 8;
+    (PROVIDED_PRIVILEGES.into_bits() as u128) | (1u128 << ARM64_GUEST_CRASH_REGS_AVAILABLE_BIT)
+}
 
 pub(crate) struct HvfHypercallHandler<'a, 'b> {
     vp: &'a mut HvfProcessor<'b>,
@@ -124,10 +160,14 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
 
                 HvArm64RegisterName::HypervisorVersion => 0u128.into(),
                 // The partition privilege/feature self-description. Advertise the
-                // exact subset we back (see PROVIDED_FEATURES) so the guest's view
-                // of our enlightenments matches what it actually observes.
+                // exact subset we back so the guest's view of our enlightenments
+                // matches what it actually observes. NOTE: this MUST use the
+                // ARM64 feature-dword packing (see `arm64_privileges_and_features`)
+                // — the x64 `HvFeatures` layout would place
+                // `GuestCrashRegsAvailable` at the wrong bit and silently disable
+                // the guest-crash enlightenment.
                 HvArm64RegisterName::PrivilegesAndFeaturesInfo => {
-                    PROVIDED_FEATURES.into_bits().into()
+                    arm64_privileges_and_features().into()
                 }
                 // Enlightenment *recommendations* (HvEnlightenmentInformation) and
                 // hardware-assist features. We recommend no specific enlightenment
@@ -175,6 +215,35 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                     } else {
                         self.vp.hv1.stimer_count(timer).into()
                     }
+                }
+
+                // Guest-crash enlightenment registers, read side. These are
+                // sticky readbacks of what the guest last wrote (P0..P4 in
+                // `crash_params`). Windows' crash path reads `GuestCrashCtl` at
+                // the moment of a bugcheck; surface whatever bugcheck code +
+                // parameters have been staged so an opaque guest crash becomes an
+                // actionable stop code even if the guest never commits the
+                // control write (CrashNotify). Returning a clean readback (rather
+                // than the generic "unsupported register" 0) also keeps the
+                // guest's crash handshake on the happy path.
+                r if (HvArm64RegisterName::GuestCrashP0..=HvArm64RegisterName::GuestCrashP4)
+                    .contains(&r) =>
+                {
+                    let idx = (r.0 - HvArm64RegisterName::GuestCrashP0.0) as usize;
+                    self.vp.crash_params[idx].into()
+                }
+                HvArm64RegisterName::GuestCrashCtl => {
+                    let [p0, p1, p2, p3, p4] = self.vp.crash_params;
+                    if [p0, p1, p2, p3, p4].iter().any(|&p| p != 0) {
+                        tracing::error!(
+                            "guest read GuestCrashCtl at crash time with staged params: \
+                             code={p0:#x} p1={p1:#x} p2={p2:#x} p3={p3:#x} p4={p4:#x}"
+                        );
+                    } else {
+                        tracing::info!("guest read GuestCrashCtl (no crash parameters staged)");
+                    }
+                    // Control register is write-mostly; report the cleared state.
+                    0u128.into()
                 }
 
                 register => {
@@ -267,6 +336,15 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
                 {
                     let idx = (r.0 - HvArm64RegisterName::GuestCrashP0.0) as usize;
                     self.vp.crash_params[idx] = value.as_u64();
+                    // Surface each staged parameter. The guest may write P0..P4
+                    // (P0 = bugcheck code) and reset WITHOUT ever committing the
+                    // GuestCrashCtl write; logging here ensures we still capture
+                    // the stop code in that case.
+                    tracing::info!(
+                        param = idx,
+                        value = value.as_u64(),
+                        "guest staged crash parameter (P{idx})"
+                    );
                 }
                 HvArm64RegisterName::GuestCrashCtl => {
                     let ctl = hvdef::GuestCrashCtl::from(value.as_u64());

@@ -594,6 +594,21 @@ impl<T: Processor, U> DebugVp for BoundVp<'_, T, U> {
         let regs = access.registers()?;
         let sregs = access.system_registers()?;
 
+        // Diagnostic: surface the EL1 fault/exception context on every debugger
+        // halt-read. During a masked post-bugcheck spin no new exceptions are
+        // taken, so ESR/FAR/ELR_EL1 still hold the original unhandled-exception
+        // context that triggered the bugcheck.
+        tracing::info!(
+            vp = self.vp_index.index(),
+            pc = format!("{:#x}", regs.pc),
+            cpsr = format!("{:#x}", regs.cpsr),
+            esr_el1 = format!("{:#x}", sregs.esr_el1),
+            far_el1 = format!("{:#x}", sregs.far_el1),
+            elr_el1 = format!("{:#x}", sregs.elr_el1),
+            vbar_el1 = format!("{:#x}", sregs.vbar_el1),
+            "gdbstub get_vp_state: EL1 fault context"
+        );
+
         Ok(Box::new(DebuggerVpState::Aarch64(
             vmm_core_defs::debug_rpc::Aarch64VpState {
                 x: [

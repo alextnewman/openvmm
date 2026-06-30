@@ -1023,34 +1023,76 @@ impl HvfProcessor<'_> {
         // `hypercall.rs`, which reports `HvPartitionIsolationType::NONE`), so
         // all guest memory is plainly host-accessible at all times.
         //
-        // Modern `vmbus.sys` on ARM64 nonetheless exercises the private SLAT
-        // host-access / host-visibility hypercall family during channel
-        // bring-up — the 0x00D6–0x00D8 band:
+        // Modern `vmbus.sys`/NT on ARM64 nonetheless exercise a small family of
+        // private hypercalls during early boot and channel bring-up. We answer
+        // the ones this non-isolating backend can honestly satisfy as semantic
+        // no-ops. The identities below are from the private hvgdk/hvhdk headers;
+        // note they are NOT the contiguous "host-visibility band" an earlier
+        // revision assumed — 0x00D6 in particular is a TLB-maintenance call, and
+        // the real ModifySparseGpaPageHostVisibility is 0x00DB (see below):
         //
-        //   0x00D6  HvCallModifySparseGpaPageHostVisibility
-        //   0x00D7  HvCallAcquireSparseSpaPageHostAccess
-        //   0x00D8  HvCallReleaseSparseSpaPageHostAccess
+        //   0x00D6  HvCallFlushTlb                       (enlightened TLB shootdown)
+        //   0x00D7  HvCallAcquireSparseSpaPageHostAccess (SPA host access)
+        //   0x00D8  HvCallReleaseSparseSpaPageHostAccess (SPA host access)
         //
-        // For a non-isolated partition these are semantic no-ops: the pages are
-        // already host-visible, so "make host-visible" / "(re)acquire host
-        // access" is trivially already satisfied. Returning
-        // `InvalidHypercallCode` (our default for unknown codes) makes
-        // `vmbus.sys` bugcheck — it cannot complete channel setup — after which
-        // the guest storms the call (~1500/s) and boot-loops. Answering SUCCESS
-        // lets channel setup proceed, which is the correct behavior for this
-        // non-isolating backend.
-        const HV_CALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY: u16 = 0x00D6;
+        // 0x00D6 HvCallFlushTlb — the ARM64 enlightened TLB-shootdown call. The
+        // header's HV_PARTITION_INFO_PAGE documents the contract: "if TlbInUse is
+        // non-zero, the guest, when issuing a broadcast TLB invalidation, must in
+        // addition issue a FlushTlb hypercall" — i.e. also flush the *hypervisor-
+        // saved* TLB state of VPs that are descheduled when the architectural
+        // `TLBI ..., IS` broadcast fires. Under HVF there is no such separate
+        // hypervisor TLB: a vCPU that is not currently running has no live TLB
+        // entries, and the guest's inner-shareable TLBI broadcast (which it always
+        // issues) is honored by the hardware across every PE running the VMID. So
+        // there is genuinely nothing extra to flush and SUCCESS is the correct
+        // emulation, not an appeasement. This is consistent with — and depends on
+        // — our keeping the TLB enlightenment *disabled*: `hypercall.rs` returns 0
+        // for `PartitionInfoPage` (0x90015 → Enabled=0/TlbInUse=0) and
+        // `TlbiControl` (0x90016 → TlbiEnlightened=0), so a well-behaved guest
+        // relies on the architectural broadcast regardless of this call.
+        //
+        // 0x00D7/0x00D8 Acquire/ReleaseSparseSpaPageHostAccess — SLAT host-access
+        // calls. For a non-isolated partition the host already has access to every
+        // SPA page, so "(re)acquire / release host access" is trivially satisfied.
+        //
+        // (0x00DB HvCallModifySparseGpaPageHostVisibility — the call the earlier
+        // revision mis-attributed to 0x00D6 — is the CVM page share/unshare call.
+        // A non-isolated guest has no reason to issue it, so we deliberately do
+        // NOT fake it; it stays `InvalidHypercallCode` until/unless observed.)
+        //
+        // Returning `InvalidHypercallCode` (our default for unknown codes) for the
+        // calls the guest DOES make wedges boot: `vmbus.sys`/NT treat the failure
+        // as fatal and storm the call (~1500/s) into a boot-loop.
+        const HV_CALL_FLUSH_TLB: u16 = 0x00D6;
         const HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00D7;
         const HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00D8;
+
+        // The hypervisor-assisted context-synchronization band. The NT kernel
+        // and `vmbus.sys` issue these on ARM64 to broadcast an ISB-equivalent
+        // barrier to a set of VPs after mutating shared state (e.g. the
+        // code-integrity / hot-patch path):
+        //
+        //   0x0019  HvCallSyncContext    (Flags + UINT64 ProcessorMask)
+        //   0x001A  HvCallSyncContextEx  (Flags + HV_VP_SET ProcessorSet)
+        //
+        // Both take a small input and return NO output; their sole effect is to
+        // force the targeted VPs to context-synchronize. Under HVF every VP is a
+        // native, cache-coherent core and every VM exit/entry world switch is
+        // itself a context-synchronization event, so the requested barrier is
+        // already satisfied — acknowledging SUCCESS is the correct emulation,
+        // not merely an appeasement. (Returning `InvalidHypercallCode` instead
+        // makes the guest treat the barrier as failed and boot-loop, storming
+        // the call ~15k times/boot before each reset.)
+        const HV_CALL_SYNC_CONTEXT: u16 = 0x0019;
+        const HV_CALL_SYNC_CONTEXT_EX: u16 = 0x001A;
 
         // Control is X0 for the Hyper-V convention (hvc #1), X1 for SMCCC.
         let control = hvdef::hypercall::Control::from(self.vcpu.gp(smccc as u8));
         match control.code() {
-            HV_CALL_MODIFY_SPARSE_GPA_PAGE_HOST_VISIBILITY
-            | HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS
-            | HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS => {
-                // These are rep hypercalls; report every element processed so
-                // the guest observes a clean, complete success. The ARM HVC
+            HV_CALL_FLUSH_TLB => {
+                // Enlightened TLB shootdown — nothing to flush under HVF (see the
+                // band comment above). Report any rep elements as processed so the
+                // guest observes a clean, complete success. The ARM HVC
                 // instruction already advanced PC (`pre_advanced`), so we only
                 // write the output word into X0 (the result register).
                 let output = hvdef::hypercall::HypercallOutput::SUCCESS
@@ -1059,7 +1101,35 @@ impl HvfProcessor<'_> {
                 tracelimit::info_ratelimited!(
                     code = control.code(),
                     reps = control.rep_count(),
-                    "non-isolated no-op success for host-visibility/access hypercall"
+                    "no-op success for enlightened FlushTlb hypercall"
+                );
+                return;
+            }
+            HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS
+            | HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS => {
+                // Non-isolated: the host already has access to every SPA page.
+                // These are rep hypercalls; report every element processed so the
+                // guest observes a clean, complete success. The ARM HVC
+                // instruction already advanced PC (`pre_advanced`), so we only
+                // write the output word into X0 (the result register).
+                let output = hvdef::hypercall::HypercallOutput::SUCCESS
+                    .with_elements_processed(control.rep_count());
+                self.vcpu.set_gp(0, u64::from(output));
+                tracelimit::info_ratelimited!(
+                    code = control.code(),
+                    reps = control.rep_count(),
+                    "non-isolated no-op success for SPA host-access hypercall"
+                );
+                return;
+            }
+            HV_CALL_SYNC_CONTEXT | HV_CALL_SYNC_CONTEXT_EX => {
+                // Not a rep hypercall and no output structure, so a plain
+                // SUCCESS (zero elements processed) is the complete response.
+                self.vcpu
+                    .set_gp(0, u64::from(hvdef::hypercall::HypercallOutput::SUCCESS));
+                tracelimit::info_ratelimited!(
+                    code = control.code(),
+                    "non-isolated no-op success for context-synchronization hypercall"
                 );
                 return;
             }

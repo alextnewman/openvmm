@@ -88,7 +88,19 @@ pub const DEFAULT_GIC_ITS_BASE: u64 = 0xEFFC_0000;
 pub const GIC_ITS_SIZE: u64 = 0x2_0000;
 
 /// Default virtual timer PPI (GIC INTID). PPI 4 = INTID 16 + 4 = 20.
-/// This is the EL1 virtual timer interrupt used across Hyper-V, KVM, and HVF.
+///
+/// NOTE: 20 is non-architectural — the Arm-defined EL1 virtual timer (CNTV) is
+/// PPI 11 = INTID 27 — but 20 is REQUIRED on the UEFI path. The Hyper-V UEFI
+/// firmware (MSVM.fd) hardcodes the virtual-timer GSIV to 20 in the GTDT it
+/// generates, and OpenVMM does not supply the GTDT there (it passes only the
+/// MADT; see `vm_loaders/uefi.rs`). The guest therefore enables INTID 20 from
+/// the firmware GTDT; if OpenVMM delivers the vtimer on any other INTID the
+/// guest never receives ticks and hangs early in boot. Empirically verified:
+/// setting this to 27 hangs AZL-3 in initrd (guest still enables 20 while HVF
+/// fires on 27 → mismatch), whereas 20 boots to login. See vtimer-ppi-27-eval.
+/// This value flows to the ACPI GTDT (direct-kernel path), the DT
+/// `arm,armv8-timer` node, and every backend (Hyper-V/WHP, KVM, HVF) as the
+/// delivery INTID, so it must stay 20 to match MSVM.fd.
 pub const DEFAULT_VIRT_TIMER_PPI: u32 = 20;
 
 /// Default total number of GIC interrupts (SGIs + PPIs + SPIs).

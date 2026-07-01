@@ -522,15 +522,16 @@ impl GdmaDevice {
             Box::new(pci_express_capability) as _,
         ];
 
-        // A physical-function client (pf_caps) requires an SR-IOV extended
-        // capability to be present in config space before it will start. Expose
-        // one advertising zero virtual functions so the client starts without
-        // requesting any virtual-function infrastructure.
-        let extended_capabilities: Vec<Box<dyn PciExtendedCapability>> = if pf_caps {
-            vec![Box::new(SriovExtendedCapability::new()) as _]
-        } else {
-            Vec::new()
-        };
+        // Every MANA PCI function exposes an SR-IOV extended capability in
+        // config space: the SR-IOV VF (`0x00ba`) as well as the PF (`0x00b9`).
+        // The Windows GDMA bus INFs bind it with `Needs=PciSriovSupported.HW`,
+        // so Windows rejects the driver as inapplicable at install time
+        // (CM_PROB_FAILED_INSTALL / no compatible drivers) unless the capability
+        // is present; the PF bus driver additionally reads it during start.
+        // Advertise one with zero virtual functions so no VF infrastructure is
+        // requested.
+        let extended_capabilities: Vec<Box<dyn PciExtendedCapability>> =
+            vec![Box::new(SriovExtendedCapability::new()) as _];
 
         let bar0_mem = mmio_registration.new_io_region("regs", 8192);
         let bar2_mem = mmio_registration.new_io_region("msix", msix.bar_len());

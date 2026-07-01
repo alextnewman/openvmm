@@ -267,13 +267,11 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
         (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
     );
 
-    // Every MANA PCI function exposes a PCI SR-IOV extended capability; the
-    // bare-metal PF is no exception. It advertises the SR-IOV capability id at
-    // the start of extended config space.
+    // bm_hostmode does not expose a PCI SR-IOV extended capability (that is
+    // specific to the pf_caps client); extended config space reads back empty.
     let mut sriov_header = 0;
     device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
-    assert_eq!(sriov_header & 0xffff, 0x0010); // SR-IOV extended capability id
-    assert_eq!((sriov_header >> 16) & 0xf, 1); // capability version
+    assert_eq!(sriov_header, 0);
 
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
@@ -310,47 +308,6 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     let dev_config = bnic.query_dev_config().await.unwrap();
     assert_eq!(dev_config.bm_hostmode, 1);
-}
-
-/// The default (SR-IOV VF) presentation reports the VF PCI id `0x00ba` and, like
-/// every MANA function, exposes a PCI SR-IOV extended capability advertising zero
-/// virtual functions. The shipping Windows VF bus driver package binds the VF
-/// with an SR-IOV install prerequisite, so Windows rejects the driver at install
-/// time (CM_PROB_FAILED_INSTALL / no compatible drivers) unless this capability
-/// is present. This is a regression guard for that install-time requirement.
-#[async_test]
-async fn test_gdma_vf_sriov_capability(driver: DefaultDriver) {
-    let mem = DeviceTestMemory::new(128, false, "test_gdma_vf_sriov_capability");
-    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
-    let mut device = gdma::GdmaDevice::new_with_config(
-        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
-        mem.guest_memory(),
-        msi_conn.target(),
-        vec![VportConfig {
-            mac_address: [1, 2, 3, 4, 5, 6].into(),
-            endpoint: Box::new(NullEndpoint::new()),
-        }],
-        &mut ExternallyManagedMmioIntercepts,
-        gdma::BnicConfig::default(),
-    );
-
-    // The default presentation advertises the SR-IOV VF PCI id.
-    let mut vendor_device = 0;
-    device.pci_cfg_read(0, &mut vendor_device).unwrap();
-    assert_eq!(
-        vendor_device,
-        (gdma_defs::DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
-    );
-
-    // The VF exposes an SR-IOV extended capability with zero virtual functions;
-    // the VF bus INF requires it to be present at install time.
-    let mut sriov_header = 0;
-    device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
-    assert_eq!(sriov_header & 0xffff, 0x0010); // SR-IOV extended capability id
-    assert_eq!((sriov_header >> 16) & 0xf, 1); // capability version
-    let mut sriov_vfs = 0;
-    device.pci_cfg_read(0x10c, &mut sriov_vfs).unwrap();
-    assert_eq!(sriov_vfs, 0); // initial + total VFs both zero
 }
 
 /// With `pf_caps` set, the device presents the PF PCI id, an SR-IOV extended

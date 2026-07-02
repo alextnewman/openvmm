@@ -340,6 +340,13 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                     u64::from(caps).into()
                 }
 
+                r if r.0 == HV_ARM64_REGISTER_TSC_FREQUENCY => {
+                    // Windows-on-ARM64 can read CNTFRQ_EL0 directly, so this
+                    // synthetic register is optional; answering it truthfully
+                    // (rather than 0) avoids a per-batch "unsupported register"
+                    // warning and matches what a real hypervisor reports.
+                    crate::read_cntfrq().into()
+                }
                 register => {
                     tracelimit::warn_ratelimited!(
                         ?register,
@@ -370,6 +377,12 @@ const HV_ARM64_REGISTER_PARTITION_INFO_PAGE: u32 = 0x0009_0015;
 
 /// `HvArm64RegisterTlbiControl` (0x00090016, "Legacy"): `{ TlbiEnlightened:1 }`.
 const HV_ARM64_REGISTER_TLBI_CONTROL: u32 = 0x0009_0016;
+
+/// `HvRegisterTscFrequency` (0x00090006): the frequency, in Hz, of the counter
+/// the guest reads for high-resolution timing. On ARM64 that counter is
+/// `CNTVCT_EL0`, whose rate is `CNTFRQ_EL0`, so we answer with the live
+/// `CNTFRQ`. Not present in `HvArm64RegisterName`, so it is matched by value.
+const HV_ARM64_REGISTER_TSC_FREQUENCY: u32 = 0x0009_0006;
 
 impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
     fn set_vp_registers(

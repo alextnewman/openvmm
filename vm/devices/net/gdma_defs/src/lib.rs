@@ -344,6 +344,10 @@ open_enum! {
         GDMA_CREATE_DMA_REGION = 25,
         GDMA_DMA_REGION_ADD_PAGES = 26,
         GDMA_DESTROY_DMA_REGION = 27,
+        GDMA_CREATE_PD = 29,
+        GDMA_DESTROY_PD = 30,
+        GDMA_CREATE_MR = 31,
+        GDMA_DESTROY_MR = 32,
         GDMA_CHANGE_MSIX_FOR_EQ = 81,
     }
 }
@@ -606,6 +610,57 @@ pub struct GdmaDmaRegionAddPagesReq {
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct GdmaDestroyDmaRegionReq {
     pub gdma_region: u64,
+}
+
+/// Creates a protection domain: a handle namespace under which memory regions
+/// are registered. `flags` carries the protection-domain flags (bit 0 permits
+/// GPA-addressed memory regions in this domain).
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreatePdReq {
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreatePdResp {
+    pub pd_handle: u64,
+    pub pd_id: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDestroyPdReq {
+    pub pd_handle: u64,
+}
+
+/// Registers a memory region within a protection domain. Only the leading
+/// fixed fields are modeled; the request carries a per-`mr_type` trailer
+/// (virtual address, DMA region handle, access flags) that the emulator does
+/// not consult, because its data path addresses guest memory by GPA and never
+/// resolves a memory key.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreateMrReq {
+    pub pd_handle: u64,
+    pub mr_type: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreateMrResp {
+    pub mr_handle: u64,
+    pub lkey: u32,
+    pub rkey: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDestroyMrReq {
+    pub mr_handle: u64,
 }
 
 #[repr(C)]

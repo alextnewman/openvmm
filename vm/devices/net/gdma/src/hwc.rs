@@ -17,9 +17,15 @@ use gdma_defs::GDMA_EQE_TEST_EVENT;
 use gdma_defs::GdmaChangeMsixVectorIndexForEq;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
+use gdma_defs::GdmaCreateMrReq;
+use gdma_defs::GdmaCreateMrResp;
+use gdma_defs::GdmaCreatePdReq;
+use gdma_defs::GdmaCreatePdResp;
 use gdma_defs::GdmaCreateQueueReq;
 use gdma_defs::GdmaCreateQueueResp;
 use gdma_defs::GdmaDestroyDmaRegionReq;
+use gdma_defs::GdmaDestroyMrReq;
+use gdma_defs::GdmaDestroyPdReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaDisableQueueReq;
@@ -95,7 +101,9 @@ impl InspectTaskMut<HwControl> for Devices {
                     .field("eq_id", hwc._eq_id)
                     .field("cq_id", hwc.cq_id)
                     .field("sq_id", hwc.sq_id)
-                    .field("rq_id", hwc.rq_id);
+                    .field("rq_id", hwc.rq_id)
+                    .field("pds", hwc.state.pds.len())
+                    .field("mrs", hwc.state.mrs.len());
             })
             .field("bnic/enabled", hwc.bnic_enabled);
         }
@@ -110,6 +118,15 @@ pub struct Devices {
 pub struct HwState {
     pub queues: Arc<Queues>,
     pub dma_regions: Slab<DmaRegionState>,
+    /// Live protection-domain handles. A protection domain is a handle
+    /// namespace for memory regions; the emulated data path addresses guest
+    /// memory by GPA and never resolves a memory key, so a domain needs no
+    /// backing state beyond a live handle. Tracked so create/destroy pair up
+    /// and a memory-region create can be validated against a live domain.
+    pub pds: Slab<()>,
+    /// Live memory-region handles. Modeled as opaque handles for the same
+    /// reason as [`HwState::pds`]: the data path does not consult memory keys.
+    pub mrs: Slab<()>,
 }
 
 /// A DMA region slot. A region whose page list spans multiple HW channel
@@ -210,6 +227,8 @@ impl HwControl {
             state: HwState {
                 queues,
                 dma_regions: Slab::new(),
+                pds: Slab::new(),
+                mrs: Slab::new(),
             },
             _eq_id: eq_id,
             cq_id,
@@ -604,6 +623,75 @@ impl HwControl {
                 }
 
                 self.bnic_enabled = false;
+                0
+            }
+            GdmaRequestType::GDMA_CREATE_PD => {
+                // A protection domain is a handle namespace for memory regions.
+                // The emulated data path addresses guest memory by GPA and never
+                // resolves a memory key, so a domain needs no backing state
+                // beyond a live handle: allocate one and report it, with `pd_id`
+                // mirroring the handle. The Windows VF driver creates a global
+                // domain while starting the device to bring up its RDMA/NDK
+                // capability; the Linux NIC driver never issues this.
+                let _req: GdmaCreatePdReq =
+                    read.read_plain().context("reading create pd request")?;
+                let key = self.state.pds.insert(());
+                let resp = GdmaCreatePdResp {
+                    pd_handle: key as u64 + 1,
+                    pd_id: key as u32 + 1,
+                    reserved: 0,
+                };
+                write
+                    .write(resp.as_bytes())
+                    .context("writing create pd response")?;
+                size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DESTROY_PD => {
+                let req: GdmaDestroyPdReq =
+                    read.read_plain().context("reading destroy pd request")?;
+                self.state
+                    .pds
+                    .try_remove(req.pd_handle.wrapping_sub(1) as usize)
+                    .context("destroying unknown pd handle")?;
+                0
+            }
+            GdmaRequestType::GDMA_CREATE_MR => {
+                // A memory region is registered within a protection domain. As
+                // with GDMA_CREATE_PD, only the handle matters to the emulator:
+                // the data path never resolves the returned keys, so report an
+                // opaque handle and usable, non-zero keys. Validate that the
+                // referenced domain is live.
+                let req: GdmaCreateMrReq =
+                    read.read_plain().context("reading create mr request")?;
+                if !self
+                    .state
+                    .pds
+                    .contains(req.pd_handle.wrapping_sub(1) as usize)
+                {
+                    anyhow::bail!(
+                        "create mr references unknown pd handle {:#x}",
+                        req.pd_handle
+                    );
+                }
+                let key = self.state.mrs.insert(());
+                let mem_key = key as u32 + 1;
+                let resp = GdmaCreateMrResp {
+                    mr_handle: key as u64 + 1,
+                    lkey: mem_key,
+                    rkey: mem_key,
+                };
+                write
+                    .write(resp.as_bytes())
+                    .context("writing create mr response")?;
+                size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DESTROY_MR => {
+                let req: GdmaDestroyMrReq =
+                    read.read_plain().context("reading destroy mr request")?;
+                self.state
+                    .mrs
+                    .try_remove(req.mr_handle.wrapping_sub(1) as usize)
+                    .context("destroying unknown mr handle")?;
                 0
             }
             ty => {

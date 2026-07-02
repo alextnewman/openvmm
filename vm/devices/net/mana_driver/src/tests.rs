@@ -21,6 +21,12 @@ use gdma_defs::GDMA_PAGE_TYPE_4K;
 use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
+use gdma_defs::GdmaCreateMrReq;
+use gdma_defs::GdmaCreateMrResp;
+use gdma_defs::GdmaCreatePdReq;
+use gdma_defs::GdmaCreatePdResp;
+use gdma_defs::GdmaDestroyMrReq;
+use gdma_defs::GdmaDestroyPdReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaDmaRegionAddPagesReq;
@@ -277,6 +283,99 @@ async fn test_gdma_mana_command_without_register(driver: DefaultDriver) {
     // succeed: the client is already provisioned by the HWC bring-up.
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     bnic.query_dev_config().await.unwrap();
+}
+
+/// The Windows VF driver is a combined NIC + RDMA driver: while starting the
+/// device it creates a global protection domain and registers a memory region
+/// to bring up its RDMA/NDK capability, issuing `GDMA_CREATE_PD` and
+/// `GDMA_CREATE_MR` on the core-GDMA device (the null device id) directly after
+/// HWC init. The Linux NIC driver never issues these. The emulator services them
+/// as handle allocators -- its data path addresses guest memory by GPA and never
+/// resolves a memory key -- so create returns a live handle (and usable, non-zero
+/// keys for a memory region) and destroy releases it. Regression test for a VF
+/// start failure where the device rejected `GDMA_CREATE_PD` as an "unsupported
+/// message type", aborting device start with `STATUS_UNSUCCESSFUL`.
+#[async_test]
+async fn test_gdma_create_pd_mr(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_create_pd_mr");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+
+    // Core-GDMA resource ops are addressed to the null device, exactly as the
+    // Windows VF driver issues them after HWC init.
+    let none = GdmaDevId {
+        ty: GdmaDevType::GDMA_DEVICE_NONE,
+        instance: 0,
+    };
+
+    let pd: GdmaCreatePdResp = gdma
+        .request(
+            GdmaRequestType::GDMA_CREATE_PD.0,
+            none,
+            GdmaCreatePdReq {
+                flags: 0,
+                reserved: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(pd.pd_handle, 0);
+    assert_ne!(pd.pd_id, 0);
+
+    let mr: GdmaCreateMrResp = gdma
+        .request(
+            GdmaRequestType::GDMA_CREATE_MR.0,
+            none,
+            GdmaCreateMrReq {
+                pd_handle: pd.pd_handle,
+                mr_type: 1,
+                reserved: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(mr.mr_handle, 0);
+    assert_ne!(mr.lkey, 0);
+    assert_eq!(mr.lkey, mr.rkey);
+
+    // Release in reverse order; both must succeed so the channel drops cleanly.
+    gdma.request::<_, ()>(
+        GdmaRequestType::GDMA_DESTROY_MR.0,
+        none,
+        GdmaDestroyMrReq {
+            mr_handle: mr.mr_handle,
+        },
+    )
+    .await
+    .unwrap();
+    gdma.request::<_, ()>(
+        GdmaRequestType::GDMA_DESTROY_PD.0,
+        none,
+        GdmaDestroyPdReq {
+            pd_handle: pd.pd_handle,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// In bare-metal-host mode the device presents itself as a physical function

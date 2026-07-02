@@ -125,8 +125,17 @@ unsafe extern "C" {
         ty: HvInterruptType,
         pending: bool,
     ) -> HvfResult;
-    pub fn hv_vcpu_get_vtimer_mask(vcpu: u64, vtimer_is_masked: *mut bool) -> HvfResult;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, vtimer_is_masked: bool) -> HvfResult;
+    /// Reads the vCPU's virtual-timer offset. Per the HVF contract
+    /// (`hv_vcpu.h`), the guest observes
+    /// `CNTVCT_EL0 == mach_absolute_time() - vtimer_offset`. Note that the guest
+    /// counter tracks `mach_absolute_time()` (which excludes host sleep), NOT the
+    /// host EL0 `CNTVCT_EL0` (`mach_continuous_time`, which includes it).
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: u64, vtimer_offset: *mut u64) -> HvfResult;
+    /// The Mach absolute-time counter. On Apple Silicon this is the 24 MHz
+    /// architected timebase (excluding host sleep) that the guest's virtual
+    /// counter is defined against — see [`hv_vcpu_get_vtimer_offset`].
+    pub fn mach_absolute_time() -> u64;
 }
 
 open_enum! {

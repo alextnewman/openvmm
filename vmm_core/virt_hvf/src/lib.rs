@@ -11,7 +11,10 @@
 
 mod abi;
 mod hypercall;
+mod vp_actor;
 mod vp_state;
+#[cfg(test)]
+mod wake_loop_tests;
 
 use crate::hypercall::HvfHypercallHandler;
 use aarch64defs::Cpsr64;
@@ -47,8 +50,6 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
-use std::task::Waker;
-use std::task::ready;
 use std::time::Duration;
 use thiserror::Error;
 use virt::BindProcessor;
@@ -69,6 +70,7 @@ use vmcore::reference_time::GetReferenceTime;
 use vmcore::reference_time::ReferenceTimeResult;
 use vmcore::reference_time::ReferenceTimeSource;
 use vmcore::synic::GuestEventPort;
+use vmcore::vmtime::VmTime;
 use vmcore::vmtime::VmTimeAccess;
 
 const HV_ARM64_HVC_SMCCC_IDENTIFIER: u32 = (1 << 30) | (6 << 24) | 1;
@@ -207,9 +209,8 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
                 .vps_arch()
                 .map(|vp_info| HvfVpInner {
                     needs_yield: NeedsYield::new(),
-                    vcpu: (!0).into(),
                     message_queues: hv1_emulator::message_queues::MessageQueues::new(),
-                    waker: Default::default(),
+                    actor: vp_actor::VpActor::new(),
                     vp_info,
                     cpu_on: Default::default(),
                 })
@@ -374,7 +375,7 @@ impl virt::irqcon::ControlGic for HvfPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
         if let Some(vp) = self.gicd.set_pending(irq_id, high) {
             if let Some(vp) = self.vps.get(vp as usize) {
-                vp.kick();
+                vp.notify();
             }
         }
     }
@@ -391,7 +392,7 @@ impl virt::synic::Synic for HvfPartitionInner {
                 .message_queues
                 .enqueue_message(sint, &HvMessage::new(HvMessageType(typ), 0, payload))
             {
-                vp.kick();
+                vp.notify();
             }
         }
     }
@@ -444,7 +445,7 @@ impl GuestEventPort for HvfEventPort {
                         .signal_event(vp, sint, flag, &mut |vector, _auto_eoi| {
                             let newly_pending = partition.gicd.raise_ppi(vp, vector);
                             if newly_pending {
-                                partition.vps[vp.index() as usize].kick();
+                                partition.vps[vp.index() as usize].notify();
                             }
                         });
             }
@@ -570,11 +571,11 @@ struct HvfVpInner {
     #[inspect(skip)]
     needs_yield: NeedsYield,
     vp_info: Aarch64VpInfo,
-    #[inspect(skip)]
-    vcpu: AtomicU64,
     message_queues: hv1_emulator::message_queues::MessageQueues,
+    /// The per-vCPU wake actor: the entire race-free wake/park state machine.
+    /// See [`vp_actor`].
     #[inspect(skip)]
-    waker: RwLock<Option<Waker>>,
+    actor: vp_actor::VpActor,
     cpu_on: Mutex<Option<CpuOnState>>,
 }
 
@@ -585,29 +586,18 @@ struct CpuOnState {
 }
 
 impl HvfVpInner {
+    /// Forces this vCPU to yield out of `hv_vcpu_run`. Used by the generic
+    /// `Partition::request_yield` path (stop, inspection, save/restore).
     fn cancel_run(&self) {
-        let vcpu: u64 = self.vcpu.load(Ordering::SeqCst);
-        if vcpu != !0 {
-            // SAFETY: `&vcpu` points to a list of vcpu IDs of length 1.
-            unsafe { abi::hv_vcpus_exit(&vcpu, 1) }.chk().unwrap();
-        }
+        self.actor.cancel_run();
     }
 
-    fn wake(&self) {
-        if let Some(waker) = &*self.waker.read() {
-            waker.wake_by_ref();
-        }
-    }
-
-    /// Forces the target vCPU to observe a cross-VP event (interrupt, IPI,
-    /// synic message): re-arm its async waker in case it is parked, *and* force
-    /// it out of `hv_vcpu_run` via `cancel_run` in case it is executing guest
-    /// code. Using only `wake()` loses the wakeup whenever the target is
-    /// actively running, which deadlocks SMP interrupt/IPI delivery under
-    /// contention.
-    fn kick(&self) {
-        self.wake();
-        self.cancel_run();
+    /// Requests this vCPU to observe cross-VP work (an interrupt now pending in
+    /// virtual GIC state, a queued synic message, a pending `CPU_ON`). The work
+    /// must already be published; this is the single wake entry point that
+    /// replaces the old `wake`/`cancel_run`/`kick` trio.
+    fn notify(&self) {
+        self.actor.notify();
     }
 }
 
@@ -1352,7 +1342,7 @@ pub(crate) fn diag_decode_bugcheck(
     }
 }
 
-/// DIAG(gic5c): live frame-pointer backtrace + P3 resolution for a bugcheck
+/// Live frame-pointer backtrace + P3 resolution for a bugcheck
 /// whose parameters are NOT the 0x7E EXCEPTION_RECORD/CONTEXT shape (e.g. the
 /// 0x5C HAL_INITIALIZATION_FAILED, where P3 is a bare kernel VA and P4 an
 /// interrupt id). Seeds the walk from the *live* guest registers at the crash
@@ -1536,8 +1526,9 @@ impl BindProcessor for HvfProcessorBinder {
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
-        // Store the vcpu index in the partition.
-        inner.vcpu.store(vcpu.vcpu, Ordering::Relaxed);
+        // Record the live HVF vcpu id in the wake actor (enables the
+        // running-state `hv_vcpus_exit` wake).
+        inner.actor.set_vcpu(vcpu.vcpu);
 
         let mut vp = HvfProcessor {
             partition: &self.partition,
@@ -1550,8 +1541,6 @@ impl BindProcessor for HvfProcessorBinder {
             vmtime: state.vmtime,
             pmu: PmuState::default(),
             crash_params: [0; 5],
-            e0_last_wfi_pc: !0,
-            e0_wfi_count: 0,
         };
 
         // Set initial register state.
@@ -1707,33 +1696,21 @@ fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
     }
 }
 
-/// Reads the guest virtual-timer state (CNTV_CTL_EL0, CNTV_CVAL_EL0), the
-/// current virtual count, and the HVF vtimer mask, for diagnosing why a WFI is
-/// not woken. Returns a compact human-readable summary. Logging-only.
-fn vtimer_diag(vcpu: u64) -> String {
-    let mut ctl = 0u64;
-    let mut cval = 0u64;
-    let mut masked = false;
-    // SAFETY: simple register reads with out-params; no aliasing requirements.
+/// Reads the counter frequency (`CNTFRQ_EL0`) in Hz — the tick rate shared by
+/// `CNTVCT_EL0` and the guest's virtual timer.
+fn read_cntfrq() -> u64 {
+    let freq: u64;
+    // SAFETY: CNTFRQ_EL0 is unprivileged-readable on AArch64 with no side effects.
     unsafe {
-        let _ = abi::hv_vcpu_get_sys_reg(vcpu, abi::HvSysReg::CNTV_CTL_EL0, &mut ctl);
-        let _ = abi::hv_vcpu_get_sys_reg(vcpu, abi::HvSysReg::CNTV_CVAL_EL0, &mut cval);
-        let _ = abi::hv_vcpu_get_vtimer_mask(vcpu, &mut masked);
+        core::arch::asm!(
+            "mrs {}, cntfrq_el0",
+            out(reg) freq,
+            options(nomem, nostack, preserves_flags),
+        );
     }
-    let now: u64;
-    // SAFETY: CNTVCT_EL0 is unprivileged-readable with no side effects.
-    unsafe {
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
-    }
-    let enable = ctl & 1 != 0;
-    let imask = ctl & 2 != 0;
-    let istatus = ctl & 4 != 0;
-    let delta = cval.wrapping_sub(now) as i64;
-    format!(
-        "vtimer{{ ctl={ctl:#x} en={enable} imask={imask} istatus={istatus} \
-         cval={cval:#x} cntvct={now:#x} cval-now={delta} hvf_masked={masked} }}"
-    )
+    freq
 }
+
 
 #[derive(InspectMut)]
 pub struct HvfProcessor<'a> {
@@ -1754,13 +1731,6 @@ pub struct HvfProcessor<'a> {
     /// writes `GuestCrashCtl` at `KeBugCheckEx` time.
     #[inspect(skip)]
     crash_params: [u64; 5],
-    /// E0 evidence-gate diagnostic state: last WFI guest-PC + a running WFI
-    /// count, used to dedup WFI-stall logging (collapse a spin to one line +
-    /// periodic heartbeat). Throwaway instrumentation — revert/fold before O5.
-    #[inspect(skip)]
-    e0_last_wfi_pc: u64,
-    #[inspect(skip)]
-    e0_wfi_count: u64,
 }
 
 #[derive(Debug, Inspect)]
@@ -1991,7 +1961,8 @@ impl HvfProcessor<'_> {
                 let output = hvdef::hypercall::HypercallOutput::SUCCESS
                     .with_elements_processed(control.rep_count());
                 self.vcpu.set_gp(0, u64::from(output));
-                tracelimit::info_ratelimited!(
+                tracelimit::event_ratelimited!(
+                    tracing::Level::DEBUG,
                     code = control.code(),
                     reps = control.rep_count(),
                     "non-isolated no-op success for SPA host-access hypercall"
@@ -2003,7 +1974,8 @@ impl HvfProcessor<'_> {
                 // SUCCESS (zero elements processed) is the complete response.
                 self.vcpu
                     .set_gp(0, u64::from(hvdef::hypercall::HypercallOutput::SUCCESS));
-                tracelimit::info_ratelimited!(
+                tracelimit::event_ratelimited!(
+                    tracing::Level::DEBUG,
                     code = control.code(),
                     "non-isolated no-op success for context-synchronization hypercall"
                 );
@@ -2026,16 +1998,65 @@ impl HvfProcessor<'_> {
             .post_pending_messages(sints, |sint, message| {
                 self.hv1
                     .post_message(sint, message, &mut |vector, _auto_eoi| {
-                        tracing::info!(
-                            target: "gic5c",
-                            sint,
-                            vector,
-                            msg_type = message.header.typ.0,
-                            "deliver_sints: raising synic vector on GIC"
-                        );
                         self.gicr.raise(vector)
                     })
             });
+    }
+
+    /// Computes the precise `vmtime` deadline at which this vCPU's virtual timer
+    /// (CNTV) is due, for use while the guest is parked in WFI *outside*
+    /// `hv_vcpu_run` — where HVF cannot raise `VTIMER_ACTIVATED` on its own.
+    ///
+    /// The guest's virtual counter is defined by HVF (`hv_vcpu.h`) as
+    /// `CNTVCT_EL0 == mach_absolute_time() - vtimer_offset`. The deadline math
+    /// therefore MUST align `CNTV_CVAL_EL0` against [`abi::mach_absolute_time`],
+    /// *not* the host EL0 `CNTVCT_EL0` (which reads `mach_continuous_time` and
+    /// includes host sleep the guest counter never saw). Mixing the two makes
+    /// every idle guest read as "already expired" and hot-spin.
+    ///
+    /// * `None` — the vtimer is disabled or masked, so it cannot wake the guest;
+    ///   nothing to wait for on its account.
+    /// * `Some(now)` — it has already expired (ISTATUS set, or CVAL is in the
+    ///   past): wake immediately so we re-enter the guest and HVF delivers the
+    ///   genuine timer interrupt.
+    /// * `Some(future)` — the exact time the timer will fire, converted from
+    ///   counter ticks to a `vmtime` instant at the architected frequency.
+    fn vtimer_deadline(&self) -> Option<VmTime> {
+        const ENABLE: u64 = 1 << 0;
+        const IMASK: u64 = 1 << 1;
+        const ISTATUS: u64 = 1 << 2;
+
+        let ctl = self.vcpu.sys_reg(abi::HvSysReg::CNTV_CTL_EL0).ok()?;
+        if ctl & ENABLE == 0 || ctl & IMASK != 0 {
+            return None;
+        }
+        if ctl & ISTATUS != 0 {
+            return Some(self.vmtime.now());
+        }
+
+        let cval = self.vcpu.sys_reg(abi::HvSysReg::CNTV_CVAL_EL0).ok()?;
+
+        // Align to the guest counter: CNTVCT_EL0 == mach_absolute_time() - offset.
+        let mut offset = 0u64;
+        // SAFETY: `offset` is a valid out-param.
+        unsafe { abi::hv_vcpu_get_vtimer_offset(self.vcpu.vcpu, &mut offset) }
+            .chk()
+            .ok()?;
+        // SAFETY: no requirements.
+        let guest_now = unsafe { abi::mach_absolute_time() }.wrapping_sub(offset);
+
+        if cval <= guest_now {
+            return Some(self.vmtime.now());
+        }
+
+        let freq = read_cntfrq();
+        if freq == 0 {
+            return None;
+        }
+        let ticks = cval - guest_now;
+        let secs = ticks / freq;
+        let nanos = ((ticks % freq) as u128 * 1_000_000_000 / freq as u128) as u32;
+        Some(self.vmtime.now().wrapping_add(Duration::new(secs, nanos)))
     }
 
     fn handle_smccc(&mut self, fc: FastCall) {
@@ -2105,7 +2126,7 @@ impl HvfProcessor<'_> {
                             x0: context_id,
                         });
                         drop(cpu_on);
-                        vp.wake();
+                        vp.notify();
                         tracing::info!(
                             target_cpu,
                             target_vp_index,
@@ -2208,7 +2229,6 @@ impl<'p> Processor for HvfProcessor<'p> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         let vp_index = self.inner.vp_info.base.vp_index;
-        let mut last_waker = None;
 
         loop {
             self.inner.needs_yield.maybe_yield().await;
@@ -2217,13 +2237,11 @@ impl<'p> Processor for HvfProcessor<'p> {
                 loop {
                     stop.check()?;
 
-                    if !last_waker
-                        .as_ref()
-                        .is_some_and(|waker| cx.waker().will_wake(waker))
-                    {
-                        last_waker = Some(cx.waker().clone());
-                        self.inner.waker.write().clone_from(&last_waker);
-                    }
+                    // Begin a fresh decision pass: reset the wake actor to
+                    // RUNNING and consume any pending must-exit latch, so the
+                    // work re-scan below observes everything a producer published
+                    // before latching it.
+                    self.inner.actor.begin_pass();
 
                     if let Some(cpu_on) = self.inner.cpu_on.lock().take() {
                         if self.on {
@@ -2241,7 +2259,16 @@ impl<'p> Processor for HvfProcessor<'p> {
                     }
 
                     if !self.on {
-                        break Poll::Pending;
+                        // Secondary vCPU not yet powered on: park until a
+                        // PSCI CPU_ON publishes a start request and notifies us.
+                        match self
+                            .inner
+                            .actor
+                            .try_park(cx.waker(), || self.inner.cpu_on.lock().is_none())
+                        {
+                            vp_actor::ParkDecision::Parked => return Poll::Pending,
+                            vp_actor::ParkDecision::Rescan => continue,
+                        }
                     }
 
                     self.hv1
@@ -2286,48 +2313,39 @@ impl<'p> Processor for HvfProcessor<'p> {
                         self.wfi = false;
                     }
 
-                    // DIAG(gic5c): whenever the synic SGI 8 (or any SGI/PPI) is
-                    // pending, snapshot the full delivery state so we can see why
-                    // the interrupt is / isn't injected right before the 0x5C.
-                    let diag_pend = self.gicr.diag_pending();
-                    if diag_pend & 0xffff != 0 {
-                        let (p, e, g, a, pmr, ge0, ge1, prio8) = self.gicr.diag_state(8);
-                        let injected = self.partition.gicd.irq_pending(&self.gicr);
-                        tracing::info!(
-                            target: "gic5c",
-                            injected,
-                            pending = format!("{p:#x}"),
-                            enable = format!("{e:#x}"),
-                            group = format!("{g:#x}"),
-                            active = format!("{a:#x}"),
-                            pmr = format!("{pmr:#x}"),
-                            grpen0 = ge0,
-                            grpen1 = ge1,
-                            sgi8_prio = format!("{prio8:#x}"),
-                            "SGI/PPI pending snapshot"
-                        );
-                    }
-
                     if self.wfi {
-                        self.vmtime.set_timeout_if_before(
-                            self.vmtime.now().wrapping_add(Duration::from_millis(2)),
-                        );
-                        ready!(self.vmtime.poll_timeout(cx));
-                        // The 2ms vtimer backstop fired. HVF cannot raise
-                        // VTIMER_ACTIVATED while the vCPU is parked in WFI (it
-                        // only delivers as an exit *from* hv_vcpu_run), so the
-                        // VMM must periodically wake the guest. Rather than
-                        // blind-injecting the timer PPI here — a spurious
-                        // interrupt that a real guest OS (e.g. Windows) rejects
-                        // because CNTV_CTL.ISTATUS is still 0, wedging boot — we
-                        // clear the WFI wait and re-enter the guest. The WFI PC
-                        // was already advanced, so the guest resumes its idle
-                        // loop; before re-running we unmask the vtimer (below),
-                        // letting HVF deliver a *genuine* VTIMER_ACTIVATED iff
-                        // the virtual timer has actually expired. The loop head
-                        // re-scans SynIC/SPI/SGI wake sources before we break.
-                        self.wfi = false;
-                        continue;
+                        // The guest is idle in WFI, parked *outside* hv_vcpu_run,
+                        // where HVF cannot itself raise VTIMER_ACTIVATED. Arm the
+                        // precise virtual-timer deadline (if the guest has the
+                        // vtimer enabled+unmasked) alongside any synic-timer
+                        // deadline set above, then wait on the earliest.
+                        if let Some(deadline) = self.vtimer_deadline() {
+                            self.vmtime.set_timeout_if_before(deadline);
+                        }
+                        if self.vmtime.poll_timeout(cx).is_ready() {
+                            // A deadline (vtimer or synic) is due: clear the WFI
+                            // wait and re-enter the guest. The vtimer is unmasked
+                            // before hv_vcpu_run (below), so HVF delivers a
+                            // *genuine* VTIMER_ACTIVATED iff it truly expired; the
+                            // loop head re-scans SynIC/SPI/SGI sources first.
+                            self.wfi = false;
+                            continue;
+                        }
+                        // Idle with a future (or absent) deadline: park until a
+                        // producer notifies us. poll_timeout above already
+                        // registered our waker for the deadline; try_park stores
+                        // the same waker for the producer path, and the fused ctl
+                        // latch guarantees no wake is lost in between.
+                        match self
+                            .inner
+                            .actor
+                            .try_park(cx.waker(), || !self.partition.gicd.irq_pending(&self.gicr))
+                        {
+                            vp_actor::ParkDecision::Parked => {
+                                return Poll::Pending;
+                            }
+                            vp_actor::ParkDecision::Rescan => continue,
+                        }
                     }
 
                     break Poll::Ready(Result::<_, VpHaltReason>::Ok(()));
@@ -2514,41 +2532,14 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     );
                                     0
                                 };
-                                // E0 evidence gate: trace generic-timer *control*
-                                // reads (CRn==14, CRm!=0 excludes the high-frequency
-                                // CNTxCT/CNTFRQ counters) to see what timer state
-                                // Windows queries while wedged.
-                                if reg.0.crn() == 14 && reg.0.crm() != 0 {
-                                    tracing::info!(
-                                        target: "e0_timer",
-                                        ?reg,
-                                        value,
-                                        pc = self.vcpu.pc(),
-                                        "E0 timer-sysreg READ"
-                                    );
-                                }
                                 self.vcpu.set_gp(iss.rt(), value);
                             } else {
                                 let value = self.vcpu.gp(iss.rt());
-                                // E0 evidence gate: trace generic-timer *control*
-                                // writes (CRn==14, CRm!=0 → CNTP_*/CNTV_*/CNTKCTL, not
-                                // the counters). A guest that arms CNTP_CVAL/CTL here
-                                // and then WFIs is the smoking gun for CNTP starvation
-                                // (→ O5 is the Windows-unblock).
-                                if reg.0.crn() == 14 && reg.0.crm() != 0 {
-                                    tracing::info!(
-                                        target: "e0_timer",
-                                        ?reg,
-                                        value,
-                                        pc = self.vcpu.pc(),
-                                        "E0 timer-sysreg WRITE"
-                                    );
-                                }
                                 let handled_by_gic = self.partition.gicd.write_sysreg(
                                     &mut self.gicr,
                                     reg,
                                     value,
-                                    |index| self.partition.vps[index].kick(),
+                                    |index| self.partition.vps[index].notify(),
                                 );
                                 if !handled_by_gic && !self.pmu.write_sysreg(reg, value, now) {
                                     tracing::warn!(
@@ -2612,35 +2603,6 @@ impl<'p> Processor for HvfProcessor<'p> {
                             }
                         }
                         ExceptionClass::WFI => {
-                            // E0 evidence gate: trace the WFI stall location, deduped
-                            // by guest PC (collapse a WFI spin to one line + a periodic
-                            // heartbeat) so we can tell whether Windows is parked
-                            // waiting on a timer interrupt that never arrives. Dump the
-                            // GIC SGI/PPI + CPU-interface state alongside so we can see
-                            // exactly which interrupt the guest enabled and is awaiting
-                            // (e.g. INTID 27 = architectural CNTV vs our 20).
-                            let pc = self.vcpu.pc();
-                            self.e0_wfi_count = self.e0_wfi_count.wrapping_add(1);
-                            if pc != self.e0_last_wfi_pc {
-                                tracing::info!(
-                                    target: "e0_wfi",
-                                    pc,
-                                    count = self.e0_wfi_count,
-                                    vtimer = %vtimer_diag(self.vcpu.vcpu),
-                                    diag = ?self.gicr.ppi_diag(),
-                                    "E0 WFI (pc changed)"
-                                );
-                                self.e0_last_wfi_pc = pc;
-                            } else if self.e0_wfi_count % 512 == 0 {
-                                tracing::info!(
-                                    target: "e0_wfi",
-                                    pc,
-                                    count = self.e0_wfi_count,
-                                    vtimer = %vtimer_diag(self.vcpu.vcpu),
-                                    diag = ?self.gicr.ppi_diag(),
-                                    "E0 WFI (spin heartbeat)"
-                                );
-                            }
                             self.wfi = true;
                             advance(&mut self.vcpu);
                         }

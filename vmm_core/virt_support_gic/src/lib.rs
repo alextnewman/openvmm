@@ -236,19 +236,10 @@ mod gicd {
             wake: impl FnMut(usize),
         ) -> bool {
             match reg {
-                SystemReg::ICC_EOIR0_EL1 => {
-                    tracing::info!(target: "gic5c", intid = value as u32, "ICC_EOIR0");
-                    self.eoi(gicr, false, value as u32)
-                }
-                SystemReg::ICC_EOIR1_EL1 => {
-                    tracing::info!(target: "gic5c", intid = value as u32, "ICC_EOIR1");
-                    self.eoi(gicr, true, value as u32)
-                }
+                SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
+                SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
                 SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
-                SystemReg::ICC_SGI1R_EL1 => {
-                    tracing::info!(target: "gic5c", raw = format!("{value:#x}"), intid = GicrSgi::from(value).intid(), "ICC_SGI1R");
-                    self.sgi(gicr, true, value, wake)
-                }
+                SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
                 _ => return gicr.write_cpuif(reg, value),
             }
             true
@@ -279,16 +270,8 @@ mod gicd {
 
         pub fn read_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg) -> Option<u64> {
             let v = match reg {
-                SystemReg::ICC_IAR0_EL1 => {
-                    let intid = self.ack(gicr, false);
-                    tracing::info!(target: "gic5c", intid, "ICC_IAR0 ack (grp0/FIQ)");
-                    intid.into()
-                }
-                SystemReg::ICC_IAR1_EL1 => {
-                    let intid = self.ack(gicr, true);
-                    tracing::info!(target: "gic5c", intid, "ICC_IAR1 ack (grp1/IRQ)");
-                    intid.into()
-                }
+                SystemReg::ICC_IAR0_EL1 => self.ack(gicr, false).into(),
+                SystemReg::ICC_IAR1_EL1 => self.ack(gicr, true).into(),
                 _ => return gicr.read_cpuif(reg),
             };
             Some(v)
@@ -1193,29 +1176,6 @@ mod gicr {
             *icc_ap1r0 = 0;
         }
 
-        /// DIAG(gic5c): raw SGI/PPI pending bitmap for this redistributor.
-        pub fn diag_pending(&self) -> u32 {
-            self.shared.pending.load(Ordering::Relaxed)
-        }
-
-        /// DIAG(gic5c): snapshot of the SGI/PPI + CPU-interface delivery state
-        /// as `(pending, enable, group, active, pmr, grpen0, grpen1, prio[intid])`.
-        pub fn diag_state(&self, intid: u32) -> (u32, u32, u32, u32, u8, bool, bool, u8) {
-            let p = self.shared.pending.load(Ordering::Relaxed);
-            let s = self.shared.mutable.lock();
-            let prio = s.priority[intid as usize / 4].to_ne_bytes()[intid as usize % 4];
-            (
-                p,
-                s.enable,
-                s.group,
-                s.active,
-                s.icc_pmr,
-                s.icc_grpen0,
-                s.icc_grpen1,
-                prio,
-            )
-        }
-
         /// Records a write to one of the GICv3 CPU-interface system registers
         /// (ICC_PMR/BPR/IGRPEN/CTLR). These are banked per-PE, so they live on
         /// the redistributor's per-CPU state. Returns `true` if `reg` is a
@@ -1240,7 +1200,6 @@ mod gicr {
                 }
                 _ => return false,
             }
-            tracing::info!(target: "gic5c", ?reg, value = format!("{value:#x}"), "write_cpuif");
             true
         }
 

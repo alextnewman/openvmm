@@ -385,19 +385,6 @@ impl ProcessorSynic {
     /// Sets the specified `SINT` register.
     pub fn set_sint(&mut self, n: usize, v: u64) {
         let sint = v.into();
-        {
-            let s: hvdef::HvSynicSint = sint;
-            tracing::info!(
-                target: "gic5c",
-                sint = n,
-                raw = format!("{v:#x}"),
-                vector = s.vector(),
-                masked = s.masked(),
-                auto_eoi = s.auto_eoi(),
-                proxy = s.proxy(),
-                "guest set SINT"
-            );
-        }
         self.sints.sint[n] = sint;
         self.shared.write().sint[n] = sint;
     }

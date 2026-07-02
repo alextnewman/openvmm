@@ -70,7 +70,16 @@ fn poll_child_exit(
     if let Some(w) = wait {
         ready!(w.poll_exit(cx))?;
     }
-    Ok(try_wait()?.expect("wait backend signaled readiness but process has not exited")).into()
+    match try_wait()? {
+        Some(status) => Poll::Ready(Ok(status)),
+        // The exit notification can arrive before `try_wait` can reap the
+        // child (e.g. macOS kqueue `NOTE_EXIT` racing `waitpid` on another
+        // core). Readiness stays latched, so re-poll until the reap succeeds.
+        None => {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
 }
 
 // --- std::process::Child ---
@@ -316,6 +325,58 @@ mod windows {
                 wait: Some(HandleProcessWait::new(wait)),
                 child,
             })
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    struct CountingWaker(AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Regression test: when the wait backend signals exit but `try_wait`
+    /// cannot yet reap the child (the macOS `NOTE_EXIT`/`waitpid` race),
+    /// `poll_child_exit` must re-poll rather than panic, then complete once
+    /// the reap succeeds.
+    #[test]
+    fn reap_race_repolls_then_completes() {
+        let waker = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let raw_waker: Waker = waker.clone().into();
+        let mut cx = Context::from_waker(&raw_waker);
+
+        // `wait == None` models a backend that has already signaled ready, so
+        // `poll_child_exit` goes straight to `try_wait`.
+        let mut wait = None;
+        let mut calls = 0;
+        let mut try_wait = || {
+            calls += 1;
+            Ok((calls > 1).then(|| std::process::ExitStatus::from_raw(0)))
+        };
+
+        // First poll hits the race: not yet reapable -> Pending + wake.
+        assert!(poll_child_exit(&mut cx, &mut wait, &mut try_wait).is_pending());
+        assert_eq!(waker.0.load(Ordering::Relaxed), 1);
+
+        // Second poll reaps successfully.
+        match poll_child_exit(&mut cx, &mut wait, &mut try_wait) {
+            Poll::Ready(Ok(status)) => assert!(status.success()),
+            other => panic!("expected ready success, got {other:?}"),
         }
     }
 }

@@ -229,6 +229,56 @@ async fn test_gdma(driver: DefaultDriver) {
     arena.destroy(&mut gdma).await;
 }
 
+/// A virtual-function driver may issue MANA device commands as soon as the
+/// hardware channel is up, without first sending `GDMA_REGISTER_DEVICE`. The
+/// MANA client is provisioned by the HWC init handshake -- the init EQE carries
+/// its pdid and resource limits -- so it is addressable immediately. The
+/// Windows VF driver relies on this ordering: it queries the device
+/// configuration directly after HWC bring-up. (The in-tree driver and the Linux
+/// driver instead send a redundant `GDMA_REGISTER_DEVICE` first, as `test_gdma`
+/// exercises; both orderings must work.) Regression test for a VF start failure
+/// where the device rejected the un-preceded `MANA_QUERY_DEV_CONFIG` as an
+/// "unknown device".
+#[async_test]
+async fn test_gdma_mana_command_without_register(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_mana_command_without_register");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    // Deliberately skip `gdma.register_device(dev_id)` and issue a MANA command
+    // directly, exactly as the Windows VF driver does after HWC init. This must
+    // succeed: the client is already provisioned by the HWC bring-up.
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    bnic.query_dev_config().await.unwrap();
+}
+
 /// In bare-metal-host mode the device presents itself as a physical function
 /// rather than an SR-IOV VF, so the guest exercises the Linux driver's
 /// bare-metal-host code paths. Three facts are observable: (1) the PCI device id

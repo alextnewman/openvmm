@@ -285,16 +285,19 @@ impl HwControl {
             let r = match hdr.req.msg_type >> 16 {
                 0 => self.handle_req(&hdr, read, write),
                 _ => {
-                    // Device specific. A BNIC client becomes usable through one
-                    // of two registration paths. A virtual function registers
-                    // explicitly with `GDMA_REGISTER_DEVICE` (tracked by
-                    // `bnic_enabled`). A physical function is registered by
-                    // enumeration: the client appears in the device list and is
-                    // usable at once, never sending an explicit register. Accept
-                    // commands when either path has made the client live.
-                    if hdr.dev_id == BNIC_DEV_ID
-                        && (self.bnic_enabled || devices.bnic.registered_by_enumeration())
-                    {
+                    // Device-specific (BNIC/MANA) command. The MANA client is
+                    // provisioned by the host as part of hardware-channel
+                    // bring-up: completing HWC setup delivers an init EQE that
+                    // carries the client's pdid and resource limits, after which
+                    // the client is addressable. `GDMA_REGISTER_DEVICE` is an
+                    // optional, redundant confirmation -- some drivers send it
+                    // (the in-tree mana_driver and the Linux driver) and others
+                    // skip it, issuing MANA commands directly after HWC init (the
+                    // Windows VF driver, and a physical function). Requiring an
+                    // explicit register here would wrongly reject the latter.
+                    // Reaching this dispatch means the HWC is live, so accept any
+                    // command addressed to the MANA client.
+                    if hdr.dev_id == BNIC_DEV_ID {
                         devices
                             .bnic
                             .handle_req(&mut self.state, &hdr, read, write)

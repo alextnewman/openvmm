@@ -2070,7 +2070,299 @@ async fn test_rss_steering_distributes_across_queues(driver: DefaultDriver) {
     endpoint.stop().await;
 }
 
-/// Yields to the executor for up to `ms` milliseconds so spawned device tasks
+/// A single-queue loopback backend that completes transmits **asynchronously**
+/// and echoes the transmit id, modelling the `consomme` NAT backend whose state
+/// is single-owner (`tx_avail` returns `(false, ..)` and the completion, with
+/// the echoed transmit id, is reported later via `tx_poll`). `get_queues`
+/// returns an error if asked for more than one queue -- the real consomme
+/// backend asserts, which would panic the device's datapath thread; an error is
+/// used here so the failure is deterministic in a test.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SingleQueueLoopbackEndpoint;
+
+#[async_trait]
+impl Endpoint for SingleQueueLoopbackEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "single-queue-loopback-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.len() == 1,
+            "single-queue backend asked for {} queues",
+            config.len()
+        );
+        queues.push(Box::new(AsyncLoopbackQueue::default()));
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 64,
+        }
+    }
+}
+
+/// Loopback queue that defers transmit completion to `tx_poll` and echoes the
+/// transmit id, exactly as the consomme backend does. This exercises the
+/// device's asynchronous transmit-completion path (`process_backend`), where the
+/// funnel must route the completion back to the send queue named by the echoed
+/// transmit id.
+#[derive(InspectMut, Default)]
+#[inspect(skip)]
+struct AsyncLoopbackQueue {
+    rx_avail: VecDeque<RxId>,
+    rx_done: VecDeque<RxId>,
+    tx_done: VecDeque<TxId>,
+}
+
+impl Queue for AsyncLoopbackQueue {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.rx_done.is_empty() && self.tx_done.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        self.rx_avail.extend(done);
+    }
+
+    fn rx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let n = packets.len().min(self.rx_done.len());
+        for (d, s) in packets.iter_mut().zip(self.rx_done.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        mut segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let mut sent = 0;
+        while !segments.is_empty() {
+            let (meta, _, _) = next_packet(segments);
+            let tx_id = meta.id;
+            let vlan = meta.vlan;
+            let before = segments.len();
+            let packet = linearize(pool, &mut segments)?;
+            sent += before - segments.len();
+            if let Some(rx_id) = self.rx_avail.pop_front() {
+                pool.write_packet(
+                    rx_id,
+                    &net_backend::RxMetadata {
+                        offset: 0,
+                        len: packet.len(),
+                        vlan,
+                        ..Default::default()
+                    },
+                    &packet,
+                );
+                self.rx_done.push_back(rx_id);
+            }
+            // Report the completion asynchronously (via `tx_poll`), echoing the
+            // transmit id, as consomme does.
+            self.tx_done.push_back(tx_id);
+        }
+        Ok((false, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        let n = done.len().min(self.tx_done.len());
+        for (d, s) in done.iter_mut().zip(self.tx_done.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+}
+
+/// The Windows VF driver creates one queue pair per CPU regardless of the
+/// per-vport `max_num_sq`/`max_num_rq` the device advertises, so it can create
+/// more queue pairs than a single-queue backend (like the `consomme` NAT
+/// backend) can service. Rather than requesting one backend queue per guest
+/// queue pair -- which a single-queue backend rejects (the real consomme
+/// backend panics its datapath thread) -- the device must funnel the guest's
+/// surplus queue pairs onto the backend's available queues.
+///
+/// This drives that funnel: two guest queue pairs against a single-queue
+/// loopback backend. It transmits from the *non-primary* send queue (queue 1)
+/// and asserts (a) the transmit completes on queue 1's own completion queue --
+/// proving the transmit was funneled onto the single backend queue and its
+/// completion routed back by the source send queue -- and (b) the looped-back
+/// packet is received on the primary receive queue (queue 0), where a
+/// single-backend-queue funnel delivers all receives.
+///
+/// Without the funnel the device requests two backend queues from the
+/// single-queue endpoint, `get_queues` fails, and `MANA_CONFIG_VPORT_RX` (hence
+/// `get_queues` below) errors -- a genuine regression guard.
+#[async_test]
+async fn funnel_multi_queue_onto_single_queue_backend(driver: DefaultDriver) {
+    let pages = 256; // 1MB
+    let mem = DeviceTestMemory::new(pages * 2, true, "funnel_multi_queue");
+    let payload_mem = mem.payload_mem();
+
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(SingleQueueLoopbackEndpoint),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 2, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+
+    // Create *two* queue pairs even though the backend advertises a single
+    // queue -- exactly what the Windows VF driver does. Without the funnel the
+    // device would ask the single-queue backend for two queues and this fails.
+    let mut queues = Vec::new();
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+    endpoint
+        .get_queues(
+            (0..2)
+                .map(|_| QueueConfig {
+                    driver: Box::new(driver.clone()),
+                })
+                .collect(),
+            None,
+            &mut queues,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queues.len(), 2);
+
+    // Post receive buffers on the *primary* receive queue (queue 0). With a
+    // single backend queue the funnel delivers every received packet there; the
+    // surplus queue's posted buffers stay idle.
+    queues[0].rx_avail(&mut pool, &(1..8u32).map(RxId).collect::<Vec<_>>());
+
+    // Transmit a one-segment frame from the *non-primary* send queue (queue 1).
+    let packet = {
+        let mut p = vec![0u8; 64];
+        p[0] = 0xb1;
+        p
+    };
+    payload_mem.write_at(0, &packet).unwrap();
+    let seg = TxSegment {
+        ty: net_backend::TxSegmentType::Head(net_backend::TxMetadata {
+            id: TxId(7),
+            segment_count: 1,
+            len: packet.len() as u32,
+            ..Default::default()
+        }),
+        gpa: 0,
+        len: packet.len() as u32,
+    };
+    queues[1].tx_avail(&mut pool, &[seg]).unwrap();
+
+    // Poll for the transmit completion on queue 1 and the looped-back receive on
+    // queue 0.
+    let mut tx_completed = false;
+    let mut rx_received: Option<RxId> = None;
+    let mut spurious_tx_on_primary = false;
+    loop {
+        let mut ctx = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if ctx
+            .until_cancelled(poll_fn(|cx| {
+                let mut ready = Poll::Pending;
+                for q in queues.iter_mut() {
+                    if q.poll_ready(cx, &mut pool).is_ready() {
+                        ready = Poll::Ready(());
+                    }
+                }
+                ready
+            }))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        let mut tx_done = [TxId(0); 4];
+        if queues[1].tx_poll(&mut pool, &mut tx_done).unwrap_or(0) > 0 {
+            tx_completed = true;
+        }
+        // The transmit came from queue 1, so its completion must not land on
+        // queue 0's completion queue.
+        if queues[0].tx_poll(&mut pool, &mut tx_done).unwrap_or(0) > 0 {
+            spurious_tx_on_primary = true;
+        }
+
+        let mut rx = [RxId(0)];
+        if queues[0].rx_poll(&mut pool, &mut rx).unwrap() > 0 {
+            rx_received = Some(rx[0]);
+        }
+
+        if tx_completed && rx_received.is_some() {
+            break;
+        }
+    }
+
+    assert!(
+        tx_completed,
+        "transmit from the non-primary send queue did not complete on its own completion queue"
+    );
+    assert!(
+        !spurious_tx_on_primary,
+        "transmit completion was misrouted to the primary send queue"
+    );
+    let rx_id =
+        rx_received.expect("looped-back packet was not delivered to the primary receive queue");
+
+    // Confirm the received bytes match what was transmitted from queue 1.
+    let buffer_size = pool.capacity(rx_id) as u64;
+    let mut received = vec![0u8; packet.len()];
+    payload_mem
+        .read_at(buffer_size * rx_id.0 as u64, &mut received)
+        .unwrap();
+    assert_eq!(received, packet);
+
+    drop(queues);
+    endpoint.stop().await;
+}
+
 /// (the emulator's receive task) can make progress while the test holds no
 /// pending future of its own.
 async fn run_executor_for(ms: u64) {

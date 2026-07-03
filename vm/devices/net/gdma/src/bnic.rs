@@ -421,6 +421,16 @@ async fn start_vport_datapath(
         anyhow::bail!("queues not configured");
     }
 
+    // The guest may create more queue pairs than the backend endpoint can
+    // service. The Windows VF driver, for example, creates one queue pair per
+    // CPU (it does not clamp to the per-vport `max_num_rq`/`max_num_sq` the way
+    // the Linux driver does), while the `consomme` NAT backend is single-queue.
+    // Honor the backend's advertised limit: request only that many backend
+    // queues and funnel the guest's queue pairs onto them, rather than asking
+    // the backend for more queues than it supports (which single-queue backends
+    // assert against).
+    let backend_queues = (vport.endpoint.multiqueue_support().max_queues as usize).clamp(1, n);
+
     let cqe_coalescing = vport.cqe_coalescing.clone();
 
     // When an indirection table is supplied it is located at `indir_tab_offset`
@@ -460,7 +470,7 @@ async fn start_vport_datapath(
         None
     };
 
-    let configs = (0..n)
+    let configs = (0..backend_queues)
         .map(|_| QueueConfig {
             driver: Box::new(state.queues.driver.clone()),
         })
@@ -478,19 +488,38 @@ async fn start_vport_datapath(
         .get_queues(configs, rss_cfg.as_ref(), &mut queues)
         .await?;
     anyhow::ensure!(
-        queues.len() == n,
-        "backend returned {} queues, expected {n}",
+        queues.len() == backend_queues,
+        "backend returned {} queues, expected {backend_queues}",
         queues.len()
     );
 
-    for (k, epqueue) in queues.into_iter().enumerate() {
-        let (sq_id, sq_cq_id) = (vport.queue_cfg.tx[k].wq_id, vport.queue_cfg.tx[k].cq_id);
-        let (rq_id, rq_cq_id) = (vport.queue_cfg.rx[k].wq_id, vport.queue_cfg.rx[k].cq_id);
+    for (j, epqueue) in queues.into_iter().enumerate() {
+        // Funnel every guest send queue that maps to this backend queue
+        // (round-robin over the backend queues) through it, so all of the
+        // guest's transmit queues reach the backend even when there are more of
+        // them than backend queues. Each send queue's completions are routed
+        // back to its own CQ via the transmit id set in `process_sqe`.
+        let sqs: Vec<SqChannel> = (j..n)
+            .step_by(backend_queues)
+            .map(|i| SqChannel {
+                sq_id: vport.queue_cfg.tx[i].wq_id,
+                sq_cq_id: vport.queue_cfg.tx[i].cq_id,
+            })
+            .collect();
+
+        // This backend queue delivers received packets to a single guest
+        // receive queue -- the backend does not itself steer across the guest's
+        // queues. When the guest created more queue pairs than the backend can
+        // service, the surplus receive queues stay idle (their posted buffers
+        // are simply not consumed, which the driver tolerates); only these
+        // primary receive queues get a fence sender, so a fence on an idle
+        // queue is posted inline (nothing is in flight to order).
+        let (rq_id, rq_cq_id) = (vport.queue_cfg.rx[j].wq_id, vport.queue_cfg.rx[j].cq_id);
 
         // Route fences for this receive object through its task so the fence
         // CQE is ordered after the task's prior receive completions.
         let (fence_tx, fence_rx) = mesh::channel();
-        vport.queue_cfg.rx[k].fence_tx = Some(fence_tx);
+        vport.queue_cfg.rx[j].fence_tx = Some(fence_tx);
 
         let mut task = TaskControl::new(TxRxState);
         task.insert(
@@ -503,8 +532,7 @@ async fn start_vport_datapath(
                     gm: state.queues.gm.clone(),
                     rx_packets: Default::default(),
                 },
-                sq_id,
-                sq_cq_id,
+                sqs,
                 rq_id,
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
@@ -539,6 +567,14 @@ struct WqObject {
 struct QueueCfg {
     tx: Vec<WqObject>,
     rx: Vec<WqObject>,
+}
+
+/// A guest send queue serviced by a [`TxRxTask`]: the work-queue id polled for
+/// transmit WQEs and the completion-queue id its transmit completions are
+/// posted to.
+struct SqChannel {
+    sq_id: u32,
+    sq_cq_id: u32,
 }
 
 impl BasicNic {
@@ -1106,8 +1142,14 @@ pub struct TxRxTask {
     queues: Arc<Queues>,
     epqueue: Box<dyn Queue>,
     pool: GuestBuffers,
-    sq_id: u32,
-    sq_cq_id: u32,
+    /// The guest send queues funneled through this task's single backend queue.
+    /// A transmit completion the backend reports carries the transmit id set in
+    /// [`TxRxTask::process_sqe`] -- the index into this vector -- so the
+    /// completion is posted back to the CQ of the send queue it came from.
+    /// Usually a single entry (one guest queue pair per backend queue); it holds
+    /// several only when the guest created more queue pairs than the backend can
+    /// service.
+    sqs: Vec<SqChannel>,
     rq_id: u32,
     rq_cq_id: u32,
     tx_segment_buffer: Vec<TxSegment>,
@@ -1139,7 +1181,7 @@ impl TxRxTask {
         let max_rx_buf = 256;
 
         enum Event {
-            Sqe(Wqe),
+            Sqe(usize, Wqe),
             Rqe(u32, Wqe),
             Ready,
             Fence,
@@ -1168,8 +1210,10 @@ impl TxRxTask {
                         return Poll::Ready(Event::Rqe(wqe_offset, wqe));
                     }
                 }
-                if let Poll::Ready(wqe) = self.queues.poll_sq(self.sq_id, cx) {
-                    return Poll::Ready(Event::Sqe(wqe));
+                for (slot, sq) in self.sqs.iter().enumerate() {
+                    if let Poll::Ready(wqe) = self.queues.poll_sq(sq.sq_id, cx) {
+                        return Poll::Ready(Event::Sqe(slot, wqe));
+                    }
                 }
                 if self.epqueue.poll_ready(cx, &mut self.pool).is_ready() {
                     return Poll::Ready(Event::Ready);
@@ -1178,7 +1222,7 @@ impl TxRxTask {
             })
             .await;
             match event {
-                Event::Sqe(sqe) => self.process_sqe(sqe)?,
+                Event::Sqe(slot, sqe) => self.process_sqe(slot, sqe)?,
                 Event::Rqe(wqe_offset, wqe) => self.process_rqe(wqe, wqe_offset)?,
                 Event::Ready => self.process_backend()?,
                 Event::Fence => self.post_fence()?,
@@ -1186,7 +1230,7 @@ impl TxRxTask {
         }
     }
 
-    fn process_sqe(&mut self, sqe: Wqe) -> anyhow::Result<()> {
+    fn process_sqe(&mut self, slot: usize, sqe: Wqe) -> anyhow::Result<()> {
         tracing::trace!("tx wqe");
         let oob = sqe.oob();
         let oob = if oob.len() >= size_of::<ManaTxOob>() {
@@ -1219,7 +1263,7 @@ impl TxRxTask {
             };
 
         let mut meta = TxMetadata {
-            id: TxId(0),
+            id: TxId(slot as u32),
             segment_count: sqe.sgl().len().try_into().unwrap(),
             len: total_len.try_into().unwrap(),
             flags: net_backend::TxFlags::new()
@@ -1255,7 +1299,7 @@ impl TxRxTask {
                     sgl_count = sqe.sgl().len(),
                     "LSO enabled, but only one SGE"
                 );
-                self.post_tx_completion_error();
+                self.post_tx_completion_error(slot);
                 return Ok(());
             }
             if sge0.size > 256 {
@@ -1263,7 +1307,7 @@ impl TxRxTask {
                     sge0_size = sge0.size,
                     "LSO enabled and SGE[0] size > 256 bytes"
                 );
-                self.post_tx_completion_error();
+                self.post_tx_completion_error(slot);
                 return Ok(());
             }
         }
@@ -1285,13 +1329,15 @@ impl TxRxTask {
         let (sync, count) = self.epqueue.tx_avail(&mut self.pool, tx_segments)?;
         if sync || count == 0 {
             tracing::trace!("tx sync complete");
-            self.post_tx_completion();
+            self.post_tx_completion(slot);
         }
         Ok(())
     }
 
     // Possible test improvement: provide proper OOB data for the GDMA error.
-    fn post_tx_completion_error(&mut self) {
+    fn post_tx_completion_error(&mut self, slot: usize) {
+        let sq = &self.sqs[slot.min(self.sqs.len() - 1)];
+        let (sq_cq_id, sq_id) = (sq.sq_cq_id, sq.sq_id);
         let tx_oob = ManaTxCompOob {
             cqe_hdr: ManaCqeHeader::new()
                 .with_client_type(MANA_CQE_COMPLETION)
@@ -1301,10 +1347,12 @@ impl TxRxTask {
             reserved: [0; 12],
         };
         self.queues
-            .post_cq(self.sq_cq_id, tx_oob.as_bytes(), self.sq_id, true);
+            .post_cq(sq_cq_id, tx_oob.as_bytes(), sq_id, true);
     }
 
-    fn post_tx_completion(&mut self) {
+    fn post_tx_completion(&mut self, slot: usize) {
+        let sq = &self.sqs[slot.min(self.sqs.len() - 1)];
+        let (sq_cq_id, sq_id) = (sq.sq_cq_id, sq.sq_id);
         let tx_oob = ManaTxCompOob {
             cqe_hdr: ManaCqeHeader::new()
                 .with_client_type(MANA_CQE_COMPLETION)
@@ -1314,7 +1362,7 @@ impl TxRxTask {
             reserved: [0; 12],
         };
         self.queues
-            .post_cq(self.sq_cq_id, tx_oob.as_bytes(), self.sq_id, true);
+            .post_cq(sq_cq_id, tx_oob.as_bytes(), sq_id, true);
     }
 
     fn process_rqe(&mut self, wqe: Wqe, wqe_offset: u32) -> anyhow::Result<()> {
@@ -1361,7 +1409,7 @@ impl TxRxTask {
         let mut packets = [TxId(0)];
         if self.epqueue.tx_poll(&mut self.pool, &mut packets)? > 0 {
             tracing::trace!("tx async complete");
-            self.post_tx_completion();
+            self.post_tx_completion(packets[0].0 as usize);
         }
 
         Ok(())

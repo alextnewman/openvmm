@@ -885,9 +885,21 @@ impl BasicNic {
                 match req.rx_enable {
                     Tristate::FALSE => {
                         vport.stop_datapath().await;
+                        // The guest disabled vport receive: the port is going
+                        // down, so report link-down to the driver. (A pure RSS
+                        // reconfiguration cycles the datapath internally in the
+                        // arm below and keeps the port up -- it must not flap
+                        // the link.)
+                        state.post_vport_link_status(req.vport as u32, false);
                     }
                     Tristate::TRUE if vport.tasks.is_empty() => {
                         start_vport_datapath(vport, state, &req, &mut read).await?;
+                        // The vport is now fully configured and receiving. A
+                        // MANA link does not come up implicitly; the device
+                        // must signal it. Report link-up so the driver (the
+                        // Windows VF in particular) indicates media-connect and
+                        // the guest stack begins transmitting.
+                        state.post_vport_link_status(req.vport as u32, true);
                     }
                     _ => {
                         // Live RSS reconfiguration on an already-running vport.

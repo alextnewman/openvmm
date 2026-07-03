@@ -22,6 +22,7 @@ use self::bnic_defs::ManaSetVportSerialNo;
 use self::bnic_defs::ManaTxCompOob;
 use self::bnic_defs::ManaTxCompOobOffsets;
 use crate::VportConfig;
+use crate::bnic::bnic_defs::BasicNicDriverFlags;
 use crate::bnic::bnic_defs::CQE_RX_COALESCED_4;
 use crate::bnic::bnic_defs::CQE_RX_OKAY;
 use crate::bnic::bnic_defs::ManaCfgRxSteerReq;
@@ -660,7 +661,16 @@ impl BasicNic {
                     .context("reading query dev config request")?;
 
                 let resp = ManaQueryDeviceCfgResp {
-                    pf_cap_flags1: 0.into(),
+                    // Advertise MANA Direct: the emulated VF is presented as a
+                    // standalone directly-assigned NIC with no paired synthetic
+                    // (failover) partner. Without this the Windows MANA VF driver
+                    // stack enumerates the VF as the accelerated member of a
+                    // synthetic/VF failover pair and binds TCP/IP to the (absent)
+                    // synthetic NIC instead of the VF, so the guest brings the
+                    // datapath fully up yet never transmits. Linux ignores this
+                    // bit (it binds its VF unconditionally), so setting it is
+                    // safe for both guests.
+                    pf_cap_flags1: BasicNicDriverFlags::new().with_mana_direct(1),
                     pf_cap_flags2: 0,
                     pf_cap_flags3: 0,
                     pf_cap_flags4: 0,

@@ -93,7 +93,19 @@ pub struct BasicNicDriverFlags {
     pub ethertype_enforcement: u8,
     #[bits(1)]
     pub query_filter_state: u8,
-    #[bits(61)]
+    #[bits(1)]
+    reserved3: u8,
+    /// The device supports "MANA Direct": the VF presents networking straight to
+    /// the guest OS network stack, with no paired synthetic NIC to fail over to.
+    /// When set, the Windows MANA VF driver stack binds the guest TCP/IP stack
+    /// directly to the VF. When clear, it treats the VF as the accelerated
+    /// member of a synthetic/VF failover pair and does not bind TCP/IP to the VF
+    /// itself, so the guest configures the datapath but never transmits through
+    /// it. OpenVMM never pairs a synthetic NIC with the emulated MANA VF, so this
+    /// must be advertised for a Windows guest to bind and transmit.
+    #[bits(1)]
+    pub mana_direct: u8,
+    #[bits(59)]
     reserved: u64,
 }
 
@@ -160,6 +172,11 @@ impl ManaQueryDeviceCfgResp {
     }
     pub fn cap_filter_state_query(&self) -> bool {
         self.pf_cap_flags1.query_filter_state() != 0
+    }
+    /// Returns whether the device advertises MANA Direct (VF presents networking
+    /// directly to the guest OS, with no synthetic failover partner).
+    pub fn cap_mana_direct(&self) -> bool {
+        self.pf_cap_flags1.mana_direct() != 0
     }
     /// Returns the adapter link speed in bits per second.
     /// Falls back to a default of 200 Gbps when the hardware does not report

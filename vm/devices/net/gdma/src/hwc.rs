@@ -9,9 +9,11 @@ use crate::queues::QueueAllocError;
 use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
+use gdma_defs::EqeDataReconfig;
 use gdma_defs::GDMA_EQE_HWC_INIT_DATA;
 use gdma_defs::GDMA_EQE_HWC_INIT_DONE;
 use gdma_defs::GDMA_EQE_HWC_INIT_EQ_ID_DB;
+use gdma_defs::GDMA_EQE_HWC_RECONFIG_DATA;
 use gdma_defs::GDMA_EQE_HWC_RESET_REQUEST;
 use gdma_defs::GDMA_EQE_TEST_EVENT;
 use gdma_defs::GdmaChangeMsixVectorIndexForEq;
@@ -41,6 +43,8 @@ use gdma_defs::GdmaRequestType;
 use gdma_defs::GdmaRespHdr;
 use gdma_defs::GdmaVerifyVerReq;
 use gdma_defs::GdmaVerifyVerResp;
+use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT;
+use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT;
 use gdma_defs::HWC_DEV_ID;
 use gdma_defs::HWC_INIT_DATA_CQID;
 use gdma_defs::HWC_INIT_DATA_GPA_MKEY;
@@ -84,7 +88,6 @@ const BNIC_DEV_ID: GdmaDevId = GdmaDevId {
 
 pub struct HwControl {
     state: HwState,
-    _eq_id: u32,
     cq_id: u32,
     sq_id: u32,
     rq_id: u32,
@@ -98,7 +101,7 @@ impl InspectTaskMut<HwControl> for Devices {
         if let Some(hwc) = hwc {
             resp.child("hwc", |req| {
                 req.respond()
-                    .field("eq_id", hwc._eq_id)
+                    .field("eq_id", hwc.state.hwc_eq_id)
                     .field("cq_id", hwc.cq_id)
                     .field("sq_id", hwc.sq_id)
                     .field("rq_id", hwc.rq_id)
@@ -117,6 +120,10 @@ pub struct Devices {
 
 pub struct HwState {
     pub queues: Arc<Queues>,
+    /// The event queue created for the HW channel during HWC init. Async
+    /// device events that the driver's HW-channel EQE handler processes (for
+    /// example vport link-status changes) are posted here.
+    pub hwc_eq_id: u32,
     pub dma_regions: Slab<DmaRegionState>,
     /// Live protection-domain handles. A protection domain is a handle
     /// namespace for memory regions; the emulated data path addresses guest
@@ -165,6 +172,38 @@ impl HwState {
             .try_remove(gdma_region.wrapping_sub(1) as usize)
             .context("invalid gdma region")?;
         Ok(())
+    }
+
+    /// Post an asynchronous vport link-status event on the HW channel EQ.
+    ///
+    /// A MANA vport does not implicitly come up "link up": the device reports
+    /// the operational link state to the driver through a reconfig EQE on the
+    /// HW channel event queue. The Windows VF miniport waits for this event
+    /// before it indicates media-connect to NDIS, so until the device sends it
+    /// the guest network stack stays media-disconnected and transmits nothing
+    /// (no ARP/DHCP) even though the data path is fully configured. (The Linux
+    /// netdev driver is not sensitive to this because it marks the carrier up
+    /// unconditionally at probe and treats the reconfig event as supplementary.)
+    /// Report link-up when the guest enables vport receive, link-down when it
+    /// disables it. The event names the affected vport by index in its 24-bit
+    /// value field.
+    pub fn post_vport_link_status(&self, vport_index: u32, connected: bool) {
+        let data_type = if connected {
+            HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT
+        } else {
+            HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT
+        };
+        let value = vport_index.to_le_bytes();
+        self.queues.post_eq(
+            self.hwc_eq_id,
+            GDMA_EQE_HWC_RECONFIG_DATA,
+            EqeDataReconfig {
+                data: [value[0], value[1], value[2]],
+                data_type,
+                reserved1: [0; 8],
+            }
+            .as_bytes(),
+        );
     }
 }
 
@@ -226,11 +265,11 @@ impl HwControl {
         Ok(Self {
             state: HwState {
                 queues,
+                hwc_eq_id: eq_id,
                 dma_regions: Slab::new(),
                 pds: Slab::new(),
                 mrs: Slab::new(),
             },
-            _eq_id: eq_id,
             cq_id,
             sq_id,
             rq_id,

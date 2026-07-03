@@ -235,6 +235,205 @@ async fn test_gdma(driver: DefaultDriver) {
     arena.destroy(&mut gdma).await;
 }
 
+/// A MANA vport does not implicitly report its link as up: the device signals
+/// the operational link state through an asynchronous reconfig EQE
+/// (`GDMA_EQE_HWC_RECONFIG_DATA` carrying `HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT`
+/// / `..._DISCONNECT`) on the HW channel event queue when the guest enables
+/// (link-up) or disables (link-down) vport receive. The Windows VF miniport
+/// waits for this event before it indicates media-connect to NDIS, so without
+/// it a fully configured data path still carries no traffic -- the guest
+/// network stack considers the media disconnected and transmits nothing (no
+/// ARP/DHCP). (The Linux netdev driver marks the carrier up unconditionally at
+/// probe and treats the event as supplementary, so it never exercised this
+/// gap.) Regression test that enabling vport receive posts link-up and
+/// disabling it posts link-down, both naming vport 0.
+#[async_test]
+async fn test_gdma_vport_link_status(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let _dev_config = bnic.query_dev_config().await.unwrap();
+    let port_config = bnic.query_vport_config(0).await.unwrap();
+    let vport = port_config.vport;
+    let buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(0x5000)
+            .unwrap(),
+    );
+    let mut arena = ResourceArena::new();
+    let eq_gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+    let rq_gdma_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(PAGE_SIZE, PAGE_SIZE))
+        .await
+        .unwrap();
+    let rq_cq_gdma_region = gdma
+        .create_dma_region(
+            &mut arena,
+            dev_id,
+            buffer.subblock(2 * PAGE_SIZE, PAGE_SIZE),
+        )
+        .await
+        .unwrap();
+    let sq_gdma_region = gdma
+        .create_dma_region(
+            &mut arena,
+            dev_id,
+            buffer.subblock(3 * PAGE_SIZE, PAGE_SIZE),
+        )
+        .await
+        .unwrap();
+    let sq_cq_gdma_region = gdma
+        .create_dma_region(
+            &mut arena,
+            dev_id,
+            buffer.subblock(4 * PAGE_SIZE, PAGE_SIZE),
+        )
+        .await
+        .unwrap();
+    let (eq_id, _) = gdma
+        .create_eq(
+            &mut arena,
+            dev_id,
+            eq_gdma_region,
+            PAGE_SIZE as u32,
+            device_props.pdid,
+            device_props.db_id,
+            0,
+        )
+        .await
+        .unwrap();
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let _rq_cfg = bnic
+        .create_wq_obj(
+            &mut arena,
+            vport,
+            GdmaQueueType::GDMA_RQ,
+            &WqConfig {
+                wq_gdma_region: rq_gdma_region,
+                cq_gdma_region: rq_cq_gdma_region,
+                wq_size: PAGE_SIZE as u32,
+                cq_size: PAGE_SIZE as u32,
+                cq_moderation_ctx_id: 0,
+                eq_id,
+            },
+        )
+        .await
+        .unwrap();
+    let _sq_cfg = bnic
+        .create_wq_obj(
+            &mut arena,
+            vport,
+            GdmaQueueType::GDMA_SQ,
+            &WqConfig {
+                wq_gdma_region: sq_gdma_region,
+                cq_gdma_region: sq_cq_gdma_region,
+                wq_size: PAGE_SIZE as u32,
+                cq_size: PAGE_SIZE as u32,
+                cq_moderation_ctx_id: 0,
+                eq_id,
+            },
+        )
+        .await
+        .unwrap();
+    bnic.config_vport_tx(vport, 0, 0).await.unwrap();
+
+    // No link status has been signaled before the receive path is enabled.
+    gdma.process_all_eqs();
+    assert!(
+        gdma.get_link_toggle_list().is_empty(),
+        "no link status should be reported before vport receive is enabled"
+    );
+
+    // Enabling vport receive brings the port up: the device must report
+    // link-up on the HW channel EQ so the driver marks the media connected.
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    bnic.config_vport_rx(
+        vport,
+        &RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: None,
+            cqe_coalescing: false,
+        },
+    )
+    .await
+    .unwrap();
+    // The link event is posted on the HW channel EQ while the config request is
+    // serviced, but the request completes via the CQ, which does not necessarily
+    // drain the EQ. Force a full EQ drain by issuing a test event and waiting for
+    // it: the test EQE is posted after the link EQE, so draining up to it must
+    // first pop and record the link event -- making the observation deterministic
+    // regardless of executor scheduling (in production the posted MSI-X wakes the
+    // driver to drain the EQ instead).
+    gdma.test_eq().await.unwrap();
+    assert_eq!(
+        gdma.get_link_toggle_list(),
+        vec![(vport as u32, true)],
+        "enabling vport receive must post a link-up event naming the vport"
+    );
+
+    // Disabling vport receive takes the port down: the device must report
+    // link-down. A pure RSS reconfiguration (not exercised here) cycles the
+    // datapath internally and must NOT flap the link.
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    bnic.config_vport_rx(
+        vport,
+        &RxConfig {
+            rx_enable: Some(false),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: None,
+            cqe_coalescing: false,
+        },
+    )
+    .await
+    .unwrap();
+    gdma.test_eq().await.unwrap();
+    assert_eq!(
+        gdma.get_link_toggle_list(),
+        vec![(vport as u32, false)],
+        "disabling vport receive must post a link-down event naming the vport"
+    );
+
+    arena.destroy(&mut gdma).await;
+}
+
 /// A virtual-function driver may issue MANA device commands as soon as the
 /// hardware channel is up, without first sending `GDMA_REGISTER_DEVICE`. The
 /// MANA client is provisioned by the HWC init handshake -- the init EQE carries

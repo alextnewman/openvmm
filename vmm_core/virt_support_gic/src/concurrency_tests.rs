@@ -295,6 +295,110 @@ mod smoke {
 }
 
 // =============================================================================
+// GICD_IROUTER (SPI affinity) delivery.
+//
+// A PCIe MSI-X vector arrives at the software GIC as a GICv2m SPI assertion
+// (`set_spi_irq` -> `Distributor::set_pending`). The guest binds each vector to
+// a CPU by programming `GICD_IROUTER<n>`; the distributor MUST deliver the SPI
+// only to that PE. The prior model hardwired every SPI to PE 0, so a vector
+// bound to a non-zero CPU never fired there — which the Linux MANA driver
+// tolerates (it services EQs on any CPU) but the Windows MANA VF driver does
+// NOT: it issues a per-vector test EQE and tears the device down if the
+// interrupt lands on the wrong CPU. These tests pin the affinity contract.
+// =============================================================================
+#[cfg(test)]
+mod irouter {
+    use super::*;
+
+    // GICD_IROUTER<n> is a 64-bit affinity-routing register at 0x6000 + 8*n.
+    const GICD_IROUTER: u64 = 0x6000;
+
+    /// Program `GICD_IROUTER<intid>` to target the PE whose Aff0 == `cpu` (this
+    /// harness's flat topology puts every PE at Aff1/Aff2/Aff3 == 0, IRM = 0 so
+    /// the route is a specific PE, not 1-of-N).
+    fn route_spi_to(sys: &Sys, intid: u32, cpu: u8) {
+        let route = u64::from(cpu);
+        sys.dist
+            .write(GICD_IROUTER + u64::from(intid) * 8, &route.to_ne_bytes());
+    }
+
+    /// An SPI whose `GICD_IROUTER` targets PE 1 is delivered to PE 1 only — not
+    /// PE 0 — and only PE 1 can acknowledge and complete it.
+    #[test]
+    fn spi_routed_to_nonzero_pe_delivers_there_only() {
+        let mut sys = Sys::new(2, 96);
+        sys.online_all();
+
+        // Bind SPI 40 to PE 1, provision it, and raise it the way a GICv2m MSI
+        // assertion does (direct `set_pending`, not an ISPENDR MMIO write).
+        route_spi_to(&sys, 40, 1);
+        sys.provision_spi(40, 0x40);
+        let target = sys.dist.set_pending(40, true);
+
+        assert_eq!(target, Some(1), "set_pending resolves IROUTER -> PE 1");
+        assert!(sys.pending(1), "PE 1 (the routed target) sees the SPI");
+        assert!(!sys.pending(0), "PE 0 must NOT see an SPI routed to PE 1");
+
+        // Only PE 1 can acknowledge it; PE 0 has nothing (spurious 1023).
+        assert_eq!(sys.ack1(0), 1023, "PE 0 has nothing to ack");
+        assert_eq!(sys.ack1(1), 40, "PE 1 acks the routed SPI");
+        assert!(
+            sys.spi_active_word(1) & (1 << (40 % 32)) != 0,
+            "SPI 40 active after ack"
+        );
+
+        // PE 1 completes it; the distributor's active bit clears.
+        sys.eoi1(1, 40);
+        assert!(
+            sys.spi_active_word(1) & (1 << (40 % 32)) == 0,
+            "EOI on the routed PE drains SPI 40"
+        );
+        assert!(!sys.pending(1));
+    }
+
+    /// Re-targeting an SPI's `GICD_IROUTER` (a guest moving the vector's CPU
+    /// affinity) moves subsequent delivery to the new PE.
+    #[test]
+    fn spi_reroute_moves_delivery() {
+        let mut sys = Sys::new(2, 96);
+        sys.online_all();
+        sys.provision_spi(45, 0x40);
+
+        route_spi_to(&sys, 45, 0);
+        assert_eq!(sys.dist.set_pending(45, true), Some(0));
+        assert!(sys.pending(0) && !sys.pending(1), "first target is PE 0");
+        assert_eq!(sys.ack1(0), 45);
+        sys.eoi1(0, 45);
+
+        route_spi_to(&sys, 45, 1);
+        assert_eq!(sys.dist.set_pending(45, true), Some(1));
+        assert!(sys.pending(1) && !sys.pending(0), "re-routed to PE 1");
+        assert_eq!(sys.ack1(1), 45);
+        sys.eoi1(1, 45);
+        assert!(!sys.pending(0) && !sys.pending(1));
+    }
+
+    /// An unprogrammed `GICD_IROUTER` (route == 0) resolves to PE 0, preserving
+    /// the historical default so a guest that never sets affinity is unaffected.
+    #[test]
+    fn spi_unrouted_defaults_to_pe0() {
+        let mut sys = Sys::new(2, 96);
+        sys.online_all();
+        sys.provision_spi(50, 0x40);
+
+        assert_eq!(
+            sys.dist.set_pending(50, true),
+            Some(0),
+            "unprogrammed IROUTER defaults to PE 0"
+        );
+        assert!(sys.pending(0) && !sys.pending(1));
+        assert_eq!(sys.ack1(1), 1023, "PE 1 sees nothing");
+        assert_eq!(sys.ack1(0), 50);
+        sys.eoi1(0, 50);
+    }
+}
+
+// =============================================================================
 // Independent reference model.
 //
 // A small, deliberately-simple, single-threaded implementation of the GICv3

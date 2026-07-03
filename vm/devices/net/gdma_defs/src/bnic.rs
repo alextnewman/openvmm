@@ -84,17 +84,29 @@ pub const MANA_VTL2_QUERY_FILTER_STATE_RESPONSE_V1: u16 = 1;
 /// link-speed surfaces agree and the guest never observes an unknown/zero speed.
 pub const MANA_DEFAULT_LINK_SPEED_MBPS: u32 = 200_000;
 
+/// The set of device (PF) capability bits reported in `pf_cap_flags1` of the
+/// `MANA_QUERY_DEV_CONFIG` response. A production MANA device advertises the
+/// whole feature set below; a Windows MANA VF driver expects a fully-featured
+/// ("legal") device and can take degraded paths when only a subset is present,
+/// so the emulator advertises the complete set (see [`BasicNicDriverFlags::all_supported`]).
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct BasicNicDriverFlags {
+    /// The device supports querying operational link status.
     #[bits(1)]
     pub query_link_status: u8,
+    /// The device enforces the per-vport EtherType allow-list. When set, the
+    /// guest treats receive filtering as EtherType-aware rather than
+    /// allow-all.
     #[bits(1)]
     pub ethertype_enforcement: u8,
+    /// The device supports querying the receive-filter state of a vport.
     #[bits(1)]
     pub query_filter_state: u8,
+    /// The device implements the asynchronous doorbell fix and therefore
+    /// accepts the newer group-configuration request form.
     #[bits(1)]
-    reserved3: u8,
+    pub async_doorbell_fix: u8,
     /// The device supports "MANA Direct": the VF presents networking straight to
     /// the guest OS network stack, with no paired synthetic NIC to fail over to.
     /// When set, the Windows MANA VF driver stack binds the guest TCP/IP stack
@@ -107,6 +119,22 @@ pub struct BasicNicDriverFlags {
     pub mana_direct: u8,
     #[bits(59)]
     reserved: u64,
+}
+
+impl BasicNicDriverFlags {
+    /// Returns the full set of capability bits a fully-featured MANA device
+    /// advertises: every supported feature plus MANA Direct. Presenting the
+    /// complete ("legal") capability set keeps the Windows MANA VF driver on its
+    /// normal directly-assigned datapath instead of a degraded/sparse-device
+    /// fallback path.
+    pub fn all_supported() -> Self {
+        Self::new()
+            .with_query_link_status(1)
+            .with_ethertype_enforcement(1)
+            .with_query_filter_state(1)
+            .with_async_doorbell_fix(1)
+            .with_mana_direct(1)
+    }
 }
 
 #[repr(C)]

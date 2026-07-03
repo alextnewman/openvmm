@@ -123,6 +123,14 @@ impl<T: Client> Access<'_, T> {
             src_port: DHCP_SERVER,
             dst_port: DHCP_CLIENT,
         };
+        // RFC 1542 2.1: a BOOTP/DHCP message is a minimum of 300 octets. Real
+        // DHCP servers pad the options with PAD (0) bytes to reach this floor;
+        // the Windows DHCP client drops shorter replies, while Linux's dhclient
+        // accepts them (which is why a bare smoltcp-sized reply worked on Linux
+        // but stalled Windows). `resp_buffer` is zero-initialized, so extending
+        // the emitted DHCP length past the message's own end pads with PAD bytes.
+        const BOOTP_MIN_MSG_LEN: usize = 300;
+        let dhcp_msg_len = resp_dhcp.buffer_len().max(BOOTP_MIN_MSG_LEN);
         // RFC 2131 4.1: keep the layer-2 and layer-3 destinations consistent and
         // honor the client's broadcast flag. When the flag is clear the client can
         // receive a unicast reply before it has bound an address, so unicast the
@@ -140,7 +148,7 @@ impl<T: Client> Access<'_, T> {
             src_addr: self.inner.state.params.gateway_ip,
             dst_addr: resp_ip_dst,
             next_header: IpProtocol::Udp,
-            payload_len: resp_udp.header_len() + resp_dhcp.buffer_len(),
+            payload_len: resp_udp.header_len() + dhcp_msg_len,
             hop_limit: 64,
         };
         let resp_eth = EthernetRepr {
@@ -159,7 +167,7 @@ impl<T: Client> Access<'_, T> {
             &mut resp_udp_packet,
             &IpAddress::Ipv4(resp_ipv4.src_addr),
             &IpAddress::Ipv4(resp_ipv4.dst_addr),
-            resp_dhcp.buffer_len(),
+            dhcp_msg_len,
             |udp_payload| {
                 let mut resp_dhcp_packet = DhcpPacket::new_unchecked(udp_payload);
                 resp_dhcp.emit(&mut resp_dhcp_packet).unwrap();
@@ -171,7 +179,7 @@ impl<T: Client> Access<'_, T> {
             &resp_buffer[..resp_eth.buffer_len()
                 + resp_ipv4.buffer_len()
                 + resp_udp.header_len()
-                + resp_dhcp.buffer_len()],
+                + dhcp_msg_len],
             // DHCP is UDP: consomme emits a correct UDP checksum above, so deliver
             // with the UDP checksum marked verified (like every other UDP path).
             // Marking only the IPv4 checksum (l4_protocol=Unknown) is what a real
@@ -306,6 +314,7 @@ mod tests {
         checksum: ChecksumState,
         client_mac: EthernetAddress,
         client_ip: Ipv4Address,
+        dhcp_msg_len: usize,
     }
 
     /// Sends a DISCOVER with the given broadcast flag and returns the decoded
@@ -338,6 +347,7 @@ mod tests {
             let udp = UdpPacket::new_checked(ipv4.payload()).expect("udp");
             assert_eq!(udp.src_port(), super::DHCP_SERVER);
             assert_eq!(udp.dst_port(), super::DHCP_CLIENT);
+            let dhcp_msg_len = udp.payload().len();
             let dhcp_packet = DhcpPacket::new_checked(udp.payload()).expect("dhcp");
             let dhcp = DhcpRepr::parse(&dhcp_packet).expect("dhcp repr");
             assert_eq!(dhcp.message_type, DhcpMessageType::Offer);
@@ -349,6 +359,7 @@ mod tests {
                 checksum: *checksum,
                 client_mac,
                 client_ip,
+                dhcp_msg_len,
             }
         })
     }
@@ -383,6 +394,22 @@ mod tests {
         assert!(
             offer.checksum.ipv4 && offer.checksum.udp && !offer.checksum.tcp,
             "UDP4 checksum"
+        );
+    }
+
+    // RFC 1542 2.1: every reply must carry a BOOTP/DHCP message of at least 300
+    // octets. The Windows DHCP client drops shorter replies (a smoltcp-emitted
+    // OFFER is only ~274 bytes), which stalled DHCP for the Windows guest while
+    // Linux's dhclient accepted the short message.
+    #[test]
+    fn offer_meets_bootp_minimum_length() {
+        assert!(
+            offer_for(true).dhcp_msg_len >= 300,
+            "OFFER DHCP message must be padded to the 300-octet BOOTP minimum"
+        );
+        assert!(
+            offer_for(false).dhcp_msg_len >= 300,
+            "OFFER DHCP message must be padded to the 300-octet BOOTP minimum"
         );
     }
 }

@@ -129,15 +129,46 @@ mod gicd {
             }
         }
 
+        /// Resolves a `GICD_IROUTER<n>` value to the index of the redistributor
+        /// (PE) that should receive the SPI. `IRM=1` (1-of-N routing) delivers to
+        /// a single deterministic PE (index 0); otherwise the affinity fields
+        /// (Aff3.Aff2.Aff1.Aff0) select the redistributor whose MPIDR matches. An
+        /// affinity that matches no redistributor falls back to PE 0 so an
+        /// interrupt is never dropped.
+        fn route_to_pe(&self, route: u64) -> u32 {
+            const IRM: u64 = 1 << 31;
+            if route & IRM != 0 {
+                return 0;
+            }
+            let aff0 = (route & 0xff) as u8;
+            let aff1 = ((route >> 8) & 0xff) as u8;
+            let aff2 = ((route >> 16) & 0xff) as u8;
+            let aff3 = ((route >> 32) & 0xff) as u8;
+            self.gicr
+                .iter()
+                .position(|g| {
+                    g.mpidr.aff0() == aff0
+                        && g.mpidr.aff1() == aff1
+                        && g.mpidr.aff2() == aff2
+                        && g.mpidr.aff3() == aff3
+                })
+                .unwrap_or(0) as u32
+        }
+
         pub fn set_pending(&self, intid: u32, pending: bool) -> Option<u32> {
-            let v = &mut self.state.lock().pending[intid as usize / 32];
+            let mut state = self.state.lock();
+            let v = &mut state.pending[intid as usize / 32];
             let mask = 1 << (intid & 31);
             if (*v & mask != 0) != pending {
                 tracing::debug!(intid, pending, "set pending");
             }
             if pending {
                 *v |= mask;
-                Some(0)
+                // Resolve the SPI's target PE from GICD_IROUTER so the caller
+                // notifies the correct redistributor (not always PE 0).
+                let route = state.route.get(intid as usize).copied().unwrap_or(0);
+                drop(state);
+                Some(self.route_to_pe(route))
             } else {
                 *v &= !mask;
                 None
@@ -145,17 +176,14 @@ mod gicd {
         }
 
         pub fn irq_pending(&self, gicr: &Redistributor) -> bool {
-            if gicr.index != 0 {
-                // Non-zero PEs see only their own SGI/PPIs.
-                return gicr.irq_pending();
-            }
             self.select(gicr, true).is_some()
         }
 
         /// The globally highest-priority Group-`group1` interrupt deliverable to
         /// this PE right now: the best SGI/PPI on its redistributor combined with
-        /// the best SPI on the distributor (PE 0 only), then gated by this PE's
-        /// PMR and preemption state. Returns `(intid, group_priority)`.
+        /// the best SPI on the distributor that is *routed to this PE*
+        /// (GICD_IROUTER), then gated by this PE's PMR and preemption state.
+        /// Returns `(intid, group_priority)`.
         ///
         /// Checking only the single best candidate is sufficient: if the
         /// highest-priority pending interrupt cannot pass PMR/preemption, none of
@@ -163,32 +191,34 @@ mod gicd {
         /// taken in turn, never simultaneously (matching the existing pattern).
         fn select(&self, gicr: &Redistributor, group1: bool) -> Option<(u32, u8)> {
             let mut cand = gicr.best_candidate(group1);
-            if gicr.index == 0 {
-                if let Some(spi) = self.best_spi(group1) {
-                    // Lowest priority byte wins; ties keep the lower intid (the
-                    // SGI/PPI, which is numerically below any SPI).
-                    cand = Some(match cand {
-                        Some((i, p)) if p <= spi.1 => (i, p),
-                        _ => spi,
-                    });
-                }
+            if let Some(spi) = self.best_spi(gicr.index, group1) {
+                // Lowest priority byte wins; ties keep the lower intid (the
+                // SGI/PPI, which is numerically below any SPI).
+                cand = Some(match cand {
+                    Some((i, p)) if p <= spi.1 => (i, p),
+                    _ => spi,
+                });
             }
             let (intid, pri) = cand?;
             let gp = gicr.admit(group1, pri)?;
             Some((intid, gp))
         }
 
-        /// The best deliverable Group-`group1` SPI: pending, inactive, enabled,
-        /// of the matching group, with the lowest priority byte (ties → lowest
-        /// intid). Word 0 is the per-redistributor SGI/PPI range, so the scan
-        /// starts at intid 32.
-        fn best_spi(&self, group1: bool) -> Option<(u32, u8)> {
+        /// The best deliverable Group-`group1` SPI *routed to PE `pe`*: pending,
+        /// inactive, enabled, of the matching group, with its GICD_IROUTER target
+        /// resolving to `pe`, and the lowest priority byte (ties → lowest intid).
+        /// Word 0 is the per-redistributor SGI/PPI range, so the scan starts at
+        /// intid 32.
+        fn best_spi(&self, pe: usize, group1: bool) -> Option<(u32, u8)> {
             let state = self.state.lock();
             let mut best: Option<(u32, u8)> = None;
             for w in 1..state.pending.len() {
-                let group = if group1 { state.group[w] } else { !state.group[w] };
-                let mut deliverable =
-                    state.pending[w] & !state.active[w] & state.enable[w] & group;
+                let group = if group1 {
+                    state.group[w]
+                } else {
+                    !state.group[w]
+                };
+                let mut deliverable = state.pending[w] & !state.active[w] & state.enable[w] & group;
                 while deliverable != 0 {
                     let bit = deliverable.trailing_zeros();
                     deliverable &= deliverable - 1;
@@ -196,8 +226,11 @@ mod gicd {
                     if intid > self.max_spi_intid {
                         continue;
                     }
-                    let pri =
-                        state.priority[intid as usize / 4].to_ne_bytes()[intid as usize % 4];
+                    let route = state.route.get(intid as usize).copied().unwrap_or(0);
+                    if self.route_to_pe(route) != pe as u32 {
+                        continue;
+                    }
+                    let pri = state.priority[intid as usize / 4].to_ne_bytes()[intid as usize % 4];
                     best = Some(match best {
                         Some((bi, bp)) if bp <= pri => (bi, bp),
                         _ => (intid, pri),
@@ -208,10 +241,6 @@ mod gicd {
         }
 
         pub fn ack(&self, gicr: &mut Redistributor, group1: bool) -> u32 {
-            if gicr.index != 0 {
-                // Non-zero PEs acknowledge only their own SGI/PPIs.
-                return gicr.ack(group1).unwrap_or(1023);
-            }
             let Some((intid, gp)) = self.select(gicr, group1) else {
                 return 1023;
             };
@@ -287,11 +316,22 @@ mod gicd {
                 gicr.eoi(group1, intid);
                 return;
             }
-            if gicr.index != 0 {
+            // SPI: only the PE the interrupt is routed to (GICD_IROUTER) — the PE
+            // that acknowledged it — performs the priority-drop and deactivation.
+            // For an unprogrammed route this resolves to PE 0, matching the prior
+            // PE-0-only behavior.
+            let route = self
+                .state
+                .lock()
+                .route
+                .get(intid as usize)
+                .copied()
+                .unwrap_or(0);
+            if self.route_to_pe(route) != gicr.index as u32 {
                 return;
             }
-            // SPI: priority-drop on the acknowledging PE (PE 0), then deactivate
-            // the distributor's active bit. We deactivate on EOIR regardless of
+            // Priority-drop on the acknowledging PE, then deactivate the
+            // distributor's active bit. We deactivate on EOIR regardless of
             // EOImode for now (matching the historical, Linux-validated
             // behavior); the EOImode=1 split deactivate via ICC_DIR is a O3
             // follow-up.
@@ -1335,6 +1375,7 @@ mod gicr {
             self.shared.mutable.lock().active &= !(1 << intid);
         }
 
+        #[cfg(test)]
         pub(crate) fn irq_pending(&self) -> bool {
             match self.best_candidate(true) {
                 Some((_, pri)) => self.admit(true, pri).is_some(),
@@ -1372,6 +1413,7 @@ mod gicr {
             }
         }
 
+        #[cfg(test)]
         pub(crate) fn ack(&mut self, group1: bool) -> Option<u32> {
             let (intid, pri) = self.best_candidate(group1)?;
             let gp = self.admit(group1, pri)?;

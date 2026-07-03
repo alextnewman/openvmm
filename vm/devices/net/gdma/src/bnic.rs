@@ -661,16 +661,21 @@ impl BasicNic {
                     .context("reading query dev config request")?;
 
                 let resp = ManaQueryDeviceCfgResp {
-                    // Advertise MANA Direct: the emulated VF is presented as a
+                    // Advertise the full device capability set, so the emulated
+                    // VF looks like a fully-featured ("legal") MANA Direct device
+                    // rather than a sparse one. MANA Direct presents the VF as a
                     // standalone directly-assigned NIC with no paired synthetic
-                    // (failover) partner. Without this the Windows MANA VF driver
+                    // (failover) partner; without it the Windows MANA VF driver
                     // stack enumerates the VF as the accelerated member of a
                     // synthetic/VF failover pair and binds TCP/IP to the (absent)
                     // synthetic NIC instead of the VF, so the guest brings the
-                    // datapath fully up yet never transmits. Linux ignores this
-                    // bit (it binds its VF unconditionally), so setting it is
-                    // safe for both guests.
-                    pf_cap_flags1: BasicNicDriverFlags::new().with_mana_direct(1),
+                    // datapath up yet never transmits. The remaining capability
+                    // bits keep the Windows VF on its normal directly-assigned
+                    // datapath instead of a degraded fallback that assumes a
+                    // richer host contract. Linux only consults per-feature bits
+                    // it needs and ignores the rest, so advertising the full set
+                    // is safe for both guests.
+                    pf_cap_flags1: BasicNicDriverFlags::all_supported(),
                     pf_cap_flags2: 0,
                     pf_cap_flags3: 0,
                     pf_cap_flags4: 0,

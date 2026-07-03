@@ -1208,6 +1208,37 @@ async fn test_gdma_advertises_mana_direct(driver: DefaultDriver) {
         u64::from(dev_config.pf_cap_flags1)
     );
     assert_eq!(dev_config.pf_cap_flags1.mana_direct(), 1);
+
+    // The emulated device must present the *full* capability set (a "legal"
+    // MANA Direct device), not just the MANA Direct bit, so the Windows VF
+    // driver stays on its normal directly-assigned datapath rather than a
+    // degraded/sparse-device fallback path.
+    let flags = dev_config.pf_cap_flags1;
+    assert_eq!(
+        flags.query_link_status(),
+        1,
+        "query_link_status must be set"
+    );
+    assert_eq!(
+        flags.ethertype_enforcement(),
+        1,
+        "ethertype_enforcement must be set"
+    );
+    assert_eq!(
+        flags.query_filter_state(),
+        1,
+        "query_filter_state must be set"
+    );
+    assert_eq!(
+        flags.async_doorbell_fix(),
+        1,
+        "async_doorbell_fix must be set"
+    );
+    assert_eq!(
+        u64::from(flags),
+        u64::from(gdma_defs::bnic::BasicNicDriverFlags::all_supported()),
+        "device must advertise the full legal capability set"
+    );
 }
 
 /// Configures the emulated GDMA device with a specific non-zero link speed

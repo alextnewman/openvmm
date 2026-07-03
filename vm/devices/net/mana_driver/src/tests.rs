@@ -1159,6 +1159,57 @@ async fn test_adapter_link_speed_default(driver: DefaultDriver) {
     );
 }
 
+/// The emulated device must advertise the "MANA Direct" capability in
+/// `MANA_QUERY_DEV_CONFIG` so that a Windows MANA VF driver binds the guest
+/// TCP/IP stack directly to the VF instead of treating it as the accelerated
+/// member of a synthetic/VF failover pair. OpenVMM never pairs a synthetic NIC
+/// with the emulated VF, so without this the Windows guest configures the
+/// datapath but never transmits.
+#[async_test]
+async fn test_gdma_advertises_mana_direct(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_advertises_mana_direct");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let dev_config = bnic.query_dev_config().await.unwrap();
+
+    assert!(
+        dev_config.cap_mana_direct(),
+        "device must advertise MANA Direct (pf_cap_flags1 = {:#x})",
+        u64::from(dev_config.pf_cap_flags1)
+    );
+    assert_eq!(dev_config.pf_cap_flags1.mana_direct(), 1);
+}
+
 /// Configures the emulated GDMA device with a specific non-zero link speed
 /// via `BnicConfig`, then verifies that `query_dev_config` returns that speed
 /// and `link_speed_bps()` converts it correctly.

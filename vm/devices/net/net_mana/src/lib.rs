@@ -681,6 +681,7 @@ struct QueueStats {
 
     tx_packets_coalesced: Counter,
     rx_packets_coalesced: Counter,
+    rx_packets_hashed: Counter,
 }
 
 impl<T: DeviceBacking> InspectMut for ManaQueue<T> {
@@ -1037,6 +1038,13 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
 
                     let coalesced = cqe_type == CQE_RX_COALESCED_4;
 
+                    // The RSS hash type is carried once in the OOB flags and
+                    // applies to every packet in a coalesced batch. Count the
+                    // packets the device hashed so the offload is observable
+                    // (e.g. via `ethtool`-style inspection); mirrors the way the
+                    // Linux driver reads the same field to steer receives.
+                    let hashed = rx_oob.flags.rx_hashtype() != 0;
+
                     // A coalesced CQE describes up to MANA_RXCOMP_OOB_NUM_PPI
                     // packets, each consuming one posted receive buffer in order;
                     // a zero length terminates the batch. CQE_RX_OKAY is the
@@ -1068,6 +1076,9 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                             pool.write_data(rx.id, &data);
                         }
                         self.stats.rx_packets.increment();
+                        if hashed {
+                            self.stats.rx_packets_hashed.increment();
+                        }
                         if coalesced {
                             self.stats.rx_packets_coalesced.increment();
                         }

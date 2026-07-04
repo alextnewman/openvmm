@@ -558,6 +558,31 @@ pub struct ManaRxcompOobFlags {
     pub reserved2: bool,
 }
 
+// Receive-side RSS hash-type codes reported in
+// [`ManaRxcompOobFlags::rx_hashtype`]. A value of zero means the device did not
+// compute a hash for the packet. These are the device's own hash-type codes:
+// they match the Linux MANA driver's `NDIS_HASH_*` values (`BIT(0)`..`BIT(8)`
+// in `include/net/mana/mana.h`), which the driver reads directly out of the
+// receive completion OOB and classifies via `MANA_HASH_L3` / `MANA_HASH_L4`.
+/// RSS hash computed over the IPv4 source and destination addresses.
+pub const MANA_HASH_IPV4: u16 = 1 << 0;
+/// RSS hash computed over the IPv4 4-tuple (addresses + TCP ports).
+pub const MANA_HASH_TCP_IPV4: u16 = 1 << 1;
+/// RSS hash computed over the IPv4 4-tuple (addresses + UDP ports).
+pub const MANA_HASH_UDP_IPV4: u16 = 1 << 2;
+/// RSS hash computed over the IPv6 source and destination addresses.
+pub const MANA_HASH_IPV6: u16 = 1 << 3;
+/// RSS hash computed over the IPv6 4-tuple (addresses + TCP ports).
+pub const MANA_HASH_TCP_IPV6: u16 = 1 << 4;
+/// RSS hash computed over the IPv6 4-tuple (addresses + UDP ports).
+pub const MANA_HASH_UDP_IPV6: u16 = 1 << 5;
+/// RSS hash computed over the IPv6 addresses including extension headers.
+pub const MANA_HASH_IPV6_EX: u16 = 1 << 6;
+/// RSS hash computed over the IPv6 TCP 4-tuple including extension headers.
+pub const MANA_HASH_TCP_IPV6_EX: u16 = 1 << 7;
+/// RSS hash computed over the IPv6 UDP 4-tuple including extension headers.
+pub const MANA_HASH_UDP_IPV6_EX: u16 = 1 << 8;
+
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct ManaTxShortOob {

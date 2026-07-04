@@ -9,6 +9,7 @@ mod dma;
 mod hwc;
 mod queues;
 pub mod resolver;
+mod rss;
 
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;

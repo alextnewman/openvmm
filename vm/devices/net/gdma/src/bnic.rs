@@ -40,6 +40,8 @@ use crate::bnic::bnic_defs::ManaQueryVportCfgResp;
 use crate::bnic::bnic_defs::ManaTxOob;
 use crate::hwc::HwState;
 use crate::queues::Queues;
+use crate::rss::MANA_HASH_KEY_SIZE;
+use crate::rss::compute_rx_hash;
 use anyhow::Context;
 use anyhow::anyhow;
 use futures::FutureExt;
@@ -172,6 +174,11 @@ const MANA_RX_CQE_COALESCING_TIMEOUT_NS: u32 = 2048;
 pub struct GuestBuffers {
     gm: GuestMemory,
     rx_packets: Slab<RxPacket>,
+    /// The RSS hash key programmed by the guest via `MANA_CONFIG_VPORT_RX`, set
+    /// when the vport has receive-side hashing enabled. When present, the device
+    /// computes a Toeplitz hash over each received packet's flow tuple and
+    /// reports it in the completion OOB (`rx_hashtype` + `pkt_hash`).
+    rss_key: Option<[u8; MANA_HASH_KEY_SIZE]>,
 }
 
 struct RxPacket {
@@ -179,6 +186,9 @@ struct RxPacket {
     len: u32,
     wqe_offset: u32,
     oob: ManaRxcompOob,
+    /// The `(rx_hashtype, pkt_hash)` computed for this packet when RSS hashing
+    /// is enabled, applied to the completion OOB by `write_header`.
+    hash: Option<(u16, u32)>,
 }
 
 impl BufferAccess for GuestBuffers {
@@ -187,6 +197,12 @@ impl BufferAccess for GuestBuffers {
     }
 
     fn write_data(&mut self, id: RxId, mut data: &[u8]) {
+        // Compute the RSS hash over the full packet before it is scattered
+        // across the receive buffer segments below. `data` is the entire packet
+        // at entry; the loop then splits it across the guest's SGL.
+        if let Some(key) = self.rss_key {
+            self.rx_packets[id.0 as usize].hash = compute_rx_hash(data, &key);
+        }
         let mut addrs = self.rx_packets[id.0 as usize].segments.iter();
         while !data.is_empty() {
             let Some(addr) = addrs.next() else {
@@ -249,6 +265,13 @@ impl BufferAccess for GuestBuffers {
 
         let packet = &mut self.rx_packets[id.0 as usize];
 
+        // Report the RSS hash type in the OOB flags (the per-packet hash value
+        // is set on ppi[0] below). Coalescing groups only packets with identical
+        // flags, so a differing hash type correctly prevents coalescing.
+        if let Some((hashtype, _)) = packet.hash {
+            flags.set_rx_hashtype(hashtype);
+        }
+
         let cqe_type = if metadata.len > packet.len as usize {
             CQE_RX_TRUNCATED
         } else {
@@ -264,6 +287,9 @@ impl BufferAccess for GuestBuffers {
             ..FromZeros::new_zeroed()
         };
         packet.oob.ppi[0].pkt_len = metadata.len as u16;
+        if let Some((_, hash)) = packet.hash {
+            packet.oob.ppi[0].pkt_hash = hash;
+        }
     }
 }
 
@@ -434,6 +460,15 @@ async fn start_vport_datapath(
 
     let cqe_coalescing = vport.cqe_coalescing.clone();
 
+    // When the guest has enabled receive-side hashing, the device computes the
+    // RSS Toeplitz hash over each received packet using the programmed key and
+    // reports it (type + value) in the completion OOB. This is distinct from the
+    // indirection table below: steering across the backend's queues is
+    // backend-owned, but the hash the guest observes is the device's own to
+    // compute. The driver fills `hashkey` with the current key whenever it
+    // (re)configures steering, so read it straight from the request.
+    let rss_key = (req.rss_enable == Tristate::TRUE).then_some(req.hashkey);
+
     // When an indirection table is supplied it is located at `indir_tab_offset`
     // bytes from the start of the GDMA request (including the request header) --
     // NOT necessarily immediately after the fixed request struct. The V2
@@ -532,6 +567,7 @@ async fn start_vport_datapath(
                 pool: GuestBuffers {
                     gm: state.queues.gm.clone(),
                     rx_packets: Default::default(),
+                    rss_key,
                 },
                 sqs,
                 rq_id,
@@ -1409,6 +1445,7 @@ impl TxRxTask {
             len,
             wqe_offset,
             oob: FromZeros::new_zeroed(),
+            hash: None,
         };
         let id = RxId(self.pool.rx_packets.insert(packet) as u32);
         self.epqueue.rx_avail(&mut self.pool, &[id]);
@@ -1548,5 +1585,99 @@ impl AsyncRun<TxRxTask> for TxRxState {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gdma_defs::bnic::MANA_HASH_TCP_IPV4;
+
+    /// The Microsoft-standard RSS hash key (matches the published Toeplitz
+    /// verification vectors used in `rss::tests`).
+    const TEST_KEY: [u8; MANA_HASH_KEY_SIZE] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
+
+    /// The published Toeplitz hash of the TCP/IPv4 4-tuple
+    /// (66.9.149.187:2794 -> 161.142.100.80:1766) under `TEST_KEY`.
+    const TCP_IPV4_HASH: u32 = 0x51ccc178;
+
+    /// Builds an Ethernet + IPv4 + TCP frame for the published test flow.
+    fn tcp_ipv4_test_frame() -> Vec<u8> {
+        let mut frame = vec![
+            // Ethernet: dst MAC, src MAC, ethertype 0x0800.
+            0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00,
+            // IPv4 header (IHL=5, protocol 6 = TCP), src then dst address.
+            0x45, 0x00, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 66, 9, 149, 187, 161, 142, 100, 80,
+            // TCP source port 2794, destination port 1766.
+            0x0a, 0xea, 0x06, 0xe6,
+        ];
+        frame.resize(60, 0);
+        frame
+    }
+
+    fn make_pool(rss_key: Option<[u8; MANA_HASH_KEY_SIZE]>) -> (GuestBuffers, RxId) {
+        let mut pool = GuestBuffers {
+            gm: GuestMemory::allocate(4096),
+            rx_packets: Default::default(),
+            rss_key,
+        };
+        let id = RxId(pool.rx_packets.insert(RxPacket {
+            segments: vec![RxBufferSegment { gpa: 0, len: 4096 }],
+            len: 4096,
+            wqe_offset: 0,
+            oob: FromZeros::new_zeroed(),
+            hash: None,
+        }) as u32);
+        (pool, id)
+    }
+
+    /// When RSS hashing is enabled the device computes the Toeplitz hash for a
+    /// received TCP/IPv4 packet and reports the exact hash type + value in the
+    /// completion OOB. Asserts the published Toeplitz value lands in the OOB,
+    /// proving the offload emission at the buffer-access layer.
+    #[test]
+    fn rx_completion_reports_rss_hash() {
+        let frame = tcp_ipv4_test_frame();
+        let (mut pool, id) = make_pool(Some(TEST_KEY));
+
+        pool.write_data(id, &frame);
+        pool.write_header(
+            id,
+            &RxMetadata {
+                offset: 0,
+                len: frame.len(),
+                ..Default::default()
+            },
+        );
+
+        let oob = &pool.rx_packets[id.0 as usize].oob;
+        assert_eq!(oob.flags.rx_hashtype(), MANA_HASH_TCP_IPV4);
+        assert_eq!(oob.ppi[0].pkt_hash, TCP_IPV4_HASH);
+    }
+
+    /// With no RSS key programmed (RSS hashing not enabled on the vport) the
+    /// device reports a zero hash -- the "no hash computed" state.
+    #[test]
+    fn rx_completion_without_rss_key_reports_no_hash() {
+        let frame = tcp_ipv4_test_frame();
+        let (mut pool, id) = make_pool(None);
+
+        pool.write_data(id, &frame);
+        pool.write_header(
+            id,
+            &RxMetadata {
+                offset: 0,
+                len: frame.len(),
+                ..Default::default()
+            },
+        );
+
+        let oob = &pool.rx_packets[id.0 as usize].oob;
+        assert_eq!(oob.flags.rx_hashtype(), 0);
+        assert_eq!(oob.ppi[0].pkt_hash, 0);
     }
 }

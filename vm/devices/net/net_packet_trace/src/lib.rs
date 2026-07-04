@@ -2,13 +2,16 @@
 // Licensed under the MIT License.
 
 //! Compact, best-effort one-line descriptions of Ethernet frames for
-//! packet-boundary ("edge") tracing at the consomme backend.
+//! packet-boundary ("edge") tracing.
 //!
 //! The goal is to make it possible to see, at TRACE level, exactly which
-//! frames the guest hands to the backend and which frames the backend hands
-//! back -- with enough L2/L3/L4 detail (including DHCP message type) to answer
-//! "did DHCP complete?", "is the guest ACKing our replies?", "what did we drop
-//! and why?" without a packet capture.
+//! frames cross a given boundary -- with enough L2/L3/L4 detail (including DHCP
+//! message type) to answer "did DHCP complete?", "is the guest ACKing our
+//! replies?", "what was delivered?" without a packet capture. It is shared
+//! between the network backends (which trace at the guest<->backend boundary)
+//! and the device emulators (which trace at the device<->guest boundary), so a
+//! frame can be followed across both edges with a single, format-identical
+//! description.
 //!
 //! [`describe_frame`] returns a [`fmt::Display`] wrapper rather than a
 //! `String`, so when it is used as a tracing field --

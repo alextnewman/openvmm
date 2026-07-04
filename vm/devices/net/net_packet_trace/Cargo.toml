@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_packet_trace"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Mirror the smoltcp feature set the consomme crate enables. Only `wire`
+# (Ethernet/IPv4/DHCP decode) is used here, but smoltcp does not build with a
+# minimal proto-only set (its `Socket` enum is empty without a socket feature,
+# yielding a non-exhaustive match), and matching consomme's set keeps Cargo
+# feature unification a no-op wherever both crates are built together.
+smoltcp = { workspace = true, features = [
+    "proto-ipv4",
+    "proto-ipv6",
+    "proto-dns",
+    "medium-ethernet",
+    "socket-raw",
+    "std",
+    "proto-dhcpv4",
+] }
+
+[lints]
+workspace = true

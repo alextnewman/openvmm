@@ -1605,6 +1605,159 @@ async fn rx_coalesced_cqe_delivers_batch(driver: DefaultDriver) {
     endpoint.stop().await;
 }
 
+/// Builds a minimal Ethernet + IPv4 + TCP frame for the published RSS test flow
+/// (66.9.149.187:2794 -> 161.142.100.80:1766), padded to `len` bytes.
+fn tcp_ipv4_frame(len: usize) -> Vec<u8> {
+    let mut frame = vec![
+        // Ethernet: dst MAC, src MAC, ethertype 0x0800.
+        0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00,
+        // IPv4 header (IHL=5, protocol 6 = TCP), src then dst address.
+        0x45, 0x00, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 66, 9, 149, 187, 161, 142, 100, 80,
+        // TCP source port 2794, destination port 1766.
+        0x0a, 0xea, 0x06, 0xe6,
+    ];
+    frame.resize(len, 0);
+    frame
+}
+
+/// RSS receive hashing (offload): when the driver enables RSS with a hash key,
+/// the device computes the Toeplitz hash over each received packet's flow tuple
+/// and reports it in the completion OOB. This drives a real TCP/IPv4 frame
+/// through the loopback datapath with RSS enabled end to end -- exercising the
+/// config_rx -> `rss_key` -> `write_data` hash wiring -- and asserts the device
+/// hashed it (the `rx_packets_hashed` counter advances). Without the device-side
+/// hash emitter the OOB hash type stays zero and the counter never moves, so the
+/// assertion is a true regression guard. The exact hash type/value is covered by
+/// the gdma-crate unit tests (`bnic::tests`, `rss::tests`).
+#[async_test]
+async fn rx_rss_hash_reported(driver: DefaultDriver) {
+    const FRAME_LEN: usize = 60;
+
+    // The Microsoft-standard RSS hash key (matches the published Toeplitz
+    // verification vectors).
+    const HASH_KEY: [u8; 40] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_rss_hash");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Enable RSS with the standard hash key. This issues MANA_CONFIG_VPORT_RX
+    // with rss_enable=TRUE plus the key, so the device arms receive-side hashing
+    // on the datapath to our single receive queue (no custom indirection table).
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(true),
+            hash_key: Some(&HASH_KEY),
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post a receive buffer, then transmit one real TCP/IPv4 frame; loopback
+    // reflects it into the receive path where the device hashes it.
+    queue.rx_avail(&mut pool, &[RxId(1)]);
+
+    let frame = tcp_ipv4_frame(FRAME_LEN);
+    payload_mem.write_at(0, &frame).unwrap();
+    let tx_metadata = net_backend::TxMetadata {
+        id: TxId(1),
+        segment_count: 1,
+        len: FRAME_LEN as u32,
+        l2_len: 14,
+        l3_len: 20,
+        l4_len: 20,
+        max_segment_size: 1460,
+        ..Default::default()
+    };
+    queue
+        .tx_avail(
+            &mut pool,
+            &[TxSegment {
+                ty: net_backend::TxSegmentType::Head(tx_metadata),
+                gpa: 0,
+                len: FRAME_LEN as u32,
+            }],
+        )
+        .unwrap();
+
+    // Poll until the frame is received (or the deadline trips).
+    let mut rx_ids = [RxId(0); 1];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        let mut tx_done = [TxId(0); 1];
+        let _ = queue.tx_poll(&mut pool, &mut tx_done).unwrap_or(0);
+        if rx_n >= 1 {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, 1, "the frame must be delivered");
+    assert_eq!(
+        queue.stats.rx_packets_hashed.get(),
+        1,
+        "the device must report an RSS hash for the received TCP/IPv4 frame"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
 /// RX CQE coalescing live toggle: enabling coalescing on an already-running
 /// vport must take effect on the live datapath WITHOUT cycling it.
 ///

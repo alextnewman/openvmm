@@ -174,6 +174,37 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
     })
     .add(&flags);
 
+    // Present the host CPU's real brand (e.g. "Apple M5") to the guest through
+    // SMBIOS Type 4 so it shows a meaningful processor name instead of a blank
+    // virtual CPU. Only hosts that expose it (Apple Silicon) populate anything;
+    // every other host is a no-op, so other backends are unaffected.
+    if let Some((manufacturer, version)) = host_processor_smbios() {
+        let brand = String::from_utf8_lossy(&version);
+        tracing::debug!(cpu = %brand, "presenting host CPU brand to guest via SMBIOS");
+        cfg.add_cstring(
+            config::BlobStructureType::SmbiosProcessorManufacturer,
+            &manufacturer,
+        )
+        .add_cstring(config::BlobStructureType::SmbiosProcessorVersion, &version)
+        // The manufacturer/version strings are indices into a Type 4 record, so
+        // emit the record itself to anchor them. The formatted fields are the
+        // SMBIOS "unknown" defaults (speeds/id/voltage) except the facts we know:
+        // a 64-bit-capable central processor in a populated, enabled socket.
+        .add(&config::Smbios31ProcessorInformation {
+            processor_id: 0,
+            external_clock: 0,
+            max_speed: 0,
+            current_speed: 0,
+            processor_characteristics: 0x04, // 64-bit capable
+            processor_family2: 0x2,          // unknown
+            processor_type: 0x3,             // central processor
+            voltage: 0,
+            status: 0x41,        // socket populated + CPU enabled
+            processor_upgrade: 0x6, // none
+            reserved: 0,
+        });
+    }
+
     #[cfg(guest_arch = "aarch64")]
     {
         let redistributors_base = match processor_topology.gic_version() {
@@ -241,4 +272,51 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
     .map_err(Error::Loader)?;
 
     Ok(loader.initial_regs())
+}
+
+/// Returns the host CPU's SMBIOS Type 4 `(manufacturer, version)` strings when
+/// the host exposes them, so the guest can display a real processor name rather
+/// than a blank virtual CPU.
+///
+/// Only Apple Silicon hosts are supported today; every other host returns
+/// `None`, leaving the config blob untouched.
+#[cfg(target_os = "macos")]
+fn host_processor_smbios() -> Option<(Vec<u8>, Vec<u8>)> {
+    // `openvmm_core` forbids `unsafe`, so read the brand via `sysctl(8)` rather
+    // than the `sysctlbyname(3)` FFI. This runs once, at load time.
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let brand = String::from_utf8(output.stdout).ok()?;
+    let brand = brand.trim();
+    if brand.is_empty() {
+        return None;
+    }
+    Some((b"Apple Inc.".to_vec(), brand.as_bytes().to_vec()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_processor_smbios() -> Option<(Vec<u8>, Vec<u8>)> {
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::host_processor_smbios;
+
+    #[test]
+    fn host_processor_smbios_reports_a_brand() {
+        // The runtime `sysctl` read must yield a non-empty brand on any macOS
+        // host; the manufacturer is the fixed Apple string.
+        let (manufacturer, version) =
+            host_processor_smbios().expect("macOS host should expose a CPU brand string");
+        assert_eq!(manufacturer, b"Apple Inc.");
+        let version = String::from_utf8(version).expect("brand string is UTF-8");
+        assert!(!version.is_empty(), "brand string must be non-empty");
+        assert!(!version.contains('\0'), "brand string must not embed NULs");
+    }
 }

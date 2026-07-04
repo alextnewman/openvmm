@@ -15,6 +15,7 @@
 //! This implementation includes a small DHCP server for address assignment.
 
 mod arp;
+mod describe;
 mod dhcp;
 mod dhcpv6;
 #[cfg_attr(unix, path = "dns_unix.rs")]
@@ -55,6 +56,9 @@ use smoltcp::wire::Icmpv6Packet;
 use smoltcp::wire::IpAddress;
 use smoltcp::wire::IpProtocol;
 pub use smoltcp::wire::IpVersion;
+
+pub use describe::FrameSummary;
+pub use describe::describe_frame;
 use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv4Packet;
 use smoltcp::wire::Ipv6Address;

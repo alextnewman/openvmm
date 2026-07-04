@@ -2725,6 +2725,7 @@ dependencies = [
  "mesh",
  "net_backend",
  "net_backend_resources",
+ "net_packet_trace",
  "parking_lot",
  "pci_core",
  "pci_resources",

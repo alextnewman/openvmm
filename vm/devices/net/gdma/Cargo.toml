@@ -11,6 +11,7 @@ gdma_defs.workspace = true
 gdma_resources.workspace = true
 net_backend.workspace = true
 net_backend_resources.workspace = true
+net_packet_trace.workspace = true
 
 device_emulators.workspace = true
 pci_core.workspace = true

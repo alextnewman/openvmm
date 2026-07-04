@@ -79,6 +79,7 @@ use net_backend::TxMetadata;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use net_backend_resources::mac_address::MacAddress;
+use net_packet_trace::describe_frame;
 use slab::Slab;
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -197,6 +198,24 @@ impl BufferAccess for GuestBuffers {
     }
 
     fn write_data(&mut self, id: RxId, mut data: &[u8]) {
+        // Device -> guest packet-boundary trace. This fires for every frame the
+        // backend delivers into a guest receive buffer, which is exactly the set
+        // of frames the device then reports to the guest as receive completions
+        // (`post_rx_completions` posts a CQE for every frame written here). It is
+        // therefore the device-side counterpart to the backend's `consomme_edge`
+        // trace: `consomme_edge` shows what the backend chose to send toward the
+        // guest, while this shows what the emulated MANA device actually placed
+        // in guest memory and will complete -- so a frame present here is proof
+        // the guest was given it (isolating a lost RX from a guest that received
+        // the frame but did not act on it). Lazy `describe_frame` keeps it
+        // zero-cost unless `mana_edge=trace` is enabled.
+        tracing::trace!(
+            target: "mana_edge",
+            dir = "rx",
+            len = data.len(),
+            frame = %describe_frame(data),
+            "backend -> guest"
+        );
         // Compute the RSS hash over the full packet before it is scattered
         // across the receive buffer segments below. `data` is the entire packet
         // at entry; the loop then splits it across the guest's SGL.
@@ -1529,6 +1548,23 @@ impl TxRxTask {
                         .context("invalid rx id")?;
                 }
             }
+
+            // Structural device -> guest completion trace: which receive queue
+            // and completion queue the frame(s) are reported on, the CQE type,
+            // and how many packets were coalesced into this CQE. Pairs in order
+            // with the L3/L4 `write_data` records above (same `mana_edge`
+            // target) so a delivered frame can be tied to the exact RQ/RCQ it
+            // lands on -- the view needed to check that receive completions
+            // reach the queue the guest associates with the flow.
+            tracing::trace!(
+                target: "mana_edge",
+                dir = "rx",
+                rq_id = self.rq_id,
+                rq_cq_id = self.rq_cq_id,
+                cqe_type = oob.cqe_hdr.cqe_type(),
+                packets = count,
+                "rx completion posted"
+            );
 
             self.queues
                 .post_cq(self.rq_cq_id, oob.as_bytes(), self.rq_id, false);

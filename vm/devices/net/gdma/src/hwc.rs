@@ -10,6 +10,7 @@ use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
 use gdma_defs::EqeDataReconfig;
+use gdma_defs::EqeVfReset;
 use gdma_defs::GDMA_EQE_HWC_INIT_DATA;
 use gdma_defs::GDMA_EQE_HWC_INIT_DONE;
 use gdma_defs::GDMA_EQE_HWC_INIT_EQ_ID_DB;
@@ -203,6 +204,27 @@ impl HwState {
                 reserved1: [0; 8],
             }
             .as_bytes(),
+        );
+    }
+
+    /// Post an asynchronous device reset-request event on the HW channel EQ
+    /// (`GDMA_EQE_HWC_RESET_REQUEST` == 135).
+    ///
+    /// This is the one device->guest asynchronous lever that forces the guest
+    /// to tear the function all the way down and rebuild it. The Windows VF
+    /// responds by halting its NIC, re-establishing the HW channel, and
+    /// re-running its entire bring-up (vport create, receive-filter install,
+    /// receive-indication enable). Because the receive-indication gate that
+    /// blocks the Windows DHCP path has no device-observable input, forcing a
+    /// clean rebirth this way is the only device-side means to make the guest
+    /// re-run that path -- so it serves as a diagnostic crutch, not a
+    /// production behavior. `revoke_vtl0_vf=false`: a plain VF has no
+    /// subordinate VTL0 to revoke and re-offer.
+    pub fn post_hwc_reset_request(&self) {
+        self.queues.post_eq(
+            self.hwc_eq_id,
+            GDMA_EQE_HWC_RESET_REQUEST,
+            EqeVfReset::new().as_bytes(),
         );
     }
 }

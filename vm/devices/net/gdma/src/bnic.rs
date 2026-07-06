@@ -356,6 +356,65 @@ pub struct BasicNic {
     /// physical-function client still expects a distinct, non-invalid handle to
     /// track for later teardown.
     next_filter_handle: u64,
+    /// Debug-only "puppetmaster" experiment (default disabled): once the
+    /// datapath is up, inject a single fake device-crash reset-request EQE to
+    /// force the Windows VF through its full recovery cascade, re-running the
+    /// otherwise device-invisible receive-indication bring-up. Armed by the
+    /// `OPENVMM_MANA_FAKE_CRASH` environment variable; see [`FakeCrash`].
+    fake_crash: FakeCrash,
+}
+
+/// Debug-only staged trigger for the fake device-crash recovery experiment.
+///
+/// The Windows VF's receive-indication gate (which blocks its DHCP path) has
+/// no device-observable input, so the only device lever that can force the
+/// guest to re-run its receive-indication bring-up is a device reset-request
+/// event (`GDMA_EQE_HWC_RESET_REQUEST`), which drives the guest through a full
+/// teardown and re-init -- halting its NIC and then recovering it. This injects
+/// exactly one such event, staged a fixed number of `MANA_QUERY_STATS` polls
+/// after the datapath reaches steady state (so it lands after RX-enable and the
+/// guest's initial DHCP attempts). It is a diagnostic crutch, not production
+/// behavior, and is disabled unless the `OPENVMM_MANA_FAKE_CRASH` environment
+/// variable is set to the desired poll count.
+#[derive(Default)]
+struct FakeCrash {
+    /// `MANA_QUERY_STATS` polls remaining before firing; `None` once disabled
+    /// or already fired (the injection is one-shot).
+    polls_until_fire: Option<u32>,
+}
+
+impl FakeCrash {
+    fn from_env() -> Self {
+        let polls_until_fire = std::env::var("OPENVMM_MANA_FAKE_CRASH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if let Some(n) = polls_until_fire {
+            tracing::warn!(
+                polls_until_fire = n,
+                "MANA fake-crash experiment ARMED (OPENVMM_MANA_FAKE_CRASH): will \
+                 inject one reset-request EQE after roughly this many stats polls"
+            );
+        }
+        Self { polls_until_fire }
+    }
+
+    /// Invoked on each `MANA_QUERY_STATS` poll. Advances the staged countdown
+    /// and returns `true` exactly once -- when the configured number of polls
+    /// has elapsed -- to request the one-shot crash injection. Disarms itself
+    /// after firing so it never returns `true` again.
+    fn tick(&mut self) -> bool {
+        match self.polls_until_fire {
+            Some(0) => {
+                self.polls_until_fire = None;
+                true
+            }
+            Some(n) => {
+                self.polls_until_fire = Some(n - 1);
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 impl InspectMut for BasicNic {
@@ -662,6 +721,7 @@ impl BasicNic {
             config,
             next_wq_obj: 1,
             next_filter_handle: 1,
+            fake_crash: FakeCrash::from_env(),
         }
     }
 
@@ -1139,6 +1199,20 @@ impl BasicNic {
                 let resp_bytes = resp.as_bytes();
                 let write_len = guest_resp_size.min(resp_bytes.len());
                 write.write(&resp_bytes[..write_len])?;
+
+                // Debug experiment (default off): stage a one-shot fake
+                // device-crash reset EQE a fixed number of stats polls after
+                // bring-up. Steady-state stats polling is the device-observable
+                // clock proving the datapath is up and (for the Windows VF) the
+                // initial DHCP attempts have already stalled, so it is where the
+                // recovery crutch is armed. See `FakeCrash`.
+                if self.fake_crash.tick() {
+                    tracing::warn!(
+                        "MANA fake-crash experiment: injecting reset-request EQE \
+                         (GDMA_EQE_HWC_RESET_REQUEST) to force guest recovery"
+                    );
+                    state.post_hwc_reset_request();
+                }
             }
             ManaCommandCode::MANA_QUERY_PHY_STAT => {
                 let req: ManaQueryPhyStatisticsRequest = read
@@ -1715,5 +1789,31 @@ mod tests {
         let oob = &pool.rx_packets[id.0 as usize].oob;
         assert_eq!(oob.flags.rx_hashtype(), 0);
         assert_eq!(oob.ppi[0].pkt_hash, 0);
+    }
+
+    #[test]
+    fn fake_crash_fires_once_after_staged_polls() {
+        // Armed to fire after 2 stats polls: two ticks stage, the third fires,
+        // and it never fires again (the injection is one-shot).
+        let mut fc = FakeCrash {
+            polls_until_fire: Some(2),
+        };
+        assert!(!fc.tick());
+        assert!(!fc.tick());
+        assert!(fc.tick());
+        assert!(!fc.tick());
+        assert!(!fc.tick());
+
+        // A count of 0 fires on the very first poll.
+        let mut immediate = FakeCrash {
+            polls_until_fire: Some(0),
+        };
+        assert!(immediate.tick());
+        assert!(!immediate.tick());
+
+        // Disabled by default (env var unset): never fires.
+        let mut off = FakeCrash::default();
+        assert!(!off.tick());
+        assert!(!off.tick());
     }
 }

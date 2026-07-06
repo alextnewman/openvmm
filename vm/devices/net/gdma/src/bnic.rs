@@ -190,6 +190,12 @@ struct RxPacket {
     /// The `(rx_hashtype, pkt_hash)` computed for this packet when RSS hashing
     /// is enabled, applied to the completion OOB by `write_header`.
     hash: Option<(u16, u32)>,
+    /// Monotonic per-task post sequence number assigned when the guest posts
+    /// this receive WQE (`process_rqe`). Purely diagnostic: it lets the
+    /// `mana_rxdiag` receive trace correlate the buffer's post order with the
+    /// order its completion is later emitted, exposing any post/complete
+    /// reordering. Ignored when the trace is disabled.
+    post_seq: u64,
 }
 
 impl BufferAccess for GuestBuffers {
@@ -222,6 +228,17 @@ impl BufferAccess for GuestBuffers {
         if let Some(key) = self.rss_key {
             self.rx_packets[id.0 as usize].hash = compute_rx_hash(data, &key);
         }
+        let diag = rx_trace_enabled();
+        let (diag_seq, diag_gpa, offer_head) = if diag {
+            let p = &self.rx_packets[id.0 as usize];
+            (
+                p.post_seq,
+                p.segments.first().map(|s| s.gpa).unwrap_or(0),
+                peek_slice_hex(data, 16),
+            )
+        } else {
+            (0, 0, String::new())
+        };
         let mut addrs = self.rx_packets[id.0 as usize].segments.iter();
         while !data.is_empty() {
             let Some(addr) = addrs.next() else {
@@ -240,6 +257,22 @@ impl BufferAccess for GuestBuffers {
                 );
             }
             data = next;
+        }
+        if diag {
+            // Read the destination back out of guest memory right after the
+            // scatter. If `readback` matches `offer_head` the device placed the
+            // backend frame at the SGE the guest posted; a later pktmon capture
+            // showing different bytes then implicates the guest reading a
+            // different buffer (desync / bounce copy), not the device write.
+            tracing::info!(
+                target: "mana_rxdiag",
+                event = "write",
+                seq = diag_seq,
+                sge0_gpa = diag_gpa,
+                offer_head = %offer_head,
+                readback = %peek_gpa_hex(&self.gm, diag_gpa, 16),
+                "device wrote rx buffer"
+            );
         }
     }
 
@@ -415,6 +448,53 @@ impl FakeCrash {
             None => false,
         }
     }
+}
+
+/// Debug-only per-receive diagnostic trace gate (default disabled), enabled by
+/// setting `OPENVMM_MANA_RX_TRACE` to any non-empty value.
+///
+/// The Windows VF indicates receive frames to NDIS with a correct completion
+/// OOB -- an RSS hash and length the device computes over the real backend
+/// frame -- but, in the DHCP-failure repro, with stale buffer contents (the
+/// guest reads a receive buffer the device never wrote for that completion).
+/// This trace makes the device side of that boundary observable: per frame it
+/// emits the posted SGE `{gpa,size}`, the bytes already in guest memory at the
+/// SGE *before* the write, the head of the backend frame, a read-back of guest
+/// memory immediately *after* the scatter write, and a second read-back when the
+/// completion is posted -- with a monotonic post-sequence number so post order
+/// and completion order can be compared. Cross-referenced with a guest pktmon
+/// capture it separates "device wrote the wrong place" from "guest read a
+/// different buffer than the device wrote".
+fn rx_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("OPENVMM_MANA_RX_TRACE")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if on {
+            tracing::warn!(
+                "MANA rx-diagnostic trace ENABLED (OPENVMM_MANA_RX_TRACE): emitting \
+                 per-receive `mana_rxdiag` records (SGE, pre/post read-back, seq)"
+            );
+        }
+        on
+    })
+}
+
+/// Formats up to `n` bytes of guest memory at `gpa` as hex for the receive
+/// diagnostic trace, or a short marker if the read fails. Only called on the
+/// debug receive-trace path.
+fn peek_gpa_hex(gm: &GuestMemory, gpa: u64, n: usize) -> String {
+    let mut buf = vec![0u8; n];
+    match gm.read_at(gpa, &mut buf) {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => "<read-err>".to_string(),
+    }
+}
+
+/// Formats up to `n` bytes of `data` as hex for the receive diagnostic trace.
+fn peek_slice_hex(data: &[u8], n: usize) -> String {
+    data.iter().take(n).map(|b| format!("{b:02x}")).collect()
 }
 
 impl InspectMut for BasicNic {
@@ -652,6 +732,7 @@ async fn start_vport_datapath(
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
                 rx_buf_count: 0,
+                rx_post_seq: 0,
                 cqe_coalescing: cqe_coalescing.clone(),
                 fence_rx,
             },
@@ -1310,6 +1391,10 @@ pub struct TxRxTask {
     rq_cq_id: u32,
     tx_segment_buffer: Vec<TxSegment>,
     rx_buf_count: u32,
+    /// Monotonic counter assigned to each posted receive WQE, stored on the
+    /// `RxPacket` for the diagnostic `mana_rxdiag` trace (see
+    /// [`rx_trace_enabled`]). Increments regardless of whether the trace is on.
+    rx_post_seq: u64,
     /// When set, pack up to `MANA_RXCOMP_OOB_NUM_PPI` ready receive completions
     /// into a single `CQE_RX_COALESCED_4` instead of posting one `CQE_RX_OKAY`
     /// per packet. Negotiated per-vport via the V2 `MANA_CONFIG_VPORT_RX` and
@@ -1522,7 +1607,7 @@ impl TxRxTask {
     }
 
     fn process_rqe(&mut self, wqe: Wqe, wqe_offset: u32) -> anyhow::Result<()> {
-        let segments = wqe
+        let segments: Vec<RxBufferSegment> = wqe
             .sgl()
             .iter()
             .map(|sge| RxBufferSegment {
@@ -1532,6 +1617,29 @@ impl TxRxTask {
             .collect();
 
         let len = wqe.sgl().iter().map(|sge| sge.size).sum();
+        let post_seq = self.rx_post_seq;
+        self.rx_post_seq = self.rx_post_seq.wrapping_add(1);
+        if rx_trace_enabled() {
+            // Record the posted buffer's SGE and what is already in guest memory
+            // there before any device write. If `pre` already matches the stale
+            // bytes a later pktmon capture shows, the guest handed the device a
+            // buffer aliasing live memory; if it is fresh/zeroed, a stale
+            // indication instead points to a completion/buffer desync.
+            let (gpa, size) = segments.first().map(|s| (s.gpa, s.len)).unwrap_or((0, 0));
+            tracing::info!(
+                target: "mana_rxdiag",
+                event = "post",
+                seq = post_seq,
+                rq_id = self.rq_id,
+                wqe_offset,
+                num_sge = segments.len(),
+                sge0_gpa = gpa,
+                sge0_len = size,
+                total_len = len,
+                pre = %peek_gpa_hex(&self.pool.gm, gpa, 16),
+                "rq buffer posted"
+            );
+        }
         tracing::trace!(?segments, len, "rx wqe");
         let packet = RxPacket {
             segments,
@@ -1539,6 +1647,7 @@ impl TxRxTask {
             wqe_offset,
             oob: FromZeros::new_zeroed(),
             hash: None,
+            post_seq,
         };
         let id = RxId(self.pool.rx_packets.insert(packet) as u32);
         self.epqueue.rx_avail(&mut self.pool, &[id]);
@@ -1594,6 +1703,9 @@ impl TxRxTask {
                 .try_remove(ids[start].0 as usize)
                 .context("invalid rx id")?;
 
+            let diag_seq = first.post_seq;
+            let diag_gpa = first.segments.first().map(|s| s.gpa).unwrap_or(0);
+
             let mut oob = first.oob;
             let coalescing = self.cqe_coalescing.load(Ordering::Relaxed);
             let can_coalesce = coalescing && oob.cqe_hdr.cqe_type() == CQE_RX_OKAY;
@@ -1639,6 +1751,27 @@ impl TxRxTask {
                 packets = count,
                 "rx completion posted"
             );
+
+            if rx_trace_enabled() {
+                // Second read-back, at completion time: proves the SGE still
+                // holds the frame the device wrote when the guest is told to
+                // consume it. If this matches the post-write read-back but the
+                // guest still indicates stale bytes, the guest is not reading
+                // this buffer for this completion.
+                tracing::info!(
+                    target: "mana_rxdiag",
+                    event = "complete",
+                    seq = diag_seq,
+                    rq_id = self.rq_id,
+                    rq_cq_id = self.rq_cq_id,
+                    cqe_type = oob.cqe_hdr.cqe_type(),
+                    count,
+                    sge0_gpa = diag_gpa,
+                    pkt_len = oob.ppi[0].pkt_len,
+                    readback = %peek_gpa_hex(&self.pool.gm, diag_gpa, 16),
+                    "rx completion posted"
+                );
+            }
 
             self.queues
                 .post_cq(self.rq_cq_id, oob.as_bytes(), self.rq_id, false);
@@ -1741,6 +1874,7 @@ mod tests {
             wqe_offset: 0,
             oob: FromZeros::new_zeroed(),
             hash: None,
+            post_seq: 0,
         }) as u32);
         (pool, id)
     }

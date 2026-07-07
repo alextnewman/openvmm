@@ -177,6 +177,36 @@ impl Sys {
         );
     }
 
+    /// Deactivate `intid` on `cpu` via ICC_DIR_EL1 (the second half of an
+    /// EOImode == 1 split completion).
+    fn dir1(&mut self, cpu: usize, intid: u32) {
+        let Sys { dist, redists, .. } = self;
+        dist.write_sysreg(
+            &mut redists[cpu],
+            SystemReg::ICC_DIR_EL1,
+            u64::from(intid),
+            no_wake,
+        );
+    }
+
+    /// Select this CPU's EOImode: `true` = split priority-drop/deactivate
+    /// (EOIR drops priority, DIR deactivates); `false` = EOIR does both.
+    /// ICC_CTLR_EL1 bit0 = CBPR, bit1 = EOImode.
+    fn set_eoimode(&mut self, cpu: usize, on: bool) {
+        self.write_cpuif(cpu, SystemReg::ICC_CTLR_EL1, if on { 0b10 } else { 0 });
+    }
+
+    /// Whether SGI/PPI `intid` is currently active on `cpu`.
+    fn ppi_active(&self, cpu: usize, intid: u32) -> bool {
+        self.redists[cpu].ppi_diag().active & (1 << intid) != 0
+    }
+
+    /// This CPU's Group-1 active-priority word (ICC_AP1R0). Non-zero ⇒ the PE
+    /// has an interrupt in service (running priority raised).
+    fn apr1(&self, cpu: usize) -> u32 {
+        self.redists[cpu].ppi_diag().icc_ap1r0
+    }
+
     fn pending(&self, cpu: usize) -> bool {
         self.dist.irq_pending(&self.redists[cpu])
     }
@@ -446,6 +476,139 @@ mod irouter {
         assert_eq!(sys.ack1(1), 1023, "PE 1 sees nothing");
         assert_eq!(sys.ack1(0), 50);
         sys.eoi1(0, 50);
+    }
+}
+
+// =============================================================================
+// EOImode split completion (ICC_EOIR / ICC_DIR).
+//
+// With ICC_CTLR_EL1.EOImode == 0 an EOIR both drops priority and deactivates.
+// With EOImode == 1 the two steps split: EOIR only drops the running priority
+// (so the handler can re-enable interrupts at a lower priority) and a later
+// ICC_DIR write deactivates the interrupt. This is the mode Linux uses. These
+// deterministic tests pin the observable state after each half-step for both
+// SGI/PPI (active state on the redistributor) and SPI (active state in the
+// distributor), plus the ignore rules (DIR under EOImode == 0, special INTIDs).
+// Grounded in ARM IHI 0069H.b §4.1 / the ICC_EOIR1_EL1 & ICC_DIR_EL1 defs.
+// =============================================================================
+#[cfg(test)]
+mod eoimode {
+    use super::*;
+    use vm_topology::processor::VpIndex;
+
+    /// EOImode == 0 (default): a single EOIR drops priority AND deactivates a
+    /// PPI, and a subsequent stray DIR is ignored.
+    #[test]
+    fn eoimode0_eoir_deactivates_ppi_and_dir_is_ignored() {
+        let mut sys = Sys::new(1, 32);
+        sys.online_all();
+        sys.enable_ppis(0, 1 << 20);
+        sys.set_sgi_ppi_priority(0, 20, 0x40);
+        sys.dist.raise_ppi(VpIndex::new(0), 20);
+
+        assert_eq!(sys.ack1(0), 20);
+        assert!(sys.apr1(0) != 0, "running priority raised after ack");
+        assert!(sys.ppi_active(0, 20), "active after ack");
+
+        sys.eoi1(0, 20);
+        assert_eq!(sys.apr1(0), 0, "EOIR drops running priority");
+        assert!(
+            !sys.ppi_active(0, 20),
+            "EOImode0 EOIR deactivates immediately"
+        );
+
+        // A stray DIR while EOImode == 0 must have no effect.
+        sys.dir1(0, 20);
+        assert!(!sys.ppi_active(0, 20), "DIR under EOImode0 is a no-op");
+    }
+
+    /// EOImode == 1: EOIR drops priority but the PPI stays ACTIVE; only the
+    /// following DIR deactivates it.
+    #[test]
+    fn eoimode1_splits_priority_drop_from_deactivate_ppi() {
+        let mut sys = Sys::new(1, 32);
+        sys.online_all();
+        sys.set_eoimode(0, true);
+        sys.enable_ppis(0, 1 << 20);
+        sys.set_sgi_ppi_priority(0, 20, 0x40);
+        sys.dist.raise_ppi(VpIndex::new(0), 20);
+
+        assert_eq!(sys.ack1(0), 20);
+        assert!(sys.apr1(0) != 0 && sys.ppi_active(0, 20));
+
+        // EOIR: priority drops, but the interrupt is still active.
+        sys.eoi1(0, 20);
+        assert_eq!(sys.apr1(0), 0, "EOIR drops running priority under EOImode1");
+        assert!(
+            sys.ppi_active(0, 20),
+            "EOImode1 EOIR must NOT deactivate; DIR does"
+        );
+
+        // DIR: now it deactivates (and does not touch priority).
+        sys.dir1(0, 20);
+        assert!(!sys.ppi_active(0, 20), "DIR deactivates under EOImode1");
+        assert_eq!(sys.apr1(0), 0, "DIR performs no priority drop");
+    }
+
+    /// The same split for an SPI: its active state lives in the distributor and
+    /// is cleared only by DIR under EOImode == 1.
+    #[test]
+    fn eoimode1_splits_priority_drop_from_deactivate_spi() {
+        let mut sys = Sys::new(2, 96);
+        sys.online_all();
+        sys.set_eoimode(0, true);
+        // SPI 40 -> word 1, bit 8. Default route delivers SPIs to PE 0.
+        sys.provision_spi(40, 0x40);
+        sys.dist.set_pending(40, true);
+
+        assert_eq!(sys.ack1(0), 40);
+        assert!(sys.apr1(0) != 0);
+        assert_ne!(sys.spi_active_word(1) & (1 << 8), 0, "SPI active after ack");
+
+        sys.eoi1(0, 40);
+        assert_eq!(sys.apr1(0), 0, "EOIR drops running priority");
+        assert_ne!(
+            sys.spi_active_word(1) & (1 << 8),
+            0,
+            "EOImode1 EOIR leaves the SPI active"
+        );
+
+        sys.dir1(0, 40);
+        assert_eq!(
+            sys.spi_active_word(1) & (1 << 8),
+            0,
+            "DIR deactivates the SPI in the distributor"
+        );
+    }
+
+    /// Special INTIDs (>= 1020) are ignored by both EOIR and DIR: no priority
+    /// drop, no deactivation of whatever is genuinely in service.
+    #[test]
+    fn special_intids_are_ignored_by_eoir_and_dir() {
+        let mut sys = Sys::new(1, 32);
+        sys.online_all();
+        sys.set_eoimode(0, true);
+        sys.enable_ppis(0, 1 << 20);
+        sys.set_sgi_ppi_priority(0, 20, 0x40);
+        sys.dist.raise_ppi(VpIndex::new(0), 20);
+        assert_eq!(sys.ack1(0), 20);
+        let apr_before = sys.apr1(0);
+        assert!(apr_before != 0);
+
+        // Spurious EOIR: must not drop priority or deactivate the real IRQ.
+        sys.eoi1(0, 1023);
+        assert_eq!(sys.apr1(0), apr_before, "spurious EOIR leaves priority");
+        assert!(sys.ppi_active(0, 20), "spurious EOIR leaves the IRQ active");
+
+        // Spurious DIR: likewise a no-op.
+        sys.dir1(0, 1023);
+        assert!(sys.ppi_active(0, 20), "spurious DIR leaves the IRQ active");
+
+        // The real completion still works.
+        sys.eoi1(0, 20);
+        sys.dir1(0, 20);
+        assert!(!sys.ppi_active(0, 20));
+        assert_eq!(sys.apr1(0), 0);
     }
 }
 

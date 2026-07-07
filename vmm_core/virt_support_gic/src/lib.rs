@@ -267,6 +267,7 @@ mod gicd {
             match reg {
                 SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
                 SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
+                SystemReg::ICC_DIR_EL1 => self.dir(gicr, value as u32),
                 SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
                 SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
                 _ => return gicr.write_cpuif(reg, value),
@@ -306,33 +307,64 @@ mod gicd {
             Some(v)
         }
 
+        /// Completes an interrupt via ICC_EOIR{0,1}_EL1.
+        ///
+        /// EOIR always performs the *priority drop* on the PE that executes it:
+        /// the top entry of that PE's active-priority stack is cleared, lowering
+        /// its running priority. IAR and EOIR are architecturally paired on one
+        /// PE, so the top entry belongs to the interrupt being completed.
+        ///
+        /// Whether EOIR *also* deactivates depends on ICC_CTLR_EL1.EOImode:
+        ///  * EOImode == 0: EOIR deactivates the interrupt as well — the common
+        ///    single-write completion.
+        ///  * EOImode == 1: EOIR does the priority drop ONLY; deactivation is
+        ///    deferred to a later ICC_DIR_EL1 write. Linux uses this split so it
+        ///    can run a handler at a lowered running priority while the
+        ///    interrupt is still active (masking re-entry of the same line).
+        ///
+        /// Writes naming a special INTID (>= 1020, e.g. the spurious 1023) are
+        /// ignored: they have no active state and cause no priority drop
+        /// (IHI 0069H.b, ICC_EOIR1_EL1).
         fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
-            // Special INTIDs (>= 1020) have no active state.
             if intid >= 1020 {
                 return;
             }
-            if intid < 32 {
-                // SGI/PPI: priority-drop + deactivate both happen on the redist.
-                gicr.eoi(group1, intid);
-                return;
-            }
-            // SPI: the priority drop happens on the PE that executed EOIR — the
-            // PE that acknowledged the interrupt, since the architecture requires
-            // IAR and EOIR to be paired on one PE (IHI 0069H.b §4.1: "A priority
-            // drop must be performed by the same PE that activated the
-            // interrupt") — and the deactivation clears the interrupt's active
-            // state in the *distributor* by INTID. Neither step re-consults
-            // GICD_IROUTER: routing is a delivery-time input only, and "SPIs can
-            // be deactivated by a different PE" (§4.1; the active state lives in
-            // the shared distributor). A stale-route guard here would strand an
-            // in-flight SPI whose affinity a guest moves between IAR and EOIR —
-            // the acking PE's active-priority bit would never be popped (wedging
-            // its preemption gate) and the SPI would never deactivate.
             gicr.pop_priority(group1);
             tracing::trace!(intid, "gic eoi");
-            let w = intid as usize / 32;
-            if let Some(v) = self.state.lock().active.get_mut(w) {
-                *v &= !(1 << (intid & 31));
+            if !gicr.eoimode() {
+                self.deactivate_intid(gicr, intid);
+            }
+        }
+
+        /// Deactivates an interrupt via ICC_DIR_EL1 — the second half of the
+        /// EOImode == 1 split completion. DIR performs NO priority drop.
+        ///
+        /// DIR is only meaningful when EOImode == 1. When EOImode == 0 the
+        /// interrupt was already deactivated at EOIR, so the write is ignored
+        /// (IHI 0069H.b, ICC_DIR_EL1: writes with EOImode == 0 have no effect).
+        /// Special INTIDs (>= 1020) are likewise ignored.
+        fn dir(&self, gicr: &mut Redistributor, intid: u32) {
+            if intid >= 1020 || !gicr.eoimode() {
+                return;
+            }
+            tracing::trace!(intid, "gic dir");
+            self.deactivate_intid(gicr, intid);
+        }
+
+        /// Clears the active state of `intid`, wherever it lives: an SGI/PPI
+        /// deactivates on the acknowledging PE's redistributor; an SPI clears its
+        /// active bit in the shared distributor. The SPI path does NOT re-consult
+        /// GICD_IROUTER — an SPI may be deactivated by any PE, and its active
+        /// state lives in the distributor (IHI 0069H.b §4.1). See `eoi` for the
+        /// full routing rationale.
+        fn deactivate_intid(&self, gicr: &mut Redistributor, intid: u32) {
+            if intid < 32 {
+                gicr.deactivate(intid);
+            } else {
+                let w = intid as usize / 32;
+                if let Some(v) = self.state.lock().active.get_mut(w) {
+                    *v &= !(1 << (intid & 31));
+                }
             }
         }
 
@@ -1370,6 +1402,13 @@ mod gicr {
             self.shared.mutable.lock().active &= !(1 << intid);
         }
 
+        /// Whether this PE's CPU interface runs in EOImode == 1 (the split
+        /// priority-drop / deactivate model, from ICC_CTLR_EL1.EOImode). When
+        /// true, EOIR only drops priority and ICC_DIR performs the deactivate.
+        pub(crate) fn eoimode(&self) -> bool {
+            self.shared.mutable.lock().icc_eoimode
+        }
+
         #[cfg(test)]
         pub(crate) fn irq_pending(&self) -> bool {
             match self.best_candidate(true) {
@@ -1418,6 +1457,11 @@ mod gicr {
             Some(intid)
         }
 
+        /// Full SGI/PPI completion (priority-drop + deactivate) on this
+        /// redistributor in isolation. Test-only: the production path routes
+        /// through [`Distributor::eoi`], which splits the priority drop from the
+        /// EOImode-gated deactivate.
+        #[cfg(test)]
         pub(crate) fn eoi(&mut self, group1: bool, intid: u32) {
             assert!(intid < 32);
             tracing::trace!(intid, "eoi");

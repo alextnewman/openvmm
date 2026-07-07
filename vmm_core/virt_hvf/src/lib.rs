@@ -2187,6 +2187,36 @@ impl HvfProcessor<'_> {
     }
 }
 
+/// Whether the default-off SMP-bringup diagnostic trace is enabled, gated on a
+/// non-empty `OPENVMM_HVF_SMP_TRACE` environment variable.
+///
+/// The intermittent hang we chase wedges right after the first secondary comes
+/// online: a vCPU stalls in WFI because `gicd.irq_pending` reports nothing
+/// deliverable, so the per-CPU timer PPI / rescheduling SGI it is waiting on is
+/// never taken, and the primary blocks forever in the CPU-up handshake. Host
+/// stack samples only reveal parked-vs-spinning, not *why* delivery is gated.
+/// This trace makes the gate observable: at each park it emits the parking VP's
+/// redistributor snapshot (`PpiDiag`: pending/active/enable/group, PMR, group
+/// enables, BPR, active-priority words, per-intid priority) so a pending PPI
+/// blocked by a masked PMR, a disabled group, or a stuck active-priority bit is
+/// visible directly, and secondaries still awaiting their `CPU_ON` are
+/// distinguished from ones that came online and then stalled.
+fn smp_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("OPENVMM_HVF_SMP_TRACE")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if on {
+            tracing::warn!(
+                "HVF SMP-bringup trace ENABLED (OPENVMM_HVF_SMP_TRACE): emitting \
+                 rate-limited `hvf_smpdiag` park records (CPU_ON wait + WFI gate)"
+            );
+        }
+        on
+    })
+}
+
 impl<'p> Processor for HvfProcessor<'p> {
     type StateAccess<'a>
         = vp_state::HvfVpStateAccess<'a, 'p>
@@ -2266,7 +2296,15 @@ impl<'p> Processor for HvfProcessor<'p> {
                             .actor
                             .try_park(cx.waker(), || self.inner.cpu_on.lock().is_none())
                         {
-                            vp_actor::ParkDecision::Parked => return Poll::Pending,
+                            vp_actor::ParkDecision::Parked => {
+                                if smp_trace_enabled() {
+                                    tracelimit::info_ratelimited!(
+                                        vp_index = vp_index.index(),
+                                        "hvf_smpdiag: parking: secondary still awaiting PSCI CPU_ON"
+                                    );
+                                }
+                                return Poll::Pending;
+                            }
                             vp_actor::ParkDecision::Rescan => continue,
                         }
                     }
@@ -2342,6 +2380,13 @@ impl<'p> Processor for HvfProcessor<'p> {
                             .try_park(cx.waker(), || !self.partition.gicd.irq_pending(&self.gicr))
                         {
                             vp_actor::ParkDecision::Parked => {
+                                if smp_trace_enabled() {
+                                    tracelimit::info_ratelimited!(
+                                        vp_index = vp_index.index(),
+                                        diag = ?self.gicr.ppi_diag(),
+                                        "hvf_smpdiag: parking: idle in WFI, no interrupt admitted"
+                                    );
+                                }
                                 return Poll::Pending;
                             }
                             vp_actor::ParkDecision::Rescan => continue,

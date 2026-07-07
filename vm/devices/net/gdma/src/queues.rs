@@ -488,7 +488,25 @@ impl Queues {
                     .with_owner_count(cq.q.owner_count()),
             };
             cqe.data[..data.len()].copy_from_slice(data);
-            cq.q.post(&self.gm, &cqe).then_some(cq.eq_id)
+            let eq_id = cq.eq_id;
+            // A CQE only forwards an EQE when the CQ is armed. Record the arm
+            // decision so the interrupt handshake is observable: `cq_armed=false`
+            // means the guest has not re-armed this CQ, so this completion is
+            // silent (no EQE, no MSI) until the guest next rings the CQ doorbell.
+            let cq_armed = cq.q.post(&self.gm, &cqe);
+            if crate::bnic::rx_trace_enabled() {
+                tracing::info!(
+                    target: "mana_irqdiag",
+                    event = "cq_post",
+                    cq_id,
+                    eq_id,
+                    wq_id,
+                    is_send,
+                    cq_armed,
+                    "cqe posted"
+                );
+            }
+            cq_armed.then_some(eq_id)
         });
 
         if let Some(eq_id) = post_to_eq {
@@ -506,7 +524,26 @@ impl Queues {
                     .with_owner_count(eq.q.owner_count()),
             };
             eqe.data[..data.len()].copy_from_slice(data);
-            eq.q.post(&self.gm, &eqe).then_some(eq.msix)
+            let msix = eq.msix;
+            // An EQE only fires an MSI when the EQ is armed. `eq_armed=false`
+            // means the MSI is SUPPRESSED (guest has not re-armed the EQ) --
+            // the smoking gun for a lost-interrupt/arm race. `eq_armed=true`
+            // means the MSI is delivered to `msix`; if the guest still does not
+            // service it, the interrupt is not reaching the guest (delivery/ITS
+            // wiring) rather than being suppressed here.
+            let eq_armed = eq.q.post(&self.gm, &eqe);
+            if crate::bnic::rx_trace_enabled() {
+                tracing::info!(
+                    target: "mana_irqdiag",
+                    event = "eq_post",
+                    eq_id,
+                    msix,
+                    ty,
+                    eq_armed,
+                    "eqe posted"
+                );
+            }
+            eq_armed.then_some(msix)
         });
 
         if let Some(msix) = post_msi {
@@ -547,9 +584,27 @@ impl Queues {
 
     pub fn doorbell_cq(&self, val: CqEqDoorbellValue) {
         let cq_id = val.id();
-        let post_to_eq = self
-            .cq(cq_id)
-            .and_then(|mut cq| cq.q.doorbell(val.tail(), val.arm()).then_some(cq.eq_id));
+        let post_to_eq = self.cq(cq_id).and_then(|mut cq| {
+            let eq_id = cq.eq_id;
+            // The guest servicing/re-arming the CQ. `triggered=true` means the
+            // guest's tail lagged (a completion it must still drain) so we
+            // forward an EQE now; `arm=true triggered=false` means it caught up
+            // and re-armed for the next completion.
+            let triggered = cq.q.doorbell(val.tail(), val.arm());
+            if crate::bnic::rx_trace_enabled() {
+                tracing::info!(
+                    target: "mana_irqdiag",
+                    event = "cq_doorbell",
+                    cq_id,
+                    eq_id,
+                    arm = val.arm(),
+                    tail = val.tail(),
+                    triggered,
+                    "guest rang cq doorbell"
+                );
+            }
+            triggered.then_some(eq_id)
+        });
 
         if let Some(eq_id) = post_to_eq {
             tracing::trace!(cq_id, eq_id, "eq completion on cq doorbell");
@@ -559,9 +614,27 @@ impl Queues {
 
     pub fn doorbell_eq(&self, val: CqEqDoorbellValue) {
         let eq_id = val.id();
-        let post_msi = self
-            .eq(eq_id)
-            .and_then(|mut eq| eq.q.doorbell(val.tail(), val.arm()).then_some(eq.msix));
+        let post_msi = self.eq(eq_id).and_then(|mut eq| {
+            let msix = eq.msix;
+            // The guest servicing/re-arming the EQ interrupt. Seeing this after
+            // an `eq_post` proves the guest received and handled the MSI (rules
+            // out a delivery failure); its absence proves the interrupt never
+            // reached the guest.
+            let triggered = eq.q.doorbell(val.tail(), val.arm());
+            if crate::bnic::rx_trace_enabled() {
+                tracing::info!(
+                    target: "mana_irqdiag",
+                    event = "eq_doorbell",
+                    eq_id,
+                    msix,
+                    arm = val.arm(),
+                    tail = val.tail(),
+                    triggered,
+                    "guest rang eq doorbell"
+                );
+            }
+            triggered.then_some(msix)
+        });
 
         if let Some(msix) = post_msi {
             tracing::trace!(eq_id, msix, "interrupt on eq doorbell");

@@ -414,6 +414,23 @@ impl HwControl {
                 }
             };
 
+            // Gated control-message trace (OPENVMM_MANA_RX_TRACE): record every
+            // HWC/BNIC request the guest issues and the status returned, so the
+            // control-plane bring-up sequence (vport create, MAC-filter register,
+            // vport RX/TX config, WQ-object create) is observable. This localizes
+            // Windows-vs-Linux divergences where a command a guest depends on is
+            // missing, unsupported, or answered with the wrong status.
+            if crate::bnic::rx_trace_enabled() {
+                tracing::info!(
+                    target: "mana_irqdiag",
+                    event = "ctrl_req",
+                    msg_type = format_args!("{:#x}", hdr.req.msg_type),
+                    dev_id = hdr.dev_id.ty.0,
+                    status,
+                    "control message handled"
+                );
+            }
+
             self.state.queues.post_cq(self.cq_id, &[], self.sq_id, true);
 
             let resp = GdmaRespHdr {

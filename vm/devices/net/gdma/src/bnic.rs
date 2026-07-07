@@ -198,6 +198,21 @@ struct RxPacket {
     post_seq: u64,
 }
 
+/// Receive-buffer bookkeeping carried from one datapath generation to the next
+/// across a reconfiguration that must preserve the receive-buffer stream (a live
+/// RSS/steering change). The guest's receive queue and every buffer it has
+/// already posted but the device has not yet completed survive such a change, so
+/// the rebuilt datapath must keep completing those buffers -- in the same FIFO
+/// post order -- instead of starting a fresh pool. Discarding them strands the
+/// guest's outstanding receive NBLs: the device's next completion is matched by
+/// the guest to its oldest still-posted buffer, so every subsequent frame lands
+/// in the wrong buffer (the guest reads a page the device never wrote) and
+/// receive silently breaks.
+struct CarriedRx {
+    rx_packets: Slab<RxPacket>,
+    rx_post_seq: u64,
+}
+
 impl BufferAccess for GuestBuffers {
     fn guest_memory(&self) -> &GuestMemory {
         &self.gm
@@ -465,7 +480,7 @@ impl FakeCrash {
 /// and completion order can be compared. Cross-referenced with a guest pktmon
 /// capture it separates "device wrote the wrong place" from "guest read a
 /// different buffer than the device wrote".
-fn rx_trace_enabled() -> bool {
+pub(crate) fn rx_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         let on = std::env::var("OPENVMM_MANA_RX_TRACE")
@@ -559,6 +574,38 @@ impl Vport {
         self.endpoint.stop().await;
     }
 
+    /// Like [`Vport::stop_datapath`], but returns each datapath task's
+    /// outstanding receive-buffer state (indexed by backend-queue build order)
+    /// so a subsequent [`start_vport_datapath`] can resume the same
+    /// receive-buffer stream. Used for a live RSS/steering reconfiguration,
+    /// where the guest's RQ -- and every buffer it has already posted but the
+    /// device has not yet completed -- survives the change: the device must keep
+    /// completing those buffers in FIFO order rather than discarding them with
+    /// the old task (which would offset every later completion against the
+    /// guest's receive NBL queue and deliver each frame to the wrong buffer).
+    async fn stop_datapath_preserving_rx(&mut self) -> Vec<Option<CarriedRx>> {
+        let mut carried = Vec::with_capacity(self.tasks.len());
+        for mut task in self.tasks.drain(..) {
+            if task.is_running() {
+                task.stop().await;
+            }
+            // Dropping the task releases its backend queue; recover its
+            // receive pool first so the outstanding buffers are not lost.
+            let (_, state) = task.into_inner();
+            carried.push(state.map(|t| CarriedRx {
+                rx_packets: t.pool.rx_packets,
+                rx_post_seq: t.rx_post_seq,
+            }));
+        }
+        // The receive tasks are gone, so drop their fence senders: any future
+        // fence has nothing in flight to order against and is posted inline.
+        for rx in &mut self.queue_cfg.rx {
+            rx.fence_tx = None;
+        }
+        self.endpoint.stop().await;
+        carried
+    }
+
     /// Poll-driven equivalent of [`Vport::stop_datapath`], for tearing the
     /// datapath down from a synchronous context (a PCIe FLR) via
     /// `poll_device`. Datapath tasks are stopped and dropped one at a time so
@@ -592,14 +639,22 @@ impl Vport {
 /// resolved table + hash key down to the backend, which owns steering.
 ///
 /// The receive path must be stopped (`tasks` empty) before calling: the initial
-/// `rx_enable=TRUE` transition arrives that way, and a live re-steer must
-/// `stop_datapath()` first so the backend queues are released before they are
+/// `rx_enable=TRUE` transition arrives that way, and a live re-steer must stop
+/// the datapath first so the backend queues are released before they are
 /// re-acquired via `get_queues`.
+///
+/// `carried` supplies, per backend queue in build order, the previous datapath
+/// generation's outstanding receive buffers when the stream must be preserved
+/// across a steering reconfiguration (see
+/// [`Vport::stop_datapath_preserving_rx`]); it is empty for a fresh bring-up.
+/// Inherited buffers are re-armed on the newly acquired backend queue in post
+/// order so the FIFO correspondence with the guest's receive NBL queue holds.
 async fn start_vport_datapath(
     vport: &mut Vport,
     state: &mut HwState,
     req: &ManaCfgRxSteerReq,
     read: &mut Limit<WqeAccess<'_>>,
+    mut carried: Vec<Option<CarriedRx>>,
 ) -> anyhow::Result<()> {
     let n = vport.queue_cfg.tx.len().min(vport.queue_cfg.rx.len());
     if n == 0 {
@@ -715,6 +770,36 @@ async fn start_vport_datapath(
         let (fence_tx, fence_rx) = mesh::channel();
         vport.queue_cfg.rx[j].fence_tx = Some(fence_tx);
 
+        // Seed this backend queue's receive-buffer bookkeeping. A fresh
+        // bring-up starts empty; a steering reconfiguration that must preserve
+        // the stream inherits the previous generation's outstanding buffers and
+        // post sequence, so the device keeps completing the guest's
+        // already-posted buffers in FIFO order instead of stranding them.
+        let (rx_packets, rx_post_seq) = match carried.get_mut(j).and_then(Option::take) {
+            Some(c) => (c.rx_packets, c.rx_post_seq),
+            None => (Slab::new(), 0),
+        };
+        let mut pool = GuestBuffers {
+            gm: state.queues.gm.clone(),
+            rx_packets,
+            rss_key,
+        };
+        let rx_buf_count = pool.rx_packets.len() as u32;
+        let mut epqueue = epqueue;
+        if rx_buf_count > 0 {
+            // Re-arm the inherited buffers on the freshly acquired backend queue
+            // in post order, so the backend delivers into them ahead of any
+            // buffers the rebuilt task newly polls off the receive ring.
+            let mut ordered: Vec<(u64, RxId)> = pool
+                .rx_packets
+                .iter()
+                .map(|(slot, packet)| (packet.post_seq, RxId(slot as u32)))
+                .collect();
+            ordered.sort_by_key(|(seq, _)| *seq);
+            let ids: Vec<RxId> = ordered.into_iter().map(|(_, id)| id).collect();
+            epqueue.rx_avail(&mut pool, &ids);
+        }
+
         let mut task = TaskControl::new(TxRxState);
         task.insert(
             &state.queues.driver,
@@ -722,17 +807,13 @@ async fn start_vport_datapath(
             TxRxTask {
                 queues: state.queues.clone(),
                 epqueue,
-                pool: GuestBuffers {
-                    gm: state.queues.gm.clone(),
-                    rx_packets: Default::default(),
-                    rss_key,
-                },
+                pool,
                 sqs,
                 rq_id,
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
-                rx_buf_count: 0,
-                rx_post_seq: 0,
+                rx_buf_count,
+                rx_post_seq,
                 cqe_coalescing: cqe_coalescing.clone(),
                 fence_rx,
             },
@@ -996,15 +1077,36 @@ impl BasicNic {
                 // handle is no longer the vport index.
                 let mut removed = None;
                 for vport in &mut self.vports {
-                    let list = if is_send {
-                        &mut vport.queue_cfg.tx
-                    } else {
-                        &mut vport.queue_cfg.rx
+                    let pos = {
+                        let list = if is_send {
+                            &vport.queue_cfg.tx
+                        } else {
+                            &vport.queue_cfg.rx
+                        };
+                        list.iter().position(|w| w.wq_obj == req.wq_obj_handle)
                     };
-                    if let Some(pos) = list.iter().position(|w| w.wq_obj == req.wq_obj_handle) {
+                    if let Some(pos) = pos {
+                        // The driver tears a queue down while its datapath is
+                        // still live: on RSS reconfiguration and on vport
+                        // teardown it fences the RQ and destroys the WQ object
+                        // without first driving CONFIG_VPORT_RX(rx_enable=FALSE)
+                        // to disable the vport. Refusing the destroy in that
+                        // window ("queue still in use") leaks a stale WqObject
+                        // into queue_cfg: the next datapath rebuild binds its
+                        // task to that stale entry (queue_cfg.rx[0]), reads an
+                        // already-drained ring, and delivers zero-SGE receives
+                        // that the backend then drops -- silently wedging RX.
+                        // Quiesce the datapath here instead so the object can be
+                        // removed cleanly; the guest's subsequent CREATE_WQ_OBJ
+                        // + CONFIG_VPORT_RX rebuilds a fresh queue.
                         if vport.tasks.iter().any(|t| t.has_state()) {
-                            anyhow::bail!("queue still in use");
+                            vport.stop_datapath().await;
                         }
+                        let list = if is_send {
+                            &mut vport.queue_cfg.tx
+                        } else {
+                            &mut vport.queue_cfg.rx
+                        };
                         removed = Some(list.remove(pos));
                         break;
                     }
@@ -1103,7 +1205,7 @@ impl BasicNic {
                         state.post_vport_link_status(req.vport as u32, false);
                     }
                     Tristate::TRUE if vport.tasks.is_empty() => {
-                        start_vport_datapath(vport, state, &req, &mut read).await?;
+                        start_vport_datapath(vport, state, &req, &mut read, Vec::new()).await?;
                         // The vport is now fully configured and receiving. A
                         // MANA link does not come up implicitly; the device
                         // must signal it. Report link-up so the driver (the
@@ -1114,16 +1216,26 @@ impl BasicNic {
                     _ => {
                         // Live RSS reconfiguration on an already-running vport.
                         // The real driver (ethtool -X / `mana_config_rss` ->
-                        // `mana_cfg_vport_steering`) re-asserts `rx_enable=TRUE`
-                        // and sets `update_indir_tab` / `update_hashkey` to push
-                        // a new indirection table or hash key WITHOUT bringing
-                        // the vport down (it fences each RQ around the change).
+                        // `mana_cfg_vport_steering`, and the Windows VF at
+                        // bring-up) re-asserts `rx_enable=TRUE` and sets
+                        // `update_indir_tab` / `update_hashkey` to push a new
+                        // indirection table or hash key WITHOUT bringing the
+                        // vport down (it fences each RQ around the change).
                         // Steering is backend-owned and its only (re)config entry
                         // point is `get_queues`, so re-apply by briefly cycling
                         // the datapath: drop the tasks (releasing the backend
                         // queues) and rebuild them with the new table/key. Without
                         // this the update falls through and is silently ignored --
                         // the device acks success but the steering never changes.
+                        //
+                        // Crucially, the guest's RQ is NOT torn down here: it
+                        // keeps every buffer it has already posted but the device
+                        // has not yet completed. So carry that receive-buffer
+                        // stream across the cycle (`stop_datapath_preserving_rx`)
+                        // and re-arm it on the rebuilt datapath; discarding it
+                        // (the old behavior) offset every later completion against
+                        // the guest's receive NBL queue, delivering each frame to
+                        // the wrong buffer and silently breaking receive.
                         //
                         // A pure coalescing toggle (ethtool -C rx-frames) also
                         // arrives here but carries no table or key, so it must
@@ -1134,8 +1246,9 @@ impl BasicNic {
                         if !vport.tasks.is_empty()
                             && (req.update_indir_tab != 0 || req.update_hashkey != 0)
                         {
-                            vport.stop_datapath().await;
-                            start_vport_datapath(vport, state, &req, &mut read).await?;
+                            let carried = vport.stop_datapath_preserving_rx().await;
+                            start_vport_datapath(vport, state, &req, &mut read, carried)
+                                .await?;
                         }
                     }
                 }

@@ -1217,14 +1217,27 @@ mod gicr {
         }
 
         /// Records a write to one of the GICv3 CPU-interface system registers
-        /// (ICC_PMR/BPR/IGRPEN/CTLR). These are banked per-PE, so they live on
-        /// the redistributor's per-CPU state. Returns `true` if `reg` is a
-        /// CPU-interface register handled here.
+        /// (ICC_PMR/BPR/IGRPEN/CTLR/AP{0,1}R0). These are banked per-PE, so they
+        /// live on the redistributor's per-CPU state. Returns `true` if `reg` is
+        /// a CPU-interface register handled here.
         ///
         /// The priority engine consults this state for delivery: PMR masks,
         /// BPR/CBPR group the priority, and IGRPEN/CTLR.EOImode shape ack/eoi.
         /// BPR writes are clamped to the architectural minimum for this
         /// configuration (writes below it read back as it).
+        ///
+        /// The active-priority words ICC_AP0R0_EL1 / ICC_AP1R0_EL1 are writable
+        /// so the guest can *reset* the running-priority bitmap — which is
+        /// exactly what a PE does while initializing its CPU interface (it clears
+        /// the active priorities) and when it restores CPU-interface context.
+        /// Honoring these writes is load-bearing: `admit` gates every delivery on
+        /// `running_priority(apr)`, so a stale active-priority bit left set (for
+        /// instance by an acknowledge whose deactivation the guest performs via a
+        /// route that has since moved) would otherwise wedge that PE — no
+        /// interrupt could ever preempt the phantom running priority again, and
+        /// the guest, unable to clear it, would spin forever. With 5 implemented
+        /// priority bits only AP0R0/AP1R0 exist; AP{0,1}R{1,2,3} are RES0
+        /// (write-ignored) so the guest's init loop doesn't fault on them.
         pub(crate) fn write_cpuif(&mut self, reg: SystemReg, value: u64) -> bool {
             let mut state = self.shared.mutable.lock();
             match reg {
@@ -1238,6 +1251,16 @@ mod gicr {
                     state.icc_cbpr = ctlr.cbpr();
                     state.icc_eoimode = ctlr.eoi_mode();
                 }
+                SystemReg::ICC_AP0R0_EL1 => state.icc_ap0r0 = value as u32,
+                SystemReg::ICC_AP1R0_EL1 => state.icc_ap1r0 = value as u32,
+                // Higher active-priority words are RES0 at 5 priority bits, but
+                // the guest's per-PE init still writes them; accept and ignore.
+                SystemReg::ICC_AP0R1_EL1
+                | SystemReg::ICC_AP0R2_EL1
+                | SystemReg::ICC_AP0R3_EL1
+                | SystemReg::ICC_AP1R1_EL1
+                | SystemReg::ICC_AP1R2_EL1
+                | SystemReg::ICC_AP1R3_EL1 => {}
                 _ => return false,
             }
             true
@@ -1246,8 +1269,11 @@ mod gicr {
         /// Reads one of the GICv3 CPU-interface system registers. Returns `None`
         /// if `reg` is not a CPU-interface register handled here.
         ///
-        /// The writable registers (PMR/BPR/IGRPEN) echo back what the guest
-        /// wrote (clamped for BPR), exactly as real hardware does.
+        /// The writable registers (PMR/BPR/IGRPEN/AP{0,1}R0) echo back what the
+        /// guest wrote (clamped for BPR), exactly as real hardware does.
+        /// ICC_RPR_EL1 reports the current running priority derived from the
+        /// active-priority bitmaps (read-only), and the RES0 higher
+        /// active-priority words read as zero.
         ///
         /// ICC_CTLR_EL1 reports the implemented capability now that the priority
         /// engine is complete: PRIbits = `PRIBITS - 1` (5 implemented priority
@@ -1264,6 +1290,20 @@ mod gicr {
                 SystemReg::ICC_BPR1_EL1 => state.icc_bpr1.into(),
                 SystemReg::ICC_IGRPEN0_EL1 => state.icc_grpen0.into(),
                 SystemReg::ICC_IGRPEN1_EL1 => state.icc_grpen1.into(),
+                SystemReg::ICC_AP0R0_EL1 => state.icc_ap0r0.into(),
+                SystemReg::ICC_AP1R0_EL1 => state.icc_ap1r0.into(),
+                SystemReg::ICC_AP0R1_EL1
+                | SystemReg::ICC_AP0R2_EL1
+                | SystemReg::ICC_AP0R3_EL1
+                | SystemReg::ICC_AP1R1_EL1
+                | SystemReg::ICC_AP1R2_EL1
+                | SystemReg::ICC_AP1R3_EL1 => 0,
+                // The running priority is the highest-priority (numerically
+                // lowest) active group priority across both groups, or
+                // IDLE_PRIORITY when nothing is active.
+                SystemReg::ICC_RPR_EL1 => running_priority(state.icc_ap0r0)
+                    .min(running_priority(state.icc_ap1r0))
+                    .into(),
                 SystemReg::ICC_CTLR_EL1 => IccCtlrEl1::new()
                     .with_cbpr(state.icc_cbpr)
                     .with_eoi_mode(state.icc_eoimode)
@@ -1529,6 +1569,86 @@ mod gicr {
             // A non-CPU-interface register is not claimed here.
             assert!(!redist.write_cpuif(SystemReg::ICC_IAR1_EL1, 0));
             assert_eq!(redist.read_cpuif(SystemReg::ICC_IAR1_EL1), None);
+        }
+
+        // The active-priority registers round-trip, the RES0 higher words read
+        // as zero (but are still claimed so a guest's init loop doesn't fault),
+        // and ICC_RPR_EL1 reports the running priority derived from them.
+        #[test]
+        fn active_priority_registers_round_trip() {
+            use aarch64defs::SystemReg;
+            use super::IDLE_PRIORITY;
+            use super::PREEMPT_SHIFT;
+
+            let (mut redist, _shared) = Redistributor::new(0, 0, true);
+
+            // AP0R0/AP1R0 are writable and read back verbatim (raw bitmaps).
+            assert!(redist.write_cpuif(SystemReg::ICC_AP0R0_EL1, 0x0000_0005));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_AP0R0_EL1), Some(0x5));
+            assert!(redist.write_cpuif(SystemReg::ICC_AP1R0_EL1, 0x0000_0010));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_AP1R0_EL1), Some(0x10));
+
+            // The higher words are RES0 at 5 priority bits: claimed (write
+            // returns true) but read as zero.
+            assert!(redist.write_cpuif(SystemReg::ICC_AP1R1_EL1, 0xffff_ffff));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_AP1R1_EL1), Some(0));
+
+            // ICC_RPR_EL1 is the highest-priority (numerically lowest) active
+            // group priority across both groups. AP1R0 bit 4 → 4 << PREEMPT_SHIFT;
+            // AP0R0 bit 0 → 0, which is numerically lower, so it wins.
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_RPR_EL1), Some(0));
+            // Clear AP0R0 so only AP1R0's bit 4 remains active.
+            redist.write_cpuif(SystemReg::ICC_AP0R0_EL1, 0);
+            assert_eq!(
+                redist.read_cpuif(SystemReg::ICC_RPR_EL1),
+                Some(u64::from(4u8 << PREEMPT_SHIFT))
+            );
+            // Fully idle → IDLE_PRIORITY, so any unmasked interrupt can preempt.
+            redist.write_cpuif(SystemReg::ICC_AP1R0_EL1, 0);
+            assert_eq!(
+                redist.read_cpuif(SystemReg::ICC_RPR_EL1),
+                Some(u64::from(IDLE_PRIORITY))
+            );
+        }
+
+        // Regression: a guest that clears its active-priority register must
+        // recover the ability to take interrupts. If a running priority is left
+        // latched (an acknowledge whose deactivation never lands on this PE),
+        // `admit` blocks every lower-or-equal-priority interrupt forever. The
+        // architected escape hatch is writing ICC_AP{0,1}R0_EL1 = 0, which a PE
+        // does while (re)initializing its CPU interface. Before AP-register
+        // writes were honored this write was silently dropped and the PE stayed
+        // wedged — the guest would spin, never taking the pending interrupt.
+        #[test]
+        fn clearing_active_priority_unwedges_delivery() {
+            use aarch64defs::SystemReg;
+            let (mut redist, shared) = Redistributor::new(0, 0, true);
+            redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xff);
+
+            // A high-priority (0x80) and a low-priority (0xa0) Group-1 interrupt.
+            enable_group1(&shared, 20);
+            enable_group1(&shared, 24);
+            set_priority(&shared, 20, 0x80);
+            set_priority(&shared, 24, 0xa0);
+            redist.raise(20);
+            redist.raise(24);
+
+            // Acknowledge the high-priority one: this latches its group priority
+            // into the active-priority bitmap (running priority now 0x80).
+            assert_eq!(redist.ack(true), Some(20));
+            // The low-priority interrupt cannot preempt the running 0x80, so it
+            // is pending-but-blocked. (Model the "stuck" state: the guest never
+            // gets to EOI 20 — e.g. its deactivation was routed elsewhere.)
+            assert_eq!(redist.ack(true), None);
+
+            // The guest clears the active-priority register to reset its CPU
+            // interface. This MUST take effect and drop the running priority.
+            assert!(redist.write_cpuif(SystemReg::ICC_AP1R0_EL1, 0));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_AP1R0_EL1), Some(0));
+
+            // With the phantom running priority cleared, the pending interrupt
+            // is deliverable again. (Before honoring the write, this was None.)
+            assert_eq!(redist.ack(true), Some(24));
         }
 
         // reset() returns the CPU-interface registers to their defaults.

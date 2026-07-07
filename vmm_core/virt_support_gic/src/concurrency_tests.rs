@@ -665,6 +665,7 @@ mod refmodel {
         pub grpen0: bool,
         pub grpen1: bool,
         pub cbpr: bool,
+        pub eoimode: bool,
         pub apr0: u32,
         pub apr1: u32,
     }
@@ -683,6 +684,7 @@ mod refmodel {
                 grpen0: false,
                 grpen1: false,
                 cbpr: false,
+                eoimode: false,
                 apr0: 0,
                 apr1: 0,
             }
@@ -737,6 +739,9 @@ mod refmodel {
         }
         pub fn set_cbpr(&mut self, cpu: usize, v: bool) {
             self.cpus[cpu].cbpr = v;
+        }
+        pub fn set_eoimode(&mut self, cpu: usize, v: bool) {
+            self.cpus[cpu].eoimode = v;
         }
         pub fn set_grpen1(&mut self, cpu: usize, v: bool) {
             self.cpus[cpu].grpen1 = v;
@@ -949,20 +954,35 @@ mod refmodel {
             if intid >= 1020 {
                 return;
             }
-            if intid < 32 {
-                self.pop_priority(cpu, group1);
-                self.cpus[cpu].active &= !(1 << intid);
+            // EOIR always drops the executing PE's running priority.
+            self.pop_priority(cpu, group1);
+            // Under EOImode == 1 deactivation is deferred to ICC_DIR; under
+            // EOImode == 0 EOIR deactivates now.
+            if self.cpus[cpu].eoimode {
                 return;
             }
-            // SPI: the priority drop pops the *executing* PE's active-priority
-            // stack — EOIR always drops the top entry of the PE that writes it,
-            // independent of the INTID's routing (IHI 0069H.b §4.1) — and the
-            // deactivate clears the interrupt's active bit in the shared
-            // distributor by INTID (any PE may deactivate an SPI). This mirrors
-            // the real model, which no longer re-consults GICD_IROUTER at EOI.
-            self.pop_priority(cpu, group1);
-            let w = intid as usize / 32;
-            self.spi_active[w] &= !(1 << (intid % 32));
+            self.deactivate(cpu, intid);
+        }
+
+        /// ICC_DIR: deactivate only, and only under EOImode == 1 (mirrors the
+        /// real model's `Distributor::dir`). No priority drop.
+        pub fn dir(&mut self, cpu: usize, intid: u32) {
+            if intid >= 1020 || !self.cpus[cpu].eoimode {
+                return;
+            }
+            self.deactivate(cpu, intid);
+        }
+
+        /// Clear the active state of `intid`: an SGI/PPI on the executing PE's
+        /// redistributor, an SPI in the shared distributor (any PE). Neither
+        /// re-consults GICD_IROUTER.
+        fn deactivate(&mut self, cpu: usize, intid: u32) {
+            if intid < 32 {
+                self.cpus[cpu].active &= !(1 << intid);
+            } else {
+                let w = intid as usize / 32;
+                self.spi_active[w] &= !(1 << (intid % 32));
+            }
         }
     }
 }
@@ -1044,13 +1064,20 @@ mod differential {
             // realistic LIFO — but a fraction are deliberately nonsensical.
             let mut inflight: Vec<Vec<u32>> = vec![Vec::new(); N];
 
+            // Under EOImode == 1 an EOIR drops priority but leaves the interrupt
+            // active until a matching ICC_DIR. Track the mode last programmed per
+            // CPU and the intids awaiting a DIR, so most DIRs are realistic
+            // (compliant deactivations) while a fraction stay nonsensical.
+            let mut cur_eoimode = vec![false; N];
+            let mut awaiting_dir: Vec<Vec<u32>> = vec![Vec::new(); N];
+
             check_equiv(&sys, &refm, seed, 0, "init");
 
             for step in 1..=OPS {
                 let last: String;
                 match rng.below(100) {
                     // ---- send SGI (targeted or broadcast) --------------------
-                    0..=26 => {
+                    0..=23 => {
                         let from = rng.below(N as u32) as usize;
                         let intid = rng.below(16);
                         if rng.boolean() {
@@ -1081,18 +1108,41 @@ mod differential {
                         last = format!("ack cpu={cpu} -> {got}");
                     }
                     // ---- EOI (mostly LIFO; sometimes nonsensical) ------------
-                    51..=73 => {
+                    51..=70 => {
                         let cpu = rng.below(N as u32) as usize;
-                        let intid = if !inflight[cpu].is_empty() && rng.below(100) < 80 {
-                            inflight[cpu].pop().unwrap()
-                        } else {
-                            // Nonsensical: EOI a random intid that may not be
-                            // active (and may not even have been acked).
-                            rng.below(MAX_SPIS)
-                        };
+                        let (intid, was_inflight) =
+                            if !inflight[cpu].is_empty() && rng.below(100) < 80 {
+                                (inflight[cpu].pop().unwrap(), true)
+                            } else {
+                                // Nonsensical: EOI a random intid that may not be
+                                // active (and may not even have been acked).
+                                (rng.below(MAX_SPIS), false)
+                            };
                         sys.eoi1(cpu, intid);
                         refm.eoi(cpu, true, intid);
+                        // Under EOImode == 1 the EOIR left it active; queue a DIR
+                        // so a compliant deactivate eventually follows.
+                        if was_inflight && cur_eoimode[cpu] {
+                            awaiting_dir[cpu].push(intid);
+                        }
                         last = format!("eoi cpu={cpu} id={intid}");
+                    }
+                    // ---- deactivate via ICC_DIR (EOImode==1 second half) -----
+                    71..=73 => {
+                        let cpu = rng.below(N as u32) as usize;
+                        let intid = if !awaiting_dir[cpu].is_empty() && rng.below(100) < 80 {
+                            // DIR order is independent of EOIR order, so pick any
+                            // pending one (not strictly LIFO).
+                            let idx = rng.below(awaiting_dir[cpu].len() as u32) as usize;
+                            awaiting_dir[cpu].swap_remove(idx)
+                        } else {
+                            // Nonsensical: DIR a random intid (maybe inactive, or
+                            // under EOImode==0 where DIR must be ignored).
+                            rng.below(MAX_SPIS)
+                        };
+                        sys.dir1(cpu, intid);
+                        refm.dir(cpu, intid);
+                        last = format!("dir cpu={cpu} id={intid}");
                     }
                     // ---- raise a PPI (+ enable it) ---------------------------
                     74..=81 => {
@@ -1154,14 +1204,16 @@ mod differential {
                             }
                             _ => {
                                 let cbpr = rng.boolean();
-                                // ICC_CTLR_EL1: bit0 = CBPR, bit1 = EOImode(=0).
-                                sys.write_cpuif(
-                                    cpu,
-                                    SystemReg::ICC_CTLR_EL1,
-                                    if cbpr { 1 } else { 0 },
-                                );
+                                let eoimode = rng.boolean();
+                                // ICC_CTLR_EL1: bit0 = CBPR, bit1 = EOImode.
+                                let v =
+                                    (u64::from(cbpr)) | (u64::from(eoimode) << 1);
+                                sys.write_cpuif(cpu, SystemReg::ICC_CTLR_EL1, v);
                                 refm.set_cbpr(cpu, cbpr);
-                                last = format!("cbpr cpu={cpu} v={cbpr}");
+                                refm.set_eoimode(cpu, eoimode);
+                                cur_eoimode[cpu] = eoimode;
+                                last =
+                                    format!("ctlr cpu={cpu} cbpr={cbpr} eoimode={eoimode}");
                             }
                         }
                     }

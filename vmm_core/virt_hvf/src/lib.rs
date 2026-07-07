@@ -2237,6 +2237,11 @@ impl HvfProcessor<'_> {
 /// blocked by a masked PMR, a disabled group, or a stuck active-priority bit is
 /// visible directly, and secondaries still awaiting their `CPU_ON` are
 /// distinguished from ones that came online and then stalled.
+///
+/// It additionally emits a rate-limited `hvf_pcdiag` record at each VM exit with
+/// the guest PC/ELR/CPSR, so a vCPU that is *not* parked but busy-spinning in a
+/// guest `cpu_relax`/YIELD loop (which host samples render only as opaque
+/// `hv_trap`) reveals the recurring PC of the stuck loop.
 fn smp_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2246,7 +2251,8 @@ fn smp_trace_enabled() -> bool {
         if on {
             tracing::warn!(
                 "HVF SMP-bringup trace ENABLED (OPENVMM_HVF_SMP_TRACE): emitting \
-                 rate-limited `hvf_smpdiag` park records (CPU_ON wait + WFI gate)"
+                 rate-limited `hvf_smpdiag` park records (CPU_ON wait + WFI gate) \
+                 and `hvf_pcdiag` guest-exit PC records (busy-spin localization)"
             );
         }
         on
@@ -2450,6 +2456,33 @@ impl<'p> Processor for HvfProcessor<'p> {
             unsafe { abi::hv_vcpu_run(self.vcpu.vcpu) }
                 .chk()
                 .map_err(|err| dev.fatal_error(err.into()))?;
+
+            // DIAGNOSTIC (guest-spin localization, default-off, gated on
+            // OPENVMM_HVF_SMP_TRACE): a wedged guest vCPU that busy-spins in a
+            // `cpu_relax`/YIELD loop — the boot CPU stuck in an SMP or spinlock
+            // handshake, or a driver polling a memory-backed completion — never
+            // stops exiting, because the periodic vtimer/preemption exit still
+            // returns here. Host stack samples only ever show `hv_trap` for such
+            // a vCPU (opaque guest execution); emitting the *recurring* guest PC
+            // (with ELR + CPSR for the EL and DAIF interrupt-mask state)
+            // pinpoints the stuck loop. Rate-limited so a hot-spinning CPU logs
+            // roughly once per second, not once per exit.
+            if smp_trace_enabled() {
+                tracelimit::info_ratelimited!(
+                    vp_index = vp_index.index(),
+                    pc = format!("{:#x}", self.vcpu.pc()),
+                    elr = format!(
+                        "{:#x}",
+                        self.vcpu.sys_reg(abi::HvSysReg::ELR_EL1).unwrap_or(0)
+                    ),
+                    cpsr = format!(
+                        "{:#x}",
+                        self.vcpu.reg(abi::HvReg::CPSR).unwrap_or(0)
+                    ),
+                    exit = self.vcpu.exit.reason.0,
+                    "hvf_pcdiag: guest exit PC (spin localization)"
+                );
+            }
 
             // DIAGNOSTIC (CloudMOS bugcheck): record the guest's most-recent EL1
             // synchronous data abort (EC=0x25) at each exit into a small ring, so

@@ -1668,6 +1668,42 @@ impl PmuState {
     }
 }
 
+/// Returns `true` when an A64 trapped-instruction transfer-register field
+/// (the data-abort `SRT` or the system-register `Rt`) encodes `XZR` rather than
+/// a general-purpose register.
+///
+/// Per the A64 ISA, register number `0b11111` (31) designates `XZR`/`WZR` in
+/// the load/store and `MSR`/`MRS` encodings — *not* the stack pointer. Reads of
+/// `XZR` return zero and writes are discarded. This matters because
+/// [`HvfProcessorRunner::vcpu`]'s `gp`/`set_gp` follow the *other* A64
+/// convention where register 31 aliases `SP`: feeding `gp(31)` into a
+/// `msr <sysreg>, xzr` would inject the guest's stack pointer (observed as
+/// bogus `ICC_AP{0,1}R0_EL1` values during GIC init), and `set_gp(31, ..)` for
+/// `mrs xzr, <sysreg>` would clobber it. Both the data-abort and
+/// system-register trap paths route their register-number decisions through
+/// this helper so they cannot diverge.
+fn reg_is_xzr(reg: u8) -> bool {
+    reg == 31
+}
+
+#[cfg(test)]
+mod xzr_tests {
+    use super::reg_is_xzr;
+
+    /// Register number 31 decodes as `XZR` in the trapped load/store (`SRT`)
+    /// and `MSR`/`MRS` (`Rt`) encodings; 0..=30 are real GP registers. This is
+    /// the invariant that keeps `msr <sysreg>, xzr` from injecting the guest
+    /// stack pointer and `mrs xzr, <sysreg>` from clobbering it — the bug that
+    /// surfaced as bogus `ICC_AP{0,1}R0_EL1` writes during GIC init.
+    #[test]
+    fn only_reg_31_is_xzr() {
+        for reg in 0..=30u8 {
+            assert!(!reg_is_xzr(reg), "reg {reg} must be a GP register, not XZR");
+        }
+        assert!(reg_is_xzr(31), "reg 31 must decode as XZR");
+    }
+}
+
 /// Reflects the host physical counter for guests that trap `CNTPCT_EL0` /
 /// `CNTVCT_EL0`.
 ///
@@ -2503,10 +2539,10 @@ impl<'p> Processor for HvfProcessor<'p> {
                             let reg = iss.srt();
 
                             if iss.wnr() {
-                                let data = match reg {
-                                    0..=30 => self.vcpu.gp(reg),
-                                    31 => 0,
-                                    _ => unreachable!(),
+                                let data = if reg_is_xzr(reg) {
+                                    0
+                                } else {
+                                    self.vcpu.gp(reg)
                                 }
                                 .to_ne_bytes();
                                 if !self
@@ -2521,7 +2557,7 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     )
                                     .await;
                                 }
-                            } else if reg != 31 {
+                            } else if !reg_is_xzr(reg) {
                                 let mut data = [0; 8];
                                 if !self
                                     .partition
@@ -2577,9 +2613,24 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     );
                                     0
                                 };
-                                self.vcpu.set_gp(iss.rt(), value);
+                                // `mrs xzr, <sysreg>` discards the result: skip
+                                // the write-back (see `reg_is_xzr`). The read
+                                // above still runs for its side effects, e.g.
+                                // ICC_IAR1_EL1 acknowledge.
+                                if !reg_is_xzr(iss.rt()) {
+                                    self.vcpu.set_gp(iss.rt(), value);
+                                }
                             } else {
-                                let value = self.vcpu.gp(iss.rt());
+                                // `msr <sysreg>, xzr` writes zero, not the stack
+                                // pointer that `gp(31)` would return (see
+                                // `reg_is_xzr`); this was the source of the bogus
+                                // `msr ICC_AP{0,1}R0_EL1, xzr` values seen at GIC
+                                // init.
+                                let value = if reg_is_xzr(iss.rt()) {
+                                    0
+                                } else {
+                                    self.vcpu.gp(iss.rt())
+                                };
                                 let handled_by_gic = self.partition.gicd.write_sysreg(
                                     &mut self.gicr,
                                     reg,

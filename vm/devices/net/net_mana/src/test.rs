@@ -1605,6 +1605,220 @@ async fn rx_coalesced_cqe_delivers_batch(driver: DefaultDriver) {
     endpoint.stop().await;
 }
 
+/// Live RSS reconfiguration must preserve the guest's already-posted receive
+/// buffer stream. A running vport keeps its receive queue -- and every buffer
+/// the guest has posted but the device has not yet completed -- across an
+/// in-place steering change (`MANA_CONFIG_VPORT_RX` re-asserting `rx_enable=TRUE`
+/// with `update_hashkey` / `update_indir_tab` set). The emulator briefly cycles
+/// its backend datapath to apply the new key/table, and it MUST carry those
+/// outstanding buffers onto the rebuilt datapath in FIFO post order. Discarding
+/// them (the original behavior) offsets every later completion against the
+/// guest's receive NBL queue, delivering each frame to the wrong buffer and
+/// silently breaking receive.
+///
+/// This drives a real loopback receive, performs a live re-steer while buffers
+/// are still outstanding (crucially without re-posting any), then drives two
+/// more receives and asserts they land in the next posted buffers in order with
+/// the exact bytes sent. That only holds if the outstanding buffer stream
+/// survived the reconfiguration -- with the buffers discarded the rebuilt
+/// datapath has nothing to receive into and the post-reconfig receives never
+/// arrive.
+#[async_test]
+async fn rss_reconfig_preserves_rx_buffer_stream(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 512;
+
+    // Supplying a hash key sets `update_hashkey` on the steering request, which
+    // is what makes the second `config_rx` a live reconfiguration (rather than a
+    // no-op) and thus exercises the buffer carry-over path.
+    const HASH_KEY: [u8; 40] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
+
+    // Build the full device stack directly so we can capture the payload memory
+    // and drive a concrete `ManaQueue` across a live steering change.
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rss_reconfig_rx");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Bring the receive datapath up: a fresh start with no RSS and no carried
+    // buffers.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post a batch of receive buffers exactly once. The test never re-posts, so
+    // every receive after the re-steer must be satisfied by a buffer that was
+    // still outstanding when the reconfiguration happened.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    // Sends the given loopback packets (payloads laid out contiguously from
+    // offset 0, one single-segment TX descriptor each), then polls until they
+    // are all received or a wall-clock budget expires. Returns the RxIds the
+    // packets landed in, in completion order. The wall-clock bound (rather than
+    // only the per-poll deadline) guarantees the test fails fast even if the
+    // datapath keeps signaling readiness without ever delivering the packets --
+    // the failure mode when the receive-buffer stream is not carried across a
+    // reconfiguration.
+    async fn loopback_recv(
+        queue: &mut ManaQueue<TestEmulatedDevice>,
+        pool: &mut net_backend::tests::Bufs,
+        payload_mem: &guestmem::GuestMemory,
+        packets: &[Vec<u8>],
+    ) -> Vec<RxId> {
+        let mut builder = TxPacketBuilder::new();
+        let mut offset = 0u64;
+        for payload in packets {
+            payload_mem.write_at(offset, payload).unwrap();
+            build_tx_segments(payload.len(), 1, false, &mut builder);
+            offset += payload.len() as u64;
+        }
+        queue.tx_avail(&mut *pool, builder.segments()).unwrap();
+
+        let want = packets.len();
+        let mut rx_ids = vec![RxId(0); want];
+        let mut rx_n = 0;
+        let mut tx_done = vec![TxId(0); want];
+        let mut tx_n = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rx_n < want {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let mut context = CancelContext::new().with_timeout(Duration::from_secs(1));
+            match context
+                .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut *pool)))
+                .await
+            {
+                Err(CancelReason::DeadlineExceeded) => continue,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to poll queue ready");
+                    break;
+                }
+                _ => {}
+            }
+            rx_n += queue.rx_poll(&mut *pool, &mut rx_ids[rx_n..]).unwrap();
+            tx_n += queue.tx_poll(&mut *pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        }
+        rx_ids.truncate(rx_n);
+        rx_ids
+    }
+
+    // Receive #1, before the re-steer: lands in the first posted buffer.
+    let sent1: Vec<u8> = (0..PACKET_LEN).map(|i| (0x10 + i) as u8).collect();
+    let rx1 = loopback_recv(
+        &mut queue,
+        &mut pool,
+        &payload_mem,
+        std::slice::from_ref(&sent1),
+    )
+    .await;
+    assert_eq!(
+        rx1.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1],
+        "first receive must use the first buffer"
+    );
+    let mut got = vec![0u8; PACKET_LEN];
+    payload_mem
+        .read_at(2048 * rx1[0].0 as u64, &mut got)
+        .unwrap();
+    assert_eq!(got, sent1, "payload mismatch on the pre-reconfig receive");
+
+    // Live RSS reconfiguration: re-assert rx_enable=TRUE and push a new hash key
+    // WITHOUT bringing the vport down and WITHOUT re-posting receive buffers.
+    // This is the path that must carry the still-outstanding buffers (2..=16)
+    // across the datapath rebuild.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: Some(&HASH_KEY),
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    // Receives #2 and #3, after the re-steer: they must resume the carried
+    // buffer stream at the next posted buffer, in order, with the exact bytes
+    // sent. If the reconfiguration had discarded the outstanding buffers these
+    // receives would never arrive.
+    let sent2: Vec<u8> = (0..PACKET_LEN).map(|i| (0x80 + i) as u8).collect();
+    let sent3: Vec<u8> = (0..PACKET_LEN).map(|i| (0xC0 + i) as u8).collect();
+    let rx23 = loopback_recv(
+        &mut queue,
+        &mut pool,
+        &payload_mem,
+        &[sent2.clone(), sent3.clone()],
+    )
+    .await;
+    assert_eq!(
+        rx23.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![2, 3],
+        "post-reconfig receives must continue the carried buffer stream in FIFO order"
+    );
+    for (rx_id, expected) in rx23.iter().zip([&sent2, &sent3]) {
+        let mut got = vec![0u8; PACKET_LEN];
+        payload_mem
+            .read_at(2048 * rx_id.0 as u64, &mut got)
+            .unwrap();
+        assert_eq!(
+            &got, expected,
+            "payload mismatch on {rx_id:?} after reconfig"
+        );
+    }
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
 /// Builds a minimal Ethernet + IPv4 + TCP frame for the published RSS test flow
 /// (66.9.149.187:2794 -> 161.142.100.80:1766), padded to `len` bytes.
 fn tcp_ipv4_frame(len: usize) -> Vec<u8> {

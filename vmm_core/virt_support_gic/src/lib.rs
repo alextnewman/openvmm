@@ -316,29 +316,24 @@ mod gicd {
                 gicr.eoi(group1, intid);
                 return;
             }
-            // SPI: only the PE the interrupt is routed to (GICD_IROUTER) — the PE
-            // that acknowledged it — performs the priority-drop and deactivation.
-            // For an unprogrammed route this resolves to PE 0, matching the prior
-            // PE-0-only behavior.
-            let route = self
-                .state
-                .lock()
-                .route
-                .get(intid as usize)
-                .copied()
-                .unwrap_or(0);
-            if self.route_to_pe(route) != gicr.index as u32 {
-                return;
-            }
-            // Priority-drop on the acknowledging PE, then deactivate the
-            // distributor's active bit. We deactivate on EOIR regardless of
-            // EOImode for now (matching the historical, Linux-validated
-            // behavior); the EOImode=1 split deactivate via ICC_DIR is a O3
-            // follow-up.
+            // SPI: the priority drop happens on the PE that executed EOIR — the
+            // PE that acknowledged the interrupt, since the architecture requires
+            // IAR and EOIR to be paired on one PE (IHI 0069H.b §4.1: "A priority
+            // drop must be performed by the same PE that activated the
+            // interrupt") — and the deactivation clears the interrupt's active
+            // state in the *distributor* by INTID. Neither step re-consults
+            // GICD_IROUTER: routing is a delivery-time input only, and "SPIs can
+            // be deactivated by a different PE" (§4.1; the active state lives in
+            // the shared distributor). A stale-route guard here would strand an
+            // in-flight SPI whose affinity a guest moves between IAR and EOIR —
+            // the acking PE's active-priority bit would never be popped (wedging
+            // its preemption gate) and the SPI would never deactivate.
             gicr.pop_priority(group1);
             tracing::trace!(intid, "gic eoi");
-            let v = &mut self.state.lock().active[intid as usize / 32];
-            *v &= !(1 << (intid & 31));
+            let w = intid as usize / 32;
+            if let Some(v) = self.state.lock().active.get_mut(w) {
+                *v &= !(1 << (intid & 31));
+            }
         }
 
         fn write32(&self, address: GicdRegister, value: u32) -> bool {

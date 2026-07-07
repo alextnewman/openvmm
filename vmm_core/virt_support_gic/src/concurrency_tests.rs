@@ -378,6 +378,57 @@ mod irouter {
         assert!(!sys.pending(0) && !sys.pending(1));
     }
 
+    /// Re-targeting an SPI's `GICD_IROUTER` *while it is in flight* — acknowledged
+    /// on its original PE but not yet EOI'd — must not strand its completion.
+    ///
+    /// The architecture requires the priority drop and the deactivation to be
+    /// performed by the PE that executes `ICC_EOIR` — the PE that acknowledged
+    /// the interrupt — and the GIC does not re-consult `GICD_IROUTER` at EOI
+    /// time. Keying the EOI off the *current* route instead strands the
+    /// completion on the acking PE two ways at once: the active-priority bit
+    /// pushed at acknowledge is never popped (so that PE's running priority stays
+    /// raised and its preemption gate rejects every same-or-lower-priority
+    /// interrupt forever), and the SPI's active bit is never cleared (so it never
+    /// re-delivers). Either leak is a hang.
+    #[test]
+    fn spi_reroute_between_ack_and_eoi_still_completes_on_acking_pe() {
+        let mut sys = Sys::new(2, 96);
+        sys.online_all();
+        sys.provision_spi(48, 0x40);
+
+        // Delivered to and acknowledged on PE 1.
+        route_spi_to(&sys, 48, 1);
+        assert_eq!(sys.dist.set_pending(48, true), Some(1));
+        assert_eq!(sys.ack1(1), 48, "PE 1 acknowledges the routed SPI");
+        assert!(
+            sys.redists[1].ppi_diag().icc_ap1r0 != 0,
+            "PE 1's running priority is raised while SPI 48 is active"
+        );
+        assert!(
+            sys.spi_active_word(1) & (1 << (48 % 32)) != 0,
+            "SPI 48 is active after ack"
+        );
+
+        // The guest moves the vector's affinity to PE 0 *before* PE 1 completes.
+        route_spi_to(&sys, 48, 0);
+
+        // PE 1 — the PE that took the interrupt — completes it.
+        sys.eoi1(1, 48);
+
+        // The priority drop happened on the acking PE: its active-priority
+        // bitmap is clear, so its preemption gate is open again.
+        assert_eq!(
+            sys.redists[1].ppi_diag().icc_ap1r0,
+            0,
+            "EOI on the acking PE must drop its running priority despite the reroute"
+        );
+        // The deactivation happened: the SPI is no longer active.
+        assert!(
+            sys.spi_active_word(1) & (1 << (48 % 32)) == 0,
+            "EOI on the acking PE must deactivate the SPI despite the reroute"
+        );
+    }
+
     /// An unprogrammed `GICD_IROUTER` (route == 0) resolves to PE 0, preserving
     /// the historical default so a guest that never sets affinity is unaffected.
     #[test]
@@ -743,10 +794,13 @@ mod refmodel {
                 self.cpus[cpu].active &= !(1 << intid);
                 return;
             }
-            if cpu != 0 {
-                return;
-            }
-            self.pop_priority(0, group1);
+            // SPI: the priority drop pops the *executing* PE's active-priority
+            // stack — EOIR always drops the top entry of the PE that writes it,
+            // independent of the INTID's routing (IHI 0069H.b §4.1) — and the
+            // deactivate clears the interrupt's active bit in the shared
+            // distributor by INTID (any PE may deactivate an SPI). This mirrors
+            // the real model, which no longer re-consults GICD_IROUTER at EOI.
+            self.pop_priority(cpu, group1);
             let w = intid as usize / 32;
             self.spi_active[w] &= !(1 << (intid % 32));
         }

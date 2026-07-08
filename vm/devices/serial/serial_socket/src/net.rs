@@ -102,6 +102,16 @@ pub struct SocketSerialBackend {
     listener: Option<PolledSocket<Socket>>,
 }
 
+/// Opt-in diagnostic gate for the serial-socket TX path, controlled by the
+/// `OPENVMM_PL011_DIAG` environment variable. Logs are rate-limited and have no
+/// effect (and near-zero cost) when the variable is unset.
+fn serial_socket_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENVMM_PL011_DIAG").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 impl InspectMut for SocketSerialBackend {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond().field_with("state", || {
@@ -200,6 +210,42 @@ impl AsyncWrite for SocketSerialBackend {
         let Some(current) = &mut self.current else {
             return Poll::Ready(Ok(buf.len()));
         };
+        // Optimistically attempt a direct non-blocking send before deferring to
+        // the readiness-gated async path.
+        //
+        // `PolledSocket::poll_write` only issues the underlying `send(2)` after
+        // the reactor delivers a writable readiness edge. On edge-triggered
+        // backends (e.g. kqueue `EV_CLEAR`) that edge is delivered once when the
+        // socket first becomes writable; if it is consumed or missed relative to
+        // a guest that busy-polls the UART TX flags from its own vCPU thread
+        // (the polled-console path, with interrupts masked), the async drain can
+        // stall indefinitely even though the socket has ample send-buffer space.
+        // The vCPU never yields to let the reactor re-arm, so the guest wedges.
+        //
+        // The socket is non-blocking (set by `PolledSocket::new`), so trying the
+        // syscall directly here is safe on the vCPU thread: it makes forward
+        // progress whenever the socket can accept bytes and only falls back to
+        // readiness registration on genuine backpressure (`WouldBlock`).
+        match current.get().send(buf) {
+            Ok(n) if n > 0 => {
+                if serial_socket_diag_enabled() {
+                    tracelimit::info_ratelimited!(n, "serialdiag: direct TX send accepted");
+                }
+                return Poll::Ready(Ok(n));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if serial_socket_diag_enabled() {
+                    tracelimit::info_ratelimited!(
+                        "serialdiag: direct TX send WouldBlock; deferring to readiness-gated path (genuine backpressure)"
+                    );
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                return Poll::Ready(Ok(buf.len()));
+            }
+            Err(err) => return Poll::Ready(Err(err)),
+        }
         let r = ready!(Pin::new(current).poll_write(cx, buf));
         if matches!(&r, Err(err) if err.kind() == io::ErrorKind::BrokenPipe) {
             return Poll::Ready(Ok(buf.len()));
@@ -227,5 +273,59 @@ impl AsyncWrite for SocketSerialBackend {
             return Poll::Ready(Ok(()));
         }
         Poll::Ready(r)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use futures::AsyncWrite;
+    use futures::task::noop_waker_ref;
+    use pal_async::DefaultDriver;
+    use pal_async::async_test;
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    /// Regression test for the polled-console hang.
+    ///
+    /// A guest that busy-polls the UART TX flags from its own vCPU thread (with
+    /// interrupts masked) drives `poll_write` with a `Context` whose waker never
+    /// receives a reactor-delivered writable edge — the vCPU never yields to let
+    /// the single-threaded reactor run. The readiness-gated async path would
+    /// therefore park forever and the guest would wedge, even though the socket
+    /// has ample send-buffer space.
+    ///
+    /// This drives that exact scenario deterministically: on the single-threaded
+    /// `DefaultPool` executor+reactor, everything up to the first `.await` runs
+    /// without the reactor servicing `kevent()`, so no writable readiness is
+    /// ever delivered. The write must still make forward progress via the direct
+    /// non-blocking send. Prior to the fix this returned `Poll::Pending` and the
+    /// bytes never reached the peer.
+    #[async_test]
+    async fn direct_send_progresses_without_reactor_readiness(driver: DefaultDriver) {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let guest = Socket::from(OwnedFd::from(guest));
+        let sock = PolledSocket::new(&driver, guest).unwrap();
+        let mut backend = SocketSerialBackend {
+            driver: Box::new(driver.clone()),
+            current: Some(sock),
+            listener: None,
+        };
+
+        // Synchronous poll with a no-op waker: the reactor has had no chance to
+        // deliver a writable edge, mirroring the busy-polling vCPU.
+        let mut cx = Context::from_waker(noop_waker_ref());
+        match Pin::new(&mut backend).poll_write(&mut cx, b"hello") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, 5),
+            other => panic!("expected the write to make progress without reactor readiness, got {other:?}"),
+        }
+
+        // The bytes must have actually reached the peer.
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 5];
+        host.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
     }
 }

@@ -16,6 +16,7 @@ unix_socket = { workspace = true, features = ["mesh"] }
 pal_async.workspace = true
 futures.workspace = true
 socket2.workspace = true
+tracelimit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 pal.workspace = true

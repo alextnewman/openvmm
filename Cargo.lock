@@ -7288,6 +7288,7 @@ dependencies = [
  "pal_async",
  "serial_core",
  "socket2",
+ "tracelimit",
  "tracing",
  "unix_socket",
  "vm_resource",

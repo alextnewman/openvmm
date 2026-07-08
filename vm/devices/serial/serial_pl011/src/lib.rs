@@ -78,6 +78,13 @@ pub struct SerialPl011 {
     rx_waker: Option<Waker>,
     #[inspect(skip)]
     tx_waker: Option<Waker>,
+    /// The most recent waker seen by [`Self::poll_device`]. Retained so that a
+    /// TX drain performed inline on the guest's MMIO access thread (see
+    /// [`SerialPl011::drain_tx_inline`]) can register the poll task's waker with
+    /// the backend, preserving asynchronous delivery for the interrupt-driven
+    /// path.
+    #[inspect(skip)]
+    device_waker: Option<Waker>,
     stats: SerialStats,
 }
 
@@ -152,6 +159,7 @@ impl SerialPl011 {
             io,
             rx_waker: None,
             tx_waker: None,
+            device_waker: None,
             stats: Default::default(),
         };
         if this.io.is_connected() {
@@ -190,6 +198,35 @@ impl SerialPl011 {
 
         // Synchronize the interrupt output.
         self.interrupt.set_level(self.state.pending_interrupt());
+    }
+
+    /// Best-effort synchronous TX drain, performed on the guest's own MMIO
+    /// access thread.
+    ///
+    /// The guest's polled console path (`pl011_console_putchar` /
+    /// `pl011_console_write`) spins on the TXFF/BUSY flags with interrupts
+    /// masked. Under a fast (release) guest this tight MMIO spin can win the
+    /// device lock often enough to starve the asynchronous
+    /// [`Self::poll_device`] task that would otherwise drain the TX FIFO,
+    /// turning a transient stall into an indefinite hang. Draining inline here
+    /// guarantees forward progress regardless of when the poll task is
+    /// scheduled: the guest's own repeated FR reads drive the drain. Genuine
+    /// backend backpressure (a truly full socket) still stalls the guest,
+    /// exactly as real hardware and the async path would (see the
+    /// `is_thr_empty` discussion in the 16550 emulator).
+    fn drain_tx_inline(&mut self) {
+        if self.state.tx_buffer.is_empty() {
+            return;
+        }
+        // Register the poll task's waker with the backend so that, if the write
+        // blocks, asynchronous delivery still resumes for callers that go idle
+        // (e.g. the interrupt-driven path). Without a known waker (before the
+        // first `poll_device`, or in unit tests) fall back to the async path.
+        let Some(waker) = self.device_waker.clone() else {
+            return;
+        };
+        let mut cx = Context::from_waker(&waker);
+        let _ = self.poll_tx(&mut cx);
     }
 
     fn poll_tx(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -318,7 +355,13 @@ impl SerialPl011 {
         let val: u16 = match register {
             Register::UARTDR => self.state.read_dr().into(),
             Register::UARTRSR => 0, // Status flags we don't care about, return zeros.
-            Register::UARTFR => self.state.read_fr(),
+            Register::UARTFR => {
+                // Drain any queued TX inline so a guest polling TXFF/BUSY with
+                // interrupts masked observes forward progress even if the async
+                // poll task is starved by this very spin.
+                self.drain_tx_inline();
+                self.state.read_fr()
+            }
             Register::UARTILPR => self.state.ilpr as u16,
             Register::UARTIBRD => self.state.ibrd,
             Register::UARTFBRD => u8::from(self.state.fbrd) as u16,
@@ -384,6 +427,12 @@ impl SerialPl011 {
                 };
             }
         }
+        if matches!(register, Register::UARTDR) {
+            // Push freshly-queued output toward the backend immediately, rather
+            // than waiting for the async poll task, so the guest's next TXFF/BUSY
+            // poll can already observe drained state.
+            self.drain_tx_inline();
+        }
         self.sync();
         IoResult::Ok
     }
@@ -413,6 +462,7 @@ impl ChipsetDevice for SerialPl011 {
 
 impl PollDevice for SerialPl011 {
     fn poll_device(&mut self, cx: &mut Context<'_>) {
+        self.device_waker = Some(cx.waker().clone());
         let _ = self.poll_tx(cx);
         let _ = self.poll_rx(cx);
         self.sync();

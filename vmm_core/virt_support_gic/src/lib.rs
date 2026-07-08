@@ -236,10 +236,19 @@ mod gicd {
             wake: impl FnMut(usize),
         ) -> bool {
             match reg {
-                SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
-                SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
+                SystemReg::ICC_EOIR0_EL1 => {
+                    tracing::info!(target: "gic5c", intid = value as u32, "ICC_EOIR0");
+                    self.eoi(gicr, false, value as u32)
+                }
+                SystemReg::ICC_EOIR1_EL1 => {
+                    tracing::info!(target: "gic5c", intid = value as u32, "ICC_EOIR1");
+                    self.eoi(gicr, true, value as u32)
+                }
                 SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
-                SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
+                SystemReg::ICC_SGI1R_EL1 => {
+                    tracing::info!(target: "gic5c", raw = format!("{value:#x}"), intid = GicrSgi::from(value).intid(), "ICC_SGI1R");
+                    self.sgi(gicr, true, value, wake)
+                }
                 _ => return gicr.write_cpuif(reg, value),
             }
             true
@@ -270,8 +279,16 @@ mod gicd {
 
         pub fn read_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg) -> Option<u64> {
             let v = match reg {
-                SystemReg::ICC_IAR0_EL1 => self.ack(gicr, false).into(),
-                SystemReg::ICC_IAR1_EL1 => self.ack(gicr, true).into(),
+                SystemReg::ICC_IAR0_EL1 => {
+                    let intid = self.ack(gicr, false);
+                    tracing::info!(target: "gic5c", intid, "ICC_IAR0 ack (grp0/FIQ)");
+                    intid.into()
+                }
+                SystemReg::ICC_IAR1_EL1 => {
+                    let intid = self.ack(gicr, true);
+                    tracing::info!(target: "gic5c", intid, "ICC_IAR1 ack (grp1/IRQ)");
+                    intid.into()
+                }
                 _ => return gicr.read_cpuif(reg),
             };
             Some(v)
@@ -383,6 +400,16 @@ mod gicd {
                 GicdRegister::TYPER => GicdTyper::new()
                     .with_it_lines_number(31)
                     .with_id_bits(5)
+                    // Advertise two security states (SecurityExtn=1), as real
+                    // Hyper-V does. The Windows ARM64 HAL, when it detects a
+                    // Microsoft-compatible hypervisor (ExtEnvHvGuest), rejects a
+                    // single-security-state GICv3 (SecurityExtn=0) in
+                    // HalpGic3ValidateIoUnit and bugchecks 0x5C. Non-secure
+                    // guests only ever touch the Non-secure view of GICD_CTLR
+                    // (ARE_NS=bit4, matching our `are` bit), so this is a pure
+                    // capability advertisement with no change to register
+                    // behavior; Linux keeps its existing DS=1 view.
+                    .with_security_extn(true)
                     .into(),
                 GicdRegister::IIDR => 0,
                 GicdRegister::TYPER2 => GicdTyper2::new().into(),
@@ -663,6 +690,37 @@ mod gicr {
     /// Running priority reported when the active-priority bitmap is empty: the
     /// lowest possible priority, so any unmasked interrupt preempts.
     pub(crate) const IDLE_PRIORITY: u8 = 0xff;
+
+    /// SGIs (INTID 0..=15) are permanently enabled in this redistributor and
+    /// cannot be enabled or disabled by the guest: `GICR_ISENABLER0` /
+    /// `GICR_ICENABLER0` writes to the low 16 bits are ignored, and the enable
+    /// state always reads back as set for those bits. This mirrors the Hyper-V
+    /// host vGIC contract (its redistributor emulation masks writes with
+    /// `& 0xFFFF0000` — "SGIs are permanently enabled"). Windows relies on it:
+    /// it programs a SynIC SINT onto an SGI vector and delivers/receives the
+    /// resulting interrupt without ever writing `GICR_ISENABLER0` for it.
+    pub(crate) const SGI_ENABLE_MASK: u32 = 0x0000_ffff;
+
+    /// The reset/default value of every redistributor's `GICR_IGROUPR0` (the
+    /// SGI/PPI group configuration): all 32 SGI/PPIs are Non-secure Group 1.
+    ///
+    /// Real Hyper-V's synthetic vGIC treats `GICR_IGROUPR0` (and `GICD_IGROUPR`)
+    /// as **RAZ/WI** — it does not model per-interrupt groups at all and delivers
+    /// every interrupt as Group 1, the only group a non-secure HvGuest uses
+    /// (oracle: `hvx/synic/arm64/SynicVGicEmulation{Read,Write}Gicr.c` —
+    /// "GICR_IGROUPR0: RAZ" / "WI"). Windows' HAL writes it all-ones on every PE
+    /// during per-PE init anyway (`gic3.c`: `GIC_WRITE(LocalUnit->Redistributor,
+    /// GICR_IGROUPR0, 0xFFFFFFFF)`).
+    ///
+    /// Seeding it to all-Group-1 (rather than the hardware-typical all-Group-0)
+    /// is REQUIRED for SMP: on `-p > 1`, Windows brings up a secondary PE and
+    /// broadcasts a Group-1 SGI (`ICC_SGI1R`, IRM=1) to it *before* that PE has
+    /// written its own `GICR_IGROUPR0`. If the SGI defaulted to Group 0 it would
+    /// be undeliverable (guests run with `ICC_IGRPEN0`=0), latch pending forever,
+    /// and SMP bringup would hang mid-boot. Uniprocessor and Linux dodge this
+    /// (Linux writes IGROUPR0 first thing on each PE), which is why the `-p 1`
+    /// desktop boot and the `-p 4` Linux gate never surfaced it.
+    pub(crate) const IGROUPR0_RESET: u32 = 0xffff_ffff;
 
     /// The group-priority mask for binary point `bpr`. The binary point splits
     /// an 8-bit priority into a group-priority field (the high `7 - bpr` bits,
@@ -1004,8 +1062,16 @@ mod gicr {
                 GicrSgiRegister::IGROUPR0 => self.mutable.lock().group = data,
                 GicrSgiRegister::ISACTIVER0 => self.mutable.lock().active |= data,
                 GicrSgiRegister::ICACTIVER0 => self.mutable.lock().active &= !data,
-                GicrSgiRegister::ISENABLER0 => self.mutable.lock().enable |= data,
-                GicrSgiRegister::ICENABLER0 => self.mutable.lock().enable &= !data,
+                GicrSgiRegister::ISENABLER0 => {
+                    // SGIs (low 16 bits) are permanently enabled; only PPI
+                    // enable bits are writable.
+                    self.mutable.lock().enable |= data & !SGI_ENABLE_MASK;
+                }
+                GicrSgiRegister::ICENABLER0 => {
+                    // SGIs (low 16 bits) are permanently enabled and cannot be
+                    // disabled; only PPI enable bits are clearable.
+                    self.mutable.lock().enable &= !(data & !SGI_ENABLE_MASK);
+                }
                 GicrSgiRegister::ICFGR0 => {
                     // Cannot change trigger mode for SGIs.
                 }
@@ -1062,8 +1128,8 @@ mod gicr {
                 last,
                 mutable: Mutex::new(SharedMutState {
                     active: 0,
-                    group: 0,
-                    enable: 0,
+                    group: IGROUPR0_RESET,
+                    enable: SGI_ENABLE_MASK,
                     ppi_cfg: 0,
                     priority: [0; 8],
                     sleep: false,
@@ -1111,8 +1177,8 @@ mod gicr {
                 icc_ap1r0,
             } = &mut *state;
             *active = 0;
-            *group = 0;
-            *enable = 0;
+            *group = IGROUPR0_RESET;
+            *enable = SGI_ENABLE_MASK;
             *ppi_cfg = 0;
             *priority = [0; 8];
             *sleep = false;
@@ -1125,6 +1191,29 @@ mod gicr {
             *icc_eoimode = false;
             *icc_ap0r0 = 0;
             *icc_ap1r0 = 0;
+        }
+
+        /// DIAG(gic5c): raw SGI/PPI pending bitmap for this redistributor.
+        pub fn diag_pending(&self) -> u32 {
+            self.shared.pending.load(Ordering::Relaxed)
+        }
+
+        /// DIAG(gic5c): snapshot of the SGI/PPI + CPU-interface delivery state
+        /// as `(pending, enable, group, active, pmr, grpen0, grpen1, prio[intid])`.
+        pub fn diag_state(&self, intid: u32) -> (u32, u32, u32, u32, u8, bool, bool, u8) {
+            let p = self.shared.pending.load(Ordering::Relaxed);
+            let s = self.shared.mutable.lock();
+            let prio = s.priority[intid as usize / 4].to_ne_bytes()[intid as usize % 4];
+            (
+                p,
+                s.enable,
+                s.group,
+                s.active,
+                s.icc_pmr,
+                s.icc_grpen0,
+                s.icc_grpen1,
+                prio,
+            )
         }
 
         /// Records a write to one of the GICv3 CPU-interface system registers
@@ -1151,6 +1240,7 @@ mod gicr {
                 }
                 _ => return false,
             }
+            tracing::info!(target: "gic5c", ?reg, value = format!("{value:#x}"), "write_cpuif");
             true
         }
 
@@ -1468,11 +1558,15 @@ mod gicr {
             shared.write(SGI + IGROUPR0, &group.to_ne_bytes());
         }
 
-        // Enables `intid` (an SGI/PPI) at Group 0. The group register is 0 at
-        // reset (all Group 0), so enabling without touching IGROUPR0 leaves it
-        // in Group 0.
+        // Enables `intid` (an SGI/PPI) at Group 0. IGROUPR0 now resets to all
+        // Group 1 (matching Hyper-V's vGIC; see `IGROUPR0_RESET`), so explicitly
+        // clear this intid's group bit to place it in Group 0.
         fn enable_group0(shared: &super::SharedState, intid: u32) {
             shared.write(SGI + ISENABLER0, &(1u32 << intid).to_ne_bytes());
+            let mut g = [0u8; 4];
+            shared.read(SGI + IGROUPR0, &mut g);
+            let group = u32::from_ne_bytes(g) & !(1u32 << intid);
+            shared.write(SGI + IGROUPR0, &group.to_ne_bytes());
         }
 
         // Sets the 8-bit priority of an SGI/PPI `intid` via byte MMIO, the way a

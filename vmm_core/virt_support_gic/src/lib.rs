@@ -10,6 +10,9 @@ pub use gicd::Distributor;
 pub use gicr::PpiDiag;
 pub use gicr::Redistributor;
 
+#[cfg(test)]
+mod concurrency_tests;
+
 mod gicd {
     use super::Redistributor;
     use super::gicr::SharedState;

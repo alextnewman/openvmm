@@ -26,9 +26,23 @@ use std::sync::atomic::Ordering;
 /// the self-description stays coherent with observable behavior. In particular
 /// `access_partition_reference_tsc` is **false** — we return 0 for the
 /// `ReferenceTsc` register and do not implement the reference TSC page. We
-/// present the Hyper-V guest ABI (synic, hypercalls, synthetic timers, reference
-/// counter, vp index); we are not the Hyper-V hypervisor, so VSM, debugging,
-/// partition management, and hardware-assist privileges all remain false.
+/// present the Hyper-V guest ABI (synic, interrupt control, hypercalls,
+/// synthetic timers, reference counter, vp index); we are not the Hyper-V
+/// hypervisor, so VSM, debugging, partition management, and hardware-assist
+/// privileges all remain false.
+///
+/// `access_apic_msrs` (bit 4) is REQUIRED even though there are no APIC MSRs on
+/// ARM64: that bit position is the architecture-neutral "interrupt control
+/// registers" privilege, spelled `AccessIntrCtrlRegs` in the ARM64
+/// `HV_PARTITION_PRIVILEGE_MASK`. `winhv.sys`'s `WinHvpCheckPartitionPrivileges`
+/// gates its entire hypervisor connection on this bit (together with the synic,
+/// synthetic-timer, reference-counter, hypercall, and vp-index bits); if it is
+/// clear, winhv leaves `WinHvpConnected = FALSE`, never runs
+/// `WinHvpInitializeSynicSupport`, and every later `WinHvGetSintEventFlags`
+/// returns NULL — which is exactly what makes `vmbus.sys` bugcheck 0x7E on a
+/// NULL event-flags page during its root `PrepareHardware`. We back the
+/// synthetic interrupt controller (SCONTROL/EOM/SINTx and GIC-routed delivery),
+/// so advertising it is honest.
 ///
 /// The privilege mask (`_HV_PARTITION_PRIVILEGE_MASK`) is architecture-neutral —
 /// the same 64-bit union on x64 and ARM64 — so reusing `HvPartitionPrivilege`
@@ -39,7 +53,8 @@ const PROVIDED_PRIVILEGES: HvPartitionPrivilege = HvPartitionPrivilege::new()
     .with_access_hypercall_msrs(true)
     .with_access_vp_index(true)
     .with_access_synic_msrs(true)
-    .with_access_synthetic_timer_msrs(true);
+    .with_access_synthetic_timer_msrs(true)
+    .with_access_apic_msrs(true);
 
 /// Builds the 128-bit `PrivilegesAndFeaturesInfo` value using the **ARM64**
 /// feature-dword packing from the private `_HV_ARM64_HYPERVISOR_FEATURES`
@@ -151,6 +166,20 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                 HvArm64RegisterName::Sipp => self.vp.hv1.simp().into(),
                 HvArm64RegisterName::Sifp => self.vp.hv1.siefp().into(),
                 HvArm64RegisterName::Scontrol => self.vp.hv1.scontrol().into(),
+                // Synthetic-interrupt-controller *version* register. This MUST
+                // be handled explicitly: `winhv.sys` gates its entire per-VP
+                // synic bring-up (`WinHvpInitializeSynicSupport`) on reading
+                // exactly `HV_SYNIC_VERSION_1` (== 1) here — any other value is
+                // taken to mean "this isn't the hypervisor's SynIC" and it
+                // silently skips SIMP/SIEFP/SCONTROL setup for every processor.
+                // Falling through to the generic "unsupported register" arm
+                // returns 0, which makes winhv leave `Siefp.EventFlagsPage` NULL;
+                // `vmbus.sys` then dereferences the NULL from
+                // `WinHvGetSintEventFlags(VMBUS_MESSAGE_SINT)` during its root
+                // PrepareHardware and bugchecks 0x7E. The emulator reports the
+                // correct version (1); surface it. (WHP passes this through to
+                // the real hypervisor, which likewise returns 1.)
+                HvArm64RegisterName::Sversion => self.vp.hv1.sversion().into(),
                 r if (HvArm64RegisterName::Sint0..=HvArm64RegisterName::Sint15).contains(&r) => {
                     self.vp
                         .hv1
@@ -242,8 +271,69 @@ impl GetVpRegisters for HvfHypercallHandler<'_, '_> {
                     } else {
                         tracing::info!("guest read GuestCrashCtl (no crash parameters staged)");
                     }
-                    // Control register is write-mostly; report the cleared state.
-                    0u128.into()
+                    // At crash time FAR_EL1/TTBR1_EL1 still hold the last EL1
+                    // synchronous-exception VA and the live high-half page-table
+                    // base (the bugcheck path and this HVC do not touch EL1's
+                    // FAR/TTBR), so log the fault context and walk the guest's own
+                    // stage-1 tables for that VA: a VALID leaf => the page is
+                    // mapped and a HW fault on it is spurious (hypervisor-side
+                    // walker-coherency bug); an INVALID leaf => genuinely unmapped
+                    // (the guest faulted because of bad input or a nested
+                    // page-table-builder fault it could not resolve).
+                    let esr = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::ESR_EL1);
+                    let elr = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::ELR_EL1);
+                    let spsr = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::SPSR_EL1);
+                    let far = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::FAR_EL1);
+                    let ttbr1 = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::TTBR1_EL1);
+                    let tcr = self.vp.vcpu.sys_reg(crate::abi::HvSysReg::TCR_EL1);
+                    if let (Ok(esr), Ok(elr), Ok(spsr), Ok(far)) = (esr, elr, spsr, far) {
+                        let ec = (esr >> 26) & 0x3f;
+                        let dfsc = esr & 0x3f;
+                        let wnr = (esr >> 6) & 1;
+                        tracing::error!(
+                            esr = format!("{esr:#x}"),
+                            ec = format!("{ec:#x}"),
+                            dfsc = format!("{dfsc:#x}"),
+                            wnr,
+                            far = format!("{far:#x}"),
+                            elr = format!("{elr:#x}"),
+                            spsr = format!("{spsr:#x}"),
+                            "EL1 fault context at GuestCrashCtl read"
+                        );
+                    }
+                    if let (Ok(far), Ok(ttbr1), Ok(tcr)) = (far, ttbr1, tcr) {
+                        // Walk the current (last) faulting VA, then dump the full
+                        // recorded chain of recent in-guest EL1 faults so we can
+                        // see the original trigger, not just the crash-time fault.
+                        crate::diag_walk_ttbr1(
+                            &self.vp.partition.guest_memory,
+                            ttbr1,
+                            tcr,
+                            far,
+                        );
+                        crate::diag_dump_fault_ring(
+                            &self.vp.partition.guest_memory,
+                            ttbr1,
+                            tcr,
+                        );
+                    }
+                    // Reads of GuestCrashCtl must report our *supported
+                    // capabilities*, NOT a cleared/zero value. Windows' NT
+                    // bugcheck path reads this register to discover whether the
+                    // host honors the crash enlightenment before it stages
+                    // P0..P4 and commits the CrashNotify write. A zero readback
+                    // makes it conclude the mechanism is unavailable and silently
+                    // skip the parameter writes entirely — observed as "no crash
+                    // parameters staged" -> BSOD painted -> reset, with P0..P4
+                    // never written, so the stop code + faulting address are
+                    // lost. Mirror the production mshv backend's `read_crash_msr`
+                    // exactly (advertise every capability bit).
+                    let caps = hvdef::GuestCrashCtl::new()
+                        .with_crash_notify(true)
+                        .with_crash_message(true)
+                        .with_no_crash_dump(true)
+                        .with_pre_os_id(0b111);
+                    u64::from(caps).into()
                 }
 
                 register => {
@@ -267,6 +357,15 @@ impl hv1_hypercall::ExtendedQueryCapabilities for HvfHypercallHandler<'_, '_> {
         Ok(0)
     }
 }
+
+/// `HvArm64RegisterPartitionInfoPage` (0x00090015, marked "Legacy" in the
+/// private hvgdk header). The guest writes `{ Enabled:1, _:11, GpaPage:52 }`
+/// here to register the GPA of an `HV_PARTITION_INFO_PAGE`; the *hypervisor*
+/// then publishes `TlbInUse` into that page.
+const HV_ARM64_REGISTER_PARTITION_INFO_PAGE: u32 = 0x0009_0015;
+
+/// `HvArm64RegisterTlbiControl` (0x00090016, "Legacy"): `{ TlbiEnlightened:1 }`.
+const HV_ARM64_REGISTER_TLBI_CONTROL: u32 = 0x0009_0016;
 
 impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
     fn set_vp_registers(
@@ -307,10 +406,8 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
                 HvArm64RegisterName::Scontrol => self.vp.hv1.set_scontrol(value.as_u64()),
                 HvArm64RegisterName::Eom => {}
                 r if (HvArm64RegisterName::Sint0..=HvArm64RegisterName::Sint15).contains(&r) => {
-                    self.vp.hv1.set_sint(
-                        (r.0 - HvArm64RegisterName::Sint0.0) as usize,
-                        value.as_u64(),
-                    )
+                    let sint_index = (r.0 - HvArm64RegisterName::Sint0.0) as usize;
+                    self.vp.hv1.set_sint(sint_index, value.as_u64())
                 }
                 // Synthetic timers (STIMERn_CONFIG/COUNT). The synic emulator
                 // arms them; the run loop's `scan()` evaluates and delivers
@@ -356,17 +453,53 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
                         "guest reported a bugcheck: \
                          code={p0:#x} p1={p1:#x} p2={p2:#x} p3={p3:#x} p4={p4:#x}"
                     );
+                    // For an exception-class stop (P0=0x7E) P2/P3/P4 point at the
+                    // faulting PC + on-stack EXCEPTION_RECORD/CONTEXT; decode them
+                    // from guest memory to surface the faulting instruction, the
+                    // access type + faulting VA, and the full register file (which
+                    // names the register that held the bad pointer). The high-half
+                    // kernel VAs translate through the live TTBR1.
+                    if let (Ok(ttbr1), Ok(tcr)) = (
+                        self.vp.vcpu.sys_reg(crate::abi::HvSysReg::TTBR1_EL1),
+                        self.vp.vcpu.sys_reg(crate::abi::HvSysReg::TCR_EL1),
+                    ) {
+                        crate::diag_decode_bugcheck(
+                            &self.vp.partition.guest_memory,
+                            ttbr1,
+                            tcr,
+                            p0,
+                            p2,
+                            p3,
+                            p4,
+                        );
+                        // For non-0x7E stops (e.g. 0x5C, where P3/P4 are not an
+                        // EXCEPTION_RECORD/CONTEXT pair) the decoder returns early,
+                        // so seed a live frame-pointer backtrace from the current
+                        // guest registers to name the routine that called
+                        // KeBugCheckEx, and resolve P3's module.
+                        if p0 != 0x7e && p0 != 0x1000_007e {
+                            if let (Ok(pc), Ok(fp), Ok(lr)) = (
+                                self.vp.vcpu.reg(crate::abi::HvReg::PC),
+                                self.vp.vcpu.reg(crate::abi::HvReg::FP),
+                                self.vp.vcpu.reg(crate::abi::HvReg::LR),
+                            ) {
+                                crate::diag_backtrace_live(
+                                    &self.vp.partition.guest_memory,
+                                    ttbr1,
+                                    tcr,
+                                    pc,
+                                    fp,
+                                    lr,
+                                    p3,
+                                );
+                            }
+                        }
+                    }
                     // When `crash_message` is set, P3 is the GPA of a textual
                     // crash message and P4 its length; surface it too.
                     if ctl.crash_message() && p4 > 0 && p4 <= 4096 {
                         let mut buf = vec![0u8; p4 as usize];
-                        if self
-                            .vp
-                            .partition
-                            .guest_memory
-                            .read_at(p3, &mut buf)
-                            .is_ok()
-                        {
+                        if self.vp.partition.guest_memory.read_at(p3, &mut buf).is_ok() {
                             let text = String::from_utf8_lossy(&buf);
                             tracing::error!(
                                 text = text.trim_end_matches(['\0', '\n', '\r']),
@@ -374,6 +507,54 @@ impl SetVpRegisters for HvfHypercallHandler<'_, '_> {
                             );
                         }
                     }
+                }
+                // TLBI-enlightenment handshake (ARM64). The guest registers a
+                // partition-info page and opts into the enlightenment; we keep it
+                // effectively disabled by publishing `TlbInUse = 0`, so the guest
+                // falls back on its own architectural `TLBI ..., IS` broadcast,
+                // which HVF honors natively. (Apple's ARM64 hypervisor exposes no
+                // guest-TLB-invalidation primitive, so we could not service a real
+                // enlightened shootdown even if we wanted to — the architectural
+                // path is the only correct one here.)
+                r if r.0 == HV_ARM64_REGISTER_PARTITION_INFO_PAGE => {
+                    // HV_REGISTER_PARTITION_INFO_PAGE { Enabled:1, _:11, GpaPage:52 }.
+                    let reg = value.as_u64();
+                    if reg & 1 != 0 {
+                        let gpa = reg & 0xffff_ffff_ffff_f000;
+                        // Publish HV_PARTITION_INFO_PAGE.TlbInUse = 0. A *non-zero*
+                        // TlbInUse is precisely what tells the guest it must ALSO
+                        // issue the supplemental HvCallFlushTlb hypercall to flush
+                        // the hypervisor-saved TLB of *descheduled* VPs. Under HVF
+                        // there is no such saved TLB, so 0 is the faithful value.
+                        // Ignoring this write (the old behavior) left TlbInUse
+                        // reading uninitialized guest memory, after which the guest
+                        // storms FlushTlb against a backend that can only no-op it.
+                        match self
+                            .vp
+                            .partition
+                            .guest_memory
+                            .write_at(gpa, &0u32.to_le_bytes())
+                        {
+                            Ok(()) => tracing::info!(
+                                gpa = format!("{gpa:#x}"),
+                                "published HV_PARTITION_INFO_PAGE (TlbInUse=0)"
+                            ),
+                            Err(err) => tracing::warn!(
+                                gpa = format!("{gpa:#x}"),
+                                error = format!("{err:?}"),
+                                "failed to publish HV_PARTITION_INFO_PAGE"
+                            ),
+                        }
+                    }
+                }
+                r if r.0 == HV_ARM64_REGISTER_TLBI_CONTROL => {
+                    // Accept the opt-in as a no-op; with TlbInUse=0 published above
+                    // (and a GET returning 0 => TlbiEnlightened=0) the guest relies
+                    // on its native architectural TLBI regardless.
+                    tracelimit::info_ratelimited!(
+                        value = value.as_u64(),
+                        "TlbiControl set; relying on native architectural TLBI"
+                    );
                 }
                 register => {
                     tracelimit::warn_ratelimited!(

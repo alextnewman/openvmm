@@ -439,8 +439,8 @@ impl GuestEventPort for HvfEventPort {
                         .hv1
                         .synic
                         .signal_event(vp, sint, flag, &mut |vector, _auto_eoi| {
-                            if partition.gicd.raise_ppi(vp, vector) {
-                                tracing::debug!(vector, "ppi from event");
+                            let newly_pending = partition.gicd.raise_ppi(vp, vector);
+                            if newly_pending {
                                 partition.vps[vp.index() as usize].kick();
                             }
                         });
@@ -627,9 +627,891 @@ struct VpInitState {
 /// GICv3/v4 system-register CPU interface (ICC_* sysregs) to the guest.
 const ID_AA64PFR0_EL1_GIC_CPUIF: u64 = 1 << 24;
 
+/// `ID_AA64PFR0_EL1.GIC` field mask (bits [27:24]). Used to set the GIC field
+/// via read-modify-write without disturbing the exception-level, FP, AdvSIMD,
+/// RAS or SVE fields the guest also reads from this register.
+const ID_AA64PFR0_EL1_GIC: u64 = 0xf << 24;
+
+/// `ID_AA64MMFR0_EL1.PARange` field (bits [3:0]) — supported physical-address
+/// range. Masked so we can pin only this field to match the stage-2 IPA size
+/// this backend configures, leaving the rest of Apple's real MMFR0 intact.
+const ID_AA64MMFR0_EL1_PARANGE: u64 = 0xf;
+
+/// `ID_AA64MMFR0_EL1.PARange == 0b0010` ⇒ 40-bit (1 TiB) physical addresses,
+/// matching `HvfPartition::max_physical_address_size`.
+const ID_AA64MMFR0_EL1_PARANGE_40BIT: u64 = 0b0010;
+
 /// `ID_AA64DFR0_EL1.PMUVer` field (bits [11:8]); cleared to hide the PMU from the
 /// guest (see the PMU rationale in `bind`).
 const ID_AA64DFR0_EL1_PMUVER: u64 = 0xf << 8;
+
+/// `ID_AA64MMFR2_EL1.CnP` field (bits [3:0]) — FEAT_TTCNP "Common-not-Private"
+/// translations. Cleared so the guest cannot set `TTBR0/1_EL1.CnP` and thereby
+/// declare that all PEs share identical translation tables. Apple silicon is
+/// asymmetric (P-cores + E-cores) and HVF migrates vCPUs across them; with CnP
+/// enabled the hardware may share TLB entries across physical cores running the
+/// same ASID/VMID, but during early SMP bring-up two VPs transiently hold
+/// different tables under the same ASID, so a shared entry from one VP is
+/// applied to the other and a concurrent access takes a spurious translation
+/// fault. Clearing CnP forces private (per-PE) translations, which is always
+/// correct (only marginally less TLB-efficient).
+const ID_AA64MMFR2_EL1_CNP: u64 = 0xf;
+
+/// `ID_AA64MMFR2_EL1.NV` field (bits [27:24]) — FEAT_NV/NV2 nested
+/// virtualization. Cleared because this backend does not trap-and-emulate EL2
+/// execution for the guest: even though we present `ID_AA64PFR0_EL1.EL2` as
+/// implemented (so the guest recognizes a Microsoft-compatible HV#1 platform —
+/// see `ID_AA64PFR0_EL1_EL2_IMP`), the guest itself never runs at EL2; it uses
+/// hypercalls, exactly like every real Hyper-V ARM64 guest, which likewise
+/// report EL2 implemented but NV == 0. Advertising nested-virt we do not honor
+/// would be an incoherent ID the guest must never see.
+const ID_AA64MMFR2_EL1_NV: u64 = 0xf << 24;
+
+/// `ID_AA64PFR0_EL1.EL2` field mask (bits [11:8]). Used to isolate the field for
+/// a read-modify-write; the value we install is `ID_AA64PFR0_EL1_EL2_IMP`.
+const ID_AA64PFR0_EL1_EL2: u64 = 0xf << 8;
+
+/// `ID_AA64PFR0_EL1.EL2` value `0b0001` — EL2 implemented, AArch64-only. HVF
+/// hides EL2 from an EL1 guest (it reports this field as 0), but a
+/// Microsoft-compatible HV#1 *guest* is expected to observe EL2 as implemented.
+/// Windows' HAL (`HalpDetectHypervisor`, hvarm64.c) gates HV#1 detection on
+/// `(ID_AA64PFR0_EL1 & 0xF00) != 0`; with EL2 == 0 it falls back to the
+/// bare-metal GIC extension, which reserves SGIs 8-15 and therefore never
+/// registers the synic/vmbus interrupt lines (INTIDs 4-10) — so the first synic
+/// SGI delivered (INTID 8 = VMBus2) hits an unregistered line and bugchecks
+/// 0x5C (HAL_INITIALIZATION_FAILED). Presenting EL2 as implemented restores the
+/// HV-guest truth HVF elides; the guest still runs only at EL1 and nested virt
+/// stays off (see `ID_AA64MMFR2_EL1_NV`).
+const ID_AA64PFR0_EL1_EL2_IMP: u64 = 0b0001 << 8;
+
+/// `ID_AA64PFR0_EL1.EL3` field (bits [15:12]); cleared so the guest sees no
+/// secure monitor (EL3), which this backend does not model.
+const ID_AA64PFR0_EL1_EL3: u64 = 0xf << 12;
+
+/// `ID_AA64PFR0_EL1.SVE` field (bits [35:32]); cleared because this backend does
+/// not allocate or context-switch SVE vector state across vCPU scheduling, so
+/// advertising SVE would let the guest silently corrupt that state. (Apple cores
+/// report SVE=0 today; the clear is defensive for any host that does not.)
+const ID_AA64PFR0_EL1_SVE: u64 = 0xf << 32;
+
+/// `ID_AA64PFR1_EL1.SME` field (bits [27:24]); cleared for the same reason as
+/// SVE — the SME/ZA streaming-vector state is neither allocated nor
+/// context-switched here, and Apple silicon reports SME present, so this clear
+/// is load-bearing rather than defensive.
+const ID_AA64PFR1_EL1_SME: u64 = 0xf << 24;
+
+/// Installs the guest-visible AArch64 feature ID registers for one virtual CPU.
+///
+/// The policy is **host-clamped**: each register starts from the value HVF
+/// reports on the underlying core (the capability upper bound — we can never
+/// advertise a feature the host cannot execute) and we then subtract the
+/// features this VMM does not model, add the one feature it provides beyond the
+/// bare core (the GICv3 system-register CPU interface), and pin the
+/// physical-address range to the stage-2 IPA size. Because every value derives
+/// from the live host register, the result is automatically correct across
+/// Apple silicon generations: an older core that lacks a feature reports a lower
+/// field here and the policy follows it, so we never hardcode one machine's
+/// capabilities into another's.
+///
+/// Fields deliberately left as host pass-through (FP/AdvSIMD, DIT, CSV2/CSV3,
+/// BTI, RAS, the entire ISAR0/ISAR1 instruction menu, the MMFR1 MMU features,
+/// the MMFR0 ASID size and translation-granule support, and the debug
+/// breakpoint/watchpoint counts) are either pure compute/ISA features HVF runs
+/// natively or system features this backend models faithfully. Notably RAS is
+/// *kept* (it is mandatory from ARMv8.2 and passive; hiding it would present an
+/// oddly old CPU) and the 4KB/16KB/64KB granule-support fields are passed
+/// through unchanged (the host already reports 64KB unsupported; the guest
+/// defaults to 4KB regardless).
+fn sanitize_id_registers(vcpu: &mut HvfVcpu) -> Result<(), HvfError> {
+    // Write `want` to `reg`, read it back, and log whether HVF honored the
+    // write. HVF may treat some feature ID registers as read-only; a refused or
+    // ignored write is logged but must not fail vCPU bring-up.
+    fn install(vcpu: &mut HvfVcpu, reg: abi::HvSysReg, want: u64, name: &str) {
+        if let Err(err) = vcpu.set_sys_reg(reg, want) {
+            tracing::warn!(
+                name,
+                want = format!("{want:#x}"),
+                error = %err,
+                "HVF rejected ID register write; guest will see the host value"
+            );
+            return;
+        }
+        match vcpu.sys_reg(reg) {
+            Ok(got) if got == want => {}
+            Ok(got) => tracing::warn!(
+                name,
+                want = format!("{want:#x}"),
+                got = format!("{got:#x}"),
+                "ID register write did not stick (HVF clamped it)"
+            ),
+            Err(err) => tracing::warn!(name, error = %err, "ID register readback failed"),
+        }
+    }
+
+    // PFR0: start from the host's real value and change only the fields where
+    // our virtual platform genuinely diverges from it. Advertise the GICv3
+    // sysreg CPU interface (we model it; Apple exposes none) and present EL2 as
+    // implemented (HVF hides it, but an HV#1 guest must observe it — without it
+    // Windows' HAL misdetects the platform and bugchecks 0x5C; see
+    // `ID_AA64PFR0_EL1_EL2_IMP`). Hide EL3 (no secure monitor) and SVE (no
+    // vector-state save/restore). FP, AdvSIMD, RAS, DIT, CSV2, CSV3 pass through.
+    let pfr0_host = vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1)?;
+    let pfr0 = (pfr0_host
+        & !(ID_AA64PFR0_EL1_GIC | ID_AA64PFR0_EL1_EL2 | ID_AA64PFR0_EL1_EL3 | ID_AA64PFR0_EL1_SVE))
+        | ID_AA64PFR0_EL1_GIC_CPUIF
+        | ID_AA64PFR0_EL1_EL2_IMP;
+    install(
+        vcpu,
+        abi::HvSysReg::ID_AA64PFR0_EL1,
+        pfr0,
+        "ID_AA64PFR0_EL1",
+    );
+
+    // PFR1: hide SME (no streaming-vector state management). BTI and the rest
+    // pass through.
+    let pfr1_host = vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR1_EL1)?;
+    let pfr1 = pfr1_host & !ID_AA64PFR1_EL1_SME;
+    install(
+        vcpu,
+        abi::HvSysReg::ID_AA64PFR1_EL1,
+        pfr1,
+        "ID_AA64PFR1_EL1",
+    );
+
+    // DFR0: hide the PMU (PMUVer=0). Windows drives PMU sysregs when PMUVer != 0,
+    // which this backend does not model and which wedges early boot. DebugVer and
+    // the breakpoint/watchpoint counts (which HVF context-switches) are kept.
+    let dfr0_host = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
+    let dfr0 = dfr0_host & !ID_AA64DFR0_EL1_PMUVER;
+    install(
+        vcpu,
+        abi::HvSysReg::ID_AA64DFR0_EL1,
+        dfr0,
+        "ID_AA64DFR0_EL1",
+    );
+
+    // MMFR0: pin only PARange to the stage-2 IPA size (40-bit); preserve the ASID
+    // size and translation-granule support exactly as the host reports them.
+    let mmfr0_host = vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1)?;
+    let mmfr0 = (mmfr0_host & !ID_AA64MMFR0_EL1_PARANGE) | ID_AA64MMFR0_EL1_PARANGE_40BIT;
+    install(
+        vcpu,
+        abi::HvSysReg::ID_AA64MMFR0_EL1,
+        mmfr0,
+        "ID_AA64MMFR0_EL1",
+    );
+
+    // MMFR2: clear CnP (unsafe under Apple P/E asymmetry with vCPU migration) and
+    // NV (we present EL2 as implemented but never trap-and-emulate EL2 for the
+    // guest, exactly like a real Hyper-V guest: EL2 implemented, NV == 0).
+    // Everything else — UAO, IESB, AT, IDS, BBM, ... — passes through from the host.
+    let mmfr2_host = vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR2_EL1)?;
+    let mmfr2 = mmfr2_host & !(ID_AA64MMFR2_EL1_CNP | ID_AA64MMFR2_EL1_NV);
+    install(
+        vcpu,
+        abi::HvSysReg::ID_AA64MMFR2_EL1,
+        mmfr2,
+        "ID_AA64MMFR2_EL1",
+    );
+
+    tracing::info!(
+        pfr0 = format!("{pfr0:#x}"),
+        pfr1 = format!("{pfr1:#x}"),
+        dfr0 = format!("{dfr0:#x}"),
+        mmfr0 = format!("{mmfr0:#x}"),
+        mmfr2 = format!("{mmfr2:#x}"),
+        "installed OpenVMM virtual-CPU ID registers (host-clamped)"
+    );
+    Ok(())
+}
+
+/// Diagnostic: walk the EL1 stage-1 (`TTBR1_EL1`) translation for `far`,
+/// reading each descriptor out of guest memory, and log every level plus the
+/// leaf. This distinguishes the two possible causes of the early CloudMOS
+/// bugcheck (a write translation fault to a high kernel VA):
+///
+///   * **leaf VALID** — the page *is* mapped in the guest's own tables, so a
+///     hardware translation fault on it is **spurious**: the hardware page-table
+///     walker did not observe the guest's PTE. That implicates an
+///     OpenVMM/HVF-side walker-coherency problem (stage-2 memory attributes, or
+///     a TLB/`SyncContext`/`FlushTlb` enlightenment we mis-handle), which is
+///     fixable on the hypervisor side.
+///   * **leaf INVALID** — the page is genuinely unmapped in the guest tables, so
+///     the fault is "real" and the guest reached this VA because it was fed bad
+///     input (memory map / ACPI / register state), a different class of bug.
+///
+/// Derives the granule, starting level, and the (possibly reduced) top-level
+/// index width from `TCR_EL1.{T1SZ,TG1}`, so the walk is correct even when the
+/// guest does not use the canonical 48-bit / start-L0 layout. Windows-on-ARM64
+/// runs `T1SZ=17`, which makes the high-half input address 47 bits: the L0 index
+/// is only **8 bits** (`VA[46:39]`) and the root table is 2 KiB-aligned, not
+/// 4 KiB — getting either wrong silently reads the wrong descriptor.
+pub(crate) fn diag_walk_ttbr1(gm: &GuestMemory, ttbr1: u64, tcr: u64, far: u64) {
+    const TABLE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    let t1sz = (tcr >> 16) & 0x3f;
+    let tg1 = (tcr >> 30) & 0x3;
+
+    // 4 KiB granule level base bits: L0=[47:39], L1=[38:30], L2=[29:21],
+    // L3=[20:12]. The top translated VA bit is `63 - T1SZ`; the start level is
+    // the highest (lowest-numbered) level whose base bit it reaches.
+    let level_base = [39u32, 30, 21, 12];
+    let top_bit = 63u32.saturating_sub(t1sz as u32);
+    let start_level = level_base.iter().position(|&b| b <= top_bit).unwrap_or(3);
+    let start_base_bit = level_base[start_level];
+    let start_width = (top_bit - start_base_bit + 1).min(9);
+    // The start-level table holds `2^start_width` 8-byte descriptors and
+    // `TTBR1.BADDR` is aligned to that table's size (smaller than 4 KiB when the
+    // top index is reduced), so do not blindly mask to 4 KiB.
+    let start_table_bytes = 8u64 << start_width;
+    let mut table = (ttbr1 & 0x0000_ffff_ffff_ffff) & !(start_table_bytes - 1);
+
+    tracing::info!(
+        far = format!("{far:#x}"),
+        ttbr1 = format!("{ttbr1:#x}"),
+        tcr = format!("{tcr:#x}"),
+        t1sz,
+        tg1,
+        top_bit,
+        start_level,
+        start_width,
+        root_table = format!("{table:#x}"),
+        "stage-1 TTBR1 walk (4KiB granule)"
+    );
+    if tg1 != 0b10 {
+        tracing::warn!(
+            tg1,
+            "TCR_EL1.TG1 is not 0b10 (4KiB); the 4KiB walk assumption may not hold"
+        );
+    }
+
+    for level in start_level..=3 {
+        let base_bit = level_base[level];
+        let width = if level == start_level { start_width } else { 9 };
+        let index = (far >> base_bit) & ((1u64 << width) - 1);
+        let entry_gpa = table + index * 8;
+        let mut buf = [0u8; 8];
+        if let Err(e) = gm.read_at(entry_gpa, &mut buf) {
+            tracing::error!(
+                level,
+                entry_gpa = format!("{entry_gpa:#x}"),
+                error = %e,
+                "stage-1 walk: failed to read descriptor from guest memory"
+            );
+            return;
+        }
+        let desc = u64::from_le_bytes(buf);
+        let valid = desc & 1 != 0;
+        let low2 = desc & 0x3;
+        tracing::info!(
+            level,
+            index,
+            width,
+            table_base = format!("{table:#x}"),
+            entry_gpa = format!("{entry_gpa:#x}"),
+            descriptor = format!("{desc:#x}"),
+            valid,
+            low2,
+            "stage-1 walk: level descriptor"
+        );
+        if !valid {
+            tracing::error!(
+                level,
+                descriptor = format!("{desc:#x}"),
+                "stage-1 walk: INVALID descriptor -> translation fault at this level; \
+                 the page is genuinely UNMAPPED in the guest's own tables"
+            );
+            return;
+        }
+        if level < 3 {
+            if low2 == 0b01 {
+                tracing::info!(
+                    level,
+                    descriptor = format!("{desc:#x}"),
+                    "stage-1 walk: BLOCK descriptor (valid) -> VA mapped by a block; leaf is VALID"
+                );
+                return;
+            }
+            // Table descriptor (0b11); descend.
+            table = desc & TABLE_ADDR_MASK;
+        } else if low2 == 0b11 {
+            let pa = (desc & TABLE_ADDR_MASK) | (far & 0xfff);
+            tracing::error!(
+                descriptor = format!("{desc:#x}"),
+                pa = format!("{pa:#x}"),
+                "stage-1 walk: L3 PAGE descriptor is VALID -> the page IS mapped in guest RAM; \
+                 a hardware translation fault here is SPURIOUS (OpenVMM/HVF walker-coherency bug)"
+            );
+        } else {
+            tracing::error!(
+                descriptor = format!("{desc:#x}"),
+                "stage-1 walk: L3 descriptor has valid bit but is not a page (0b01 reserved)"
+            );
+        }
+    }
+}
+
+/// Non-logging companion to [`diag_walk_ttbr1`]: returns `Some(true)` if `far`
+/// translates through TTBR1 to a VALID leaf, `Some(false)` on an invalid
+/// descriptor, `None` if guest memory could not be read. Used by the run-loop
+/// sampler to capture the leaf state **at fault time**. The later crash-time
+/// walk can disagree if the guest resolved a genuine demand fault in between —
+/// that difference is exactly what distinguishes a spurious fault (valid at both
+/// times: the page was always mapped, the HW walker just didn't see it) from a
+/// real demand fault (invalid at fault time, valid once the guest paged it in).
+pub(crate) fn diag_walk_leaf_valid(gm: &GuestMemory, ttbr1: u64, tcr: u64, far: u64) -> Option<bool> {
+    const TABLE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    let t1sz = (tcr >> 16) & 0x3f;
+    let level_base = [39u32, 30, 21, 12];
+    let top_bit = 63u32.saturating_sub(t1sz as u32);
+    let start_level = level_base.iter().position(|&b| b <= top_bit).unwrap_or(3);
+    let start_width = (top_bit - level_base[start_level] + 1).min(9);
+    let mut table = (ttbr1 & 0x0000_ffff_ffff_ffff) & !((8u64 << start_width) - 1);
+    for level in start_level..=3 {
+        let width = if level == start_level { start_width } else { 9 };
+        let index = (far >> level_base[level]) & ((1u64 << width) - 1);
+        let mut buf = [0u8; 8];
+        gm.read_at(table + index * 8, &mut buf).ok()?;
+        let desc = u64::from_le_bytes(buf);
+        if desc & 1 == 0 {
+            return Some(false);
+        }
+        if level < 3 {
+            if desc & 0x3 == 0b01 {
+                return Some(true); // block descriptor
+            }
+            table = desc & TABLE_ADDR_MASK;
+        } else {
+            return Some(desc & 0x3 == 0b11); // L3 page descriptor
+        }
+    }
+    Some(true)
+}
+
+/// Translate a high-half (TTBR1) guest VA to its guest-physical address by
+/// walking the guest's own stage-1 tables, mirroring [`diag_walk_leaf_valid`]
+/// but returning the resolved GPA (honoring block descriptors and the page
+/// offset). Returns `None` if any level is invalid or unreadable. Used by
+/// [`diag_decode_bugcheck`] to read the EXCEPTION_RECORD/CONTEXT that a Windows
+/// bugcheck references by virtual address.
+pub(crate) fn diag_translate_ttbr1(gm: &GuestMemory, ttbr1: u64, tcr: u64, va: u64) -> Option<u64> {
+    const TABLE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    let t1sz = (tcr >> 16) & 0x3f;
+    let level_base = [39u32, 30, 21, 12];
+    let top_bit = 63u32.saturating_sub(t1sz as u32);
+    let start_level = level_base.iter().position(|&b| b <= top_bit).unwrap_or(3);
+    let start_width = (top_bit - level_base[start_level] + 1).min(9);
+    let mut table = (ttbr1 & 0x0000_ffff_ffff_ffff) & !((8u64 << start_width) - 1);
+    for level in start_level..=3 {
+        let width = if level == start_level { start_width } else { 9 };
+        let base_bit = level_base[level];
+        let index = (va >> base_bit) & ((1u64 << width) - 1);
+        let mut buf = [0u8; 8];
+        gm.read_at(table + index * 8, &mut buf).ok()?;
+        let desc = u64::from_le_bytes(buf);
+        if desc & 1 == 0 {
+            return None;
+        }
+        if level < 3 {
+            if desc & 0x3 == 0b01 {
+                // Block descriptor: output[47:base_bit] from desc, low bits from VA.
+                let block_off_mask = (1u64 << base_bit) - 1;
+                return Some((desc & TABLE_ADDR_MASK & !block_off_mask) | (va & block_off_mask));
+            }
+            table = desc & TABLE_ADDR_MASK;
+        } else if desc & 0x3 == 0b11 {
+            return Some((desc & TABLE_ADDR_MASK) | (va & 0xfff));
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Given a high-half kernel VA that lies inside a loaded PE image, scan downward
+/// page-by-page for the `MZ`/`PE\0\0` header and extract the module name from the
+/// image's export directory. Turns the anonymous return addresses in a bugcheck
+/// backtrace into module names (e.g. `ntoskrnl.exe`, `vmbus.sys`), which names
+/// the subsystem that received the NULL. Returns `(image_base, name)`.
+pub(crate) fn diag_identify_module(
+    gm: &GuestMemory,
+    ttbr1: u64,
+    tcr: u64,
+    va: u64,
+) -> Option<(u64, String)> {
+    let rd16 = |a: u64| -> Option<u16> {
+        let pa = diag_translate_ttbr1(gm, ttbr1, tcr, a)?;
+        let mut b = [0u8; 2];
+        gm.read_at(pa, &mut b).ok()?;
+        Some(u16::from_le_bytes(b))
+    };
+    let rd32 = |a: u64| -> Option<u32> {
+        let pa = diag_translate_ttbr1(gm, ttbr1, tcr, a)?;
+        let mut b = [0u8; 4];
+        gm.read_at(pa, &mut b).ok()?;
+        Some(u32::from_le_bytes(b))
+    };
+
+    let rd_cstr = |a: u64, max: u64| -> String {
+        let mut s = String::new();
+        for i in 0..max {
+            match rd16(a + i) {
+                Some(w) => {
+                    let c = (w & 0xff) as u8;
+                    if c == 0 {
+                        break;
+                    }
+                    if c.is_ascii_graphic() {
+                        s.push(c as char);
+                    }
+                }
+                None => break,
+            }
+        }
+        s
+    };
+
+    let mut page = va & !0xfff;
+    // Cover ntoskrnl-sized images (~16 MiB) worth of downward scan.
+    for _ in 0..4096u32 {
+        if rd16(page) == Some(0x5a4d) {
+            // Candidate DOS header; validate the PE signature via e_lfanew.
+            if let Some(e_lfanew) = rd32(page + 0x3c) {
+                if e_lfanew < 0x1000 && rd32(page + e_lfanew as u64) == Some(0x0000_4550) {
+                    // PE32+ optional header: DataDirectory begins at +0x70 after
+                    // the 4-byte signature + 20-byte file header. Export = index 0,
+                    // Debug = index 6.
+                    let datadir = page + e_lfanew as u64 + 4 + 20 + 0x70;
+
+                    // Parse the CodeView (RSDS) record first: it yields the PDB
+                    // basename AND the Microsoft symbol-server key (GUID+Age) so the
+                    // exact matching PDB can be fetched offline. Present on both
+                    // drivers (no export table) and ntoskrnl. Emit the sympath here
+                    // so every module on the stack is fetchable regardless of whether
+                    // it also has an export name.
+                    let mut pdb_name: Option<String> = None;
+                    if let (Some(dbg_rva), Some(dbg_size)) =
+                        (rd32(datadir + 6 * 8), rd32(datadir + 6 * 8 + 4))
+                    {
+                        if dbg_rva != 0 {
+                            let count = (dbg_size / 28).min(32);
+                            for i in 0..count as u64 {
+                                let e = page + dbg_rva as u64 + i * 28;
+                                if rd32(e + 12) == Some(2) {
+                                    // IMAGE_DEBUG_TYPE_CODEVIEW → AddressOfRawData@20.
+                                    if let Some(cv_rva) = rd32(e + 20) {
+                                        let cv = page + cv_rva as u64;
+                                        // "RSDS" magic, then GUID(16)+Age(4), name@24.
+                                        if rd32(cv) == Some(0x5344_5352) {
+                                            let pdb = rd_cstr(cv + 24, 64);
+                                            let base = pdb
+                                                .rsplit(['\\', '/'])
+                                                .next()
+                                                .unwrap_or(&pdb)
+                                                .to_string();
+                                            // GUID stored as {Data1:u32 LE}{Data2:u16 LE}
+                                            // {Data3:u16 LE}{Data4:8 raw bytes}; the
+                                            // server key is D1(8)D2(4)D3(4)D4(16)+Age(hex).
+                                            if let (Some(d1), Some(d2), Some(d3), Some(age)) = (
+                                                rd32(cv + 4),
+                                                rd16(cv + 8),
+                                                rd16(cv + 10),
+                                                rd32(cv + 20),
+                                            ) {
+                                                let mut d4 = [0u8; 8];
+                                                let mut ok = true;
+                                                for (i, b) in d4.iter_mut().enumerate() {
+                                                    match rd16(cv + 12 + i as u64) {
+                                                        Some(w) => *b = (w & 0xff) as u8,
+                                                        None => ok = false,
+                                                    }
+                                                }
+                                                if ok && !base.is_empty() {
+                                                    let d4hex: String = d4
+                                                        .iter()
+                                                        .map(|b| format!("{b:02X}"))
+                                                        .collect();
+                                                    let sig = format!(
+                                                        "{d1:08X}{d2:04X}{d3:04X}{d4hex}{age:X}"
+                                                    );
+                                                    tracing::error!(
+                                                        pdb = base,
+                                                        sig = sig,
+                                                        image_base = format!("{page:#x}"),
+                                                        sympath = format!("{base}/{sig}/{base}"),
+                                                        "bugcheck decode: module PDB signature"
+                                                    );
+                                                }
+                                            }
+                                            if !base.is_empty() {
+                                                pdb_name = Some(base);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Prefer the export directory's module name for display (present
+                    // on ntoskrnl and most DLLs); else fall back to the PDB basename.
+                    if let Some(export_rva) = rd32(datadir) {
+                        if export_rva != 0 {
+                            if let Some(name_rva) = rd32(page + export_rva as u64 + 0x0c) {
+                                if name_rva != 0 {
+                                    let name = rd_cstr(page + name_rva as u64, 64);
+                                    if !name.is_empty() {
+                                        return Some((page, name));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    return Some((page, pdb_name.unwrap_or_else(|| String::from("<unknown>"))));
+                }
+            }
+        }
+        if page < 0xffff_0000_0000_1000 {
+            break;
+        }
+        page -= 0x1000;
+    }
+    None
+}
+
+/// Decode a Windows bugcheck's reference structures at crash time. Windows hands
+/// the host the bugcheck code (P0) plus, for exception-class stops, the faulting
+/// PC and the on-stack `EXCEPTION_RECORD`/`CONTEXT` by virtual address (P2..P4).
+/// Translating and reading them turns an opaque stop code into: the faulting
+/// instruction word, the access type + faulting VA (for `0xC0000005`), and the
+/// full integer register file at fault time — which names the register that held
+/// the bad pointer. All high-half kernel VAs translate through the live TTBR1
+/// (the bugcheck runs in the faulting thread's context and never switches the
+/// high-half mappings, which are global across address spaces).
+pub(crate) fn diag_decode_bugcheck(
+    gm: &GuestMemory,
+    ttbr1: u64,
+    tcr: u64,
+    code: u64,
+    p2: u64,
+    p3: u64,
+    p4: u64,
+) {
+    const HIGH_HALF: u64 = 0xffff_0000_0000_0000;
+
+    // Faulting instruction word at the exception PC (P2). Valid for the
+    // exception-class stops (0x7E/0x8E/0x1E) where P2 is the fault address.
+    if p2 >= HIGH_HALF {
+        if let Some(pa) = diag_translate_ttbr1(gm, ttbr1, tcr, p2) {
+            let mut ib = [0u8; 4];
+            if gm.read_at(pa, &mut ib).is_ok() {
+                tracing::error!(
+                    pc = format!("{p2:#x}"),
+                    instr = format!("{:#010x}", u32::from_le_bytes(ib)),
+                    "bugcheck decode: faulting instruction word"
+                );
+            }
+        }
+    }
+
+    // SYSTEM_THREAD_EXCEPTION_NOT_HANDLED: P3 = EXCEPTION_RECORD*, P4 = CONTEXT*.
+    if code != 0x7e && code != 0x1000_007e {
+        return;
+    }
+
+    // EXCEPTION_RECORD: ExceptionCode@0x00, NumberParameters@0x18,
+    // ExceptionInformation[]@0x20 ([0]=access kind, [1]=faulting VA).
+    if p3 >= HIGH_HALF {
+        if let Some(pa) = diag_translate_ttbr1(gm, ttbr1, tcr, p3) {
+            let mut er = [0u8; 0x40];
+            if gm.read_at(pa, &mut er).is_ok() {
+                let exc_code = u32::from_le_bytes(er[0x00..0x04].try_into().unwrap());
+                let nparams = u32::from_le_bytes(er[0x18..0x1c].try_into().unwrap());
+                let info0 = u64::from_le_bytes(er[0x20..0x28].try_into().unwrap());
+                let info1 = u64::from_le_bytes(er[0x28..0x30].try_into().unwrap());
+                let access = match info0 {
+                    0 => "read",
+                    1 => "write",
+                    8 => "execute",
+                    _ => "other",
+                };
+                tracing::error!(
+                    exception_code = format!("{exc_code:#010x}"),
+                    number_parameters = nparams,
+                    access_type = access,
+                    faulting_va = format!("{info1:#x}"),
+                    "bugcheck decode: EXCEPTION_RECORD"
+                );
+            }
+        }
+    }
+
+    // CONTEXT (ARM64): Cpsr@0x04, X0..X30@0x08 (31 regs), Sp@0x100, Pc@0x108.
+    if p4 >= HIGH_HALF {
+        if let Some(pa) = diag_translate_ttbr1(gm, ttbr1, tcr, p4) {
+            let mut cx = [0u8; 0x110];
+            if gm.read_at(pa, &mut cx).is_ok() {
+                let rd = |off: usize| u64::from_le_bytes(cx[off..off + 8].try_into().unwrap());
+                for base in (0..31usize).step_by(6) {
+                    let end = (base + 6).min(31);
+                    let regs = (base..end)
+                        .map(|i| format!("x{i}={:#x}", rd(0x08 + i * 8)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::error!(regs = regs, "bugcheck decode: CONTEXT gpr");
+                }
+                let sp = rd(0x100);
+                let pc = rd(0x108);
+                let fp = rd(0x08 + 29 * 8);
+                let lr = rd(0x08 + 30 * 8);
+                let cpsr = u32::from_le_bytes(cx[0x04..0x08].try_into().unwrap());
+                tracing::error!(
+                    sp = format!("{sp:#x}"),
+                    pc = format!("{pc:#x}"),
+                    cpsr = format!("{cpsr:#x}"),
+                    "bugcheck decode: CONTEXT sp/pc/cpsr"
+                );
+
+                // Instruction window around the faulting PC (aligned): reach back
+                // far enough to capture where the indirect-call target (x8) and the
+                // NULL destination (x0) are set up, plus the faulting store.
+                let win_start = pc.saturating_sub(0x60) & !0x3;
+                for i in 0..28u64 {
+                    let ia = win_start + i * 4;
+                    if let Some(ipa) = diag_translate_ttbr1(gm, ttbr1, tcr, ia) {
+                        let mut ib = [0u8; 4];
+                        if gm.read_at(ipa, &mut ib).is_ok() {
+                            let marker = if ia == pc { " <== FAULT" } else { "" };
+                            let word = u32::from_le_bytes(ib);
+                            // Decode a direct BL (opcode 100101) and resolve its
+                            // target's module+offset — the branch just before the
+                            // faulting store is the helper that returned NULL, so
+                            // naming it identifies the missing dependency.
+                            let mut branch = String::new();
+                            if word >> 26 == 0b10_0101 {
+                                let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 6; // sign-extend imm26
+                                let target = ia.wrapping_add((imm as i64 as u64) << 2);
+                                let sym = diag_identify_module(gm, ttbr1, tcr, target)
+                                    .map(|(b, n)| format!("{n}+{:#x}", target - b))
+                                    .unwrap_or_else(|| String::from("?"));
+                                branch = format!(" bl->{target:#x} ({sym})");
+                            }
+                            tracing::error!(
+                                addr = format!("{ia:#x}"),
+                                word = format!("{word:#010x}"),
+                                "bugcheck decode: code window{marker}{branch}"
+                            );
+                        }
+                    }
+                }
+
+                // Frame-pointer backtrace: Windows ARM64 uses x29 as the frame
+                // pointer with standard {fp,lr} frame records ([fp]=prev fp,
+                // [fp+8]=saved lr). Saved LRs carry a PAC (pointer-auth) signature
+                // in the upper VA bits (bits >= 64-T1SZ), so strip it to recover
+                // the canonical kernel VA, then resolve each to its module so the
+                // subsystem that passed the NULL destination is named.
+                let t1sz = (tcr >> 16) & 0x3f;
+                let va_bits = 64u64.saturating_sub(t1sz);
+                let va_mask = (1u64 << va_bits) - 1;
+                let strip_pac = |v: u64| (v & va_mask) | !va_mask;
+
+                let mut named: std::collections::BTreeMap<u64, String> =
+                    std::collections::BTreeMap::new();
+                let mut name_of = |addr: u64| -> String {
+                    if let Some((base, name)) = diag_identify_module(gm, ttbr1, tcr, addr) {
+                        named.entry(base).or_insert_with(|| name.clone());
+                        format!("{name}+{:#x}", addr - base)
+                    } else {
+                        String::from("?")
+                    }
+                };
+
+                let leaf = strip_pac(lr);
+                tracing::error!(
+                    lr = format!("{leaf:#x}"),
+                    module = name_of(leaf),
+                    "bugcheck decode: backtrace #0 (leaf lr)"
+                );
+                let mut cur = fp;
+                for depth in 1..=16u32 {
+                    if cur < HIGH_HALF || cur & 0x7 != 0 {
+                        break;
+                    }
+                    let Some(fpa) = diag_translate_ttbr1(gm, ttbr1, tcr, cur) else {
+                        break;
+                    };
+                    let mut rec = [0u8; 16];
+                    if gm.read_at(fpa, &mut rec).is_err() {
+                        break;
+                    }
+                    let next_fp = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    let ret = strip_pac(u64::from_le_bytes(rec[8..16].try_into().unwrap()));
+                    if ret == 0 || ret < HIGH_HALF {
+                        break;
+                    }
+                    tracing::error!(
+                        ret = format!("{ret:#x}"),
+                        module = name_of(ret),
+                        fp = format!("{cur:#x}"),
+                        "bugcheck decode: backtrace #{depth}"
+                    );
+                    if next_fp <= cur {
+                        break;
+                    }
+                    cur = next_fp;
+                }
+                for (base, name) in named {
+                    tracing::error!(base = format!("{base:#x}"), name, "bugcheck decode: module");
+                }
+                let _ = sp;
+            }
+        }
+    }
+}
+
+/// DIAG(gic5c): live frame-pointer backtrace + P3 resolution for a bugcheck
+/// whose parameters are NOT the 0x7E EXCEPTION_RECORD/CONTEXT shape (e.g. the
+/// 0x5C HAL_INITIALIZATION_FAILED, where P3 is a bare kernel VA and P4 an
+/// interrupt id). Seeds the walk from the *live* guest registers at the crash
+/// MSR write, so the chain runs current -> KeBugCheck2 -> KeBugCheckEx -> the
+/// routine that invoked it. Windows ARM64 uses x29 as the frame pointer with
+/// {fp,lr} records; saved LRs carry a PAC signature in the high VA bits
+/// (stripped here). Also resolves P3 to its module.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn diag_backtrace_live(
+    gm: &GuestMemory,
+    ttbr1: u64,
+    tcr: u64,
+    pc: u64,
+    fp: u64,
+    lr: u64,
+    p3: u64,
+) {
+    const HIGH_HALF: u64 = 0xffff_0000_0000_0000;
+    let t1sz = (tcr >> 16) & 0x3f;
+    let va_bits = 64u64.saturating_sub(t1sz);
+    let va_mask = (1u64 << va_bits) - 1;
+    let strip_pac = |v: u64| (v & va_mask) | !va_mask;
+
+    let mut named: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    let mut name_of = |addr: u64| -> String {
+        if let Some((base, name)) = diag_identify_module(gm, ttbr1, tcr, addr) {
+            named.entry(base).or_insert_with(|| name.clone());
+            format!("{name}+{:#x}", addr - base)
+        } else {
+            String::from("?")
+        }
+    };
+
+    // Resolve P3 (the HAL passes a kernel VA of interest here).
+    if p3 >= HIGH_HALF {
+        tracing::error!(
+            p3 = format!("{p3:#x}"),
+            module = name_of(p3),
+            "bugcheck backtrace: P3 resolves to"
+        );
+    }
+
+    let pcs = strip_pac(pc);
+    tracing::error!(
+        frame = 0u32,
+        addr = format!("{pcs:#x}"),
+        module = name_of(pcs),
+        "bugcheck backtrace: pc"
+    );
+    let leaf = strip_pac(lr);
+    tracing::error!(
+        frame = 1u32,
+        addr = format!("{leaf:#x}"),
+        module = name_of(leaf),
+        "bugcheck backtrace: leaf lr"
+    );
+    let mut cur = fp;
+    for depth in 2..=24u32 {
+        if cur < HIGH_HALF || cur & 0x7 != 0 {
+            break;
+        }
+        let Some(fpa) = diag_translate_ttbr1(gm, ttbr1, tcr, cur) else {
+            break;
+        };
+        let mut rec = [0u8; 16];
+        if gm.read_at(fpa, &mut rec).is_err() {
+            break;
+        }
+        let next_fp = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+        let ret = strip_pac(u64::from_le_bytes(rec[8..16].try_into().unwrap()));
+        if ret == 0 || ret < HIGH_HALF {
+            break;
+        }
+        tracing::error!(
+            frame = depth,
+            addr = format!("{ret:#x}"),
+            module = name_of(ret),
+            fp = format!("{cur:#x}"),
+            "bugcheck backtrace: frame"
+        );
+        if next_fp <= cur {
+            break;
+        }
+        cur = next_fp;
+    }
+    for (base, name) in named {
+        tracing::error!(base = format!("{base:#x}"), name, "bugcheck backtrace: module");
+    }
+}
+
+/// Diagnostic ring of the most-recent distinct in-guest EL1 data aborts as
+/// `(ESR_EL1, FAR_EL1, ELR_EL1, leaf_valid_at_fault_time)`, populated by the
+/// run-loop sampler and drained at crash time by [`diag_dump_fault_ring`]. The
+/// validity code is `1` (valid), `0` (invalid), or `2` (unknown/low-half/walk
+/// failed).
+static DIAG_FAULT_RING: Mutex<std::collections::VecDeque<(u64, u64, u64, u8)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Drains and logs the recorded in-guest EL1 data-abort ring, walking each
+/// high-half (TTBR1) faulting VA's stage-1 translation with the live
+/// `ttbr1`/`tcr`. Called at crash time so the fault chain leading to the
+/// bugcheck — from the original trigger through to the final unhandled fault —
+/// is visible together with whether each leaf was mapped at fault time (spurious
+/// HW fault) or absent (a real, unresolved fault).
+pub(crate) fn diag_dump_fault_ring(gm: &GuestMemory, ttbr1: u64, tcr: u64) {
+    let entries: Vec<(u64, u64, u64, u8)> = {
+        let mut ring = DIAG_FAULT_RING.lock();
+        ring.drain(..).collect()
+    };
+    tracing::error!(
+        count = entries.len(),
+        "in-guest EL1 data-abort chain leading to crash (oldest first)"
+    );
+    for (i, (esr, far, elr, fault_time_valid)) in entries.iter().enumerate() {
+        let ec = (esr >> 26) & 0x3f;
+        let dfsc = esr & 0x3f;
+        let wnr = (esr >> 6) & 1;
+        let fault_time_leaf = match fault_time_valid {
+            1 => "VALID",
+            0 => "INVALID",
+            _ => "unknown",
+        };
+        tracing::error!(
+            seq = i,
+            esr = format!("{esr:#x}"),
+            ec = format!("{ec:#x}"),
+            dfsc = format!("{dfsc:#x}"),
+            wnr,
+            far = format!("{far:#x}"),
+            elr = format!("{elr:#x}"),
+            fault_time_leaf,
+            "fault-chain entry"
+        );
+        // Only high-half VAs translate through TTBR1; a low-half (user/TTBR0)
+        // FAR would walk the wrong root, so skip the walk for those.
+        if *far >= 0xffff_0000_0000_0000 {
+            diag_walk_ttbr1(gm, ttbr1, tcr, *far);
+        }
+    }
+}
 
 /// `PMCR_EL0.E` (bit 0) — cycle counter enable.
 const PMCR_EL0_E: u64 = 1 << 0;
@@ -648,19 +1530,28 @@ impl BindProcessor for HvfProcessorBinder {
         let state = self.state.take().unwrap();
         let inner = &self.partition.vps[self.vp_index.index() as usize];
 
-        // Initialize configuration registers.
-        // Set 40 bit physical address width.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
-        // Enable GICv3 system registers.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, ID_AA64PFR0_EL1_GIC_CPUIF)?;
-        // Hide the PMU from the guest. Windows-on-ARM64 reads
-        // ID_AA64DFR0_EL1.PMUVer and, when it is non-zero, drives PMU system
-        // registers (PMCR_EL0, PMCCNTR_EL0, ...) that this backend does not
-        // model, which wedges early boot. Clear only PMUVer[11:8] via
-        // read-modify-write so DebugVer and the other mandatory debug ID fields
-        // are preserved.
-        let dfr0 = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1, dfr0 & !ID_AA64DFR0_EL1_PMUVER)?;
+        // Initialize the guest-visible AArch64 feature ID registers. First log
+        // the full raw menu HVF exposes on this host: this is the UPPER BOUND of
+        // what we may advertise to the virtual CPU. We can hide/clear features
+        // the VMM does not model, but must never advertise a feature the
+        // underlying core cannot execute — which also makes the policy portable
+        // across Apple silicon generations (an older core that lacks a feature
+        // simply reports a lower value here, and the clamp follows it).
+        tracing::info!(
+            midr = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::MIDR_EL1)?),
+            pfr0 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1)?),
+            pfr1 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR1_EL1)?),
+            dfr0 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?),
+            dfr1 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR1_EL1)?),
+            isar0 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64ISAR0_EL1)?),
+            isar1 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64ISAR1_EL1)?),
+            mmfr0 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1)?),
+            mmfr1 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR1_EL1)?),
+            mmfr2 = format!("{:#x}", vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR2_EL1)?),
+            "raw AArch64 ID-register menu from HVF (host capability upper bound)"
+        );
+        // Install the OpenVMM virtual-CPU ID-register policy (host-clamped).
+        sanitize_id_registers(&mut vcpu)?;
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
@@ -1046,10 +1937,14 @@ impl HvfProcessor<'_> {
         // issues) is honored by the hardware across every PE running the VMID. So
         // there is genuinely nothing extra to flush and SUCCESS is the correct
         // emulation, not an appeasement. This is consistent with — and depends on
-        // — our keeping the TLB enlightenment *disabled*: `hypercall.rs` returns 0
-        // for `PartitionInfoPage` (0x90015 → Enabled=0/TlbInUse=0) and
-        // `TlbiControl` (0x90016 → TlbiEnlightened=0), so a well-behaved guest
-        // relies on the architectural broadcast regardless of this call.
+        // — our keeping the TLB enlightenment *disabled*: `hypercall.rs` now
+        // publishes `HV_PARTITION_INFO_PAGE.TlbInUse = 0` into the page the guest
+        // registers via `PartitionInfoPage` (0x90015) and reads back `TlbiControl`
+        // (0x90016) as `TlbiEnlightened = 0`, so a well-behaved guest relies on
+        // its architectural `TLBI ..., IS` broadcast and need not issue this call
+        // at all. (Apple's ARM64 HVF exposes no guest-TLB-invalidation primitive,
+        // so the architectural broadcast is in any case the only path that can
+        // actually maintain stage-1 coherence here.)
         //
         // 0x00D7/0x00D8 Acquire/ReleaseSparseSpaPageHostAccess — SLAT host-access
         // calls. For a non-isolated partition the host already has access to every
@@ -1150,6 +2045,13 @@ impl HvfProcessor<'_> {
             .post_pending_messages(sints, |sint, message| {
                 self.hv1
                     .post_message(sint, message, &mut |vector, _auto_eoi| {
+                        tracing::info!(
+                            target: "gic5c",
+                            sint,
+                            vector,
+                            msg_type = message.header.typ.0,
+                            "deliver_sints: raising synic vector on GIC"
+                        );
                         self.gicr.raise(vector)
                     })
             });
@@ -1369,6 +2271,28 @@ impl<'p> Processor for HvfProcessor<'p> {
                         self.wfi = false;
                     }
 
+                    // DIAG(gic5c): whenever the synic SGI 8 (or any SGI/PPI) is
+                    // pending, snapshot the full delivery state so we can see why
+                    // the interrupt is / isn't injected right before the 0x5C.
+                    let diag_pend = self.gicr.diag_pending();
+                    if diag_pend & 0xffff != 0 {
+                        let (p, e, g, a, pmr, ge0, ge1, prio8) = self.gicr.diag_state(8);
+                        let injected = self.partition.gicd.irq_pending(&self.gicr);
+                        tracing::info!(
+                            target: "gic5c",
+                            injected,
+                            pending = format!("{p:#x}"),
+                            enable = format!("{e:#x}"),
+                            group = format!("{g:#x}"),
+                            active = format!("{a:#x}"),
+                            pmr = format!("{pmr:#x}"),
+                            grpen0 = ge0,
+                            grpen1 = ge1,
+                            sgi8_prio = format!("{prio8:#x}"),
+                            "SGI/PPI pending snapshot"
+                        );
+                    }
+
                     if self.wfi {
                         self.vmtime.set_timeout_if_before(
                             self.vmtime.now().wrapping_add(Duration::from_millis(2)),
@@ -1412,6 +2336,50 @@ impl<'p> Processor for HvfProcessor<'p> {
             unsafe { abi::hv_vcpu_run(self.vcpu.vcpu) }
                 .chk()
                 .map_err(|err| dev.fatal_error(err.into()))?;
+
+            // DIAGNOSTIC (CloudMOS bugcheck): record the guest's most-recent EL1
+            // synchronous data abort (EC=0x25) at each exit into a small ring, so
+            // the in-guest fault chain immediately preceding a bugcheck can be
+            // dumped + page-table-walked at the GuestCrashCtl read. Those faults
+            // are taken and resolved entirely at EL1 and never exit to HVF, so
+            // this exit-time `ESR_EL1` snapshot is the only window onto them.
+            if let (Ok(esr), Ok(far)) = (
+                self.vcpu.sys_reg(abi::HvSysReg::ESR_EL1),
+                self.vcpu.sys_reg(abi::HvSysReg::FAR_EL1),
+            ) {
+                if (esr >> 26) & 0x3f == 0x25 {
+                    let mut ring = DIAG_FAULT_RING.lock();
+                    if ring.back().map(|&(_, f, _, _)| f) != Some(far) {
+                        let elr = self.vcpu.sys_reg(abi::HvSysReg::ELR_EL1).unwrap_or(0);
+                        // Capture whether the faulting VA's leaf is mapped *now*,
+                        // at fault time (vs. the later crash-time walk).
+                        let fault_time_valid = if far >= 0xffff_0000_0000_0000 {
+                            match (
+                                self.vcpu.sys_reg(abi::HvSysReg::TTBR1_EL1),
+                                self.vcpu.sys_reg(abi::HvSysReg::TCR_EL1),
+                            ) {
+                                (Ok(ttbr1), Ok(tcr)) => match diag_walk_leaf_valid(
+                                    &self.partition.guest_memory,
+                                    ttbr1,
+                                    tcr,
+                                    far,
+                                ) {
+                                    Some(true) => 1,
+                                    Some(false) => 0,
+                                    None => 2,
+                                },
+                                _ => 2,
+                            }
+                        } else {
+                            2
+                        };
+                        ring.push_back((esr, far, elr, fault_time_valid));
+                        while ring.len() > 16 {
+                            ring.pop_front();
+                        }
+                    }
+                }
+            }
 
             match self.vcpu.exit.reason {
                 abi::HvExitReason::CANCELED => {

@@ -890,6 +890,7 @@ dependencies = [
  "inspect_counters",
  "libc",
  "mesh_channel_core",
+ "net_packet_trace",
  "open_enum",
  "pal",
  "pal_async",
@@ -4830,6 +4831,13 @@ dependencies = [
  "parking_lot",
  "pcap-file",
  "tracing",
+]
+
+[[package]]
+name = "net_packet_trace"
+version = "0.0.0"
+dependencies = [
+ "smoltcp",
 ]
 
 [[package]]

@@ -55,6 +55,9 @@ use smoltcp::wire::Icmpv6Packet;
 use smoltcp::wire::IpAddress;
 use smoltcp::wire::IpProtocol;
 pub use smoltcp::wire::IpVersion;
+
+pub use net_packet_trace::FrameSummary;
+pub use net_packet_trace::describe_frame;
 use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv4Packet;
 use smoltcp::wire::Ipv6Address;

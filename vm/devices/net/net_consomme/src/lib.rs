@@ -520,8 +520,20 @@ impl net_backend::Queue for ConsommeQueue {
                 offset += segment.len as usize;
             }
 
+            tracing::trace!(
+                target: "consomme_edge",
+                dir = "tx",
+                len = buf.len(),
+                frame = %consomme::describe_frame(&buf),
+                "guest -> backend"
+            );
             if let Err(err) = self.with_consomme(pool, |c| c.send(&buf, &checksum)) {
-                tracing::debug!(error = &err as &dyn std::error::Error, "tx packet ignored");
+                tracing::debug!(
+                    target: "consomme_edge",
+                    frame = %consomme::describe_frame(&buf),
+                    error = &err as &dyn std::error::Error,
+                    "tx frame dropped by backend"
+                );
                 match err {
                     consomme::DropReason::SendBufferFull => self.stats.tx_dropped.increment(),
                     consomme::DropReason::UnsupportedEthertype(_)
@@ -646,6 +658,13 @@ impl consomme::Client for Client<'_> {
     }
 
     fn recv(&mut self, data: &[u8], checksum: &ChecksumState) {
+        tracing::trace!(
+            target: "consomme_edge",
+            dir = "rx",
+            len = data.len(),
+            frame = %consomme::describe_frame(data),
+            "backend -> guest"
+        );
         let Some(rx_id) = self.state.rx_avail.pop_front() else {
             // This should be rare, only affecting unbuffered protocols. TCP and
             // UDP are buffered and they won't indicate packets unless rx_mtu()

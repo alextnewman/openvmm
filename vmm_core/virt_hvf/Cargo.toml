@@ -6,6 +6,16 @@ name = "virt_hvf"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Request a 4KB stage-2 (IPA) granule via `hv_vm_config_set_ipa_granule`
+# (macOS 26.0+) instead of HVF's native 16KB Apple-Silicon default. OFF by
+# default: enabling it raises the runtime floor to macOS 26 and does NOT fix the
+# Windows-on-ARM64 spurious stage-1 store-translation livelock (CloudMOS `0x1E`;
+# see the session's cloudmos_livelock_analysis.md). It is a correct,
+# AZL-3-validated configuration kept as a lever for opportunistic Windows
+# re-tests on future macOS.
+hvf-4kb-ipa = []
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 aarch64defs.workspace = true
 hvdef.workspace = true
@@ -13,6 +23,7 @@ hv1_emulator.workspace = true
 hv1_hypercall.workspace = true
 virt.workspace = true
 virt_support_gic.workspace = true
+pci_core.workspace = true
 guestmem.workspace = true
 vmcore.workspace = true
 vm_topology.workspace = true

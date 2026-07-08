@@ -21,6 +21,24 @@ use zerocopy::KnownLayout;
 
 pub const VENDOR_ID: u16 = 0x1414;
 pub const DEVICE_ID: u16 = 0x00BA;
+/// PCI device id for the physical function (PF). A device presented with this
+/// id (rather than the SR-IOV VF id [`DEVICE_ID`]) drives the Linux driver's
+/// bare-metal-host code paths (`mana_is_pf`).
+pub const PF_DEVICE_ID: u16 = 0x00B9;
+
+/// PF BAR0 register offsets read by the Linux driver's `mana_gd_init_pf_regs`.
+/// These name a register layout disjoint from the VF [`RegMap`], used only when
+/// the device is presented as a PF.
+pub mod pf_regs {
+    /// `u64` doorbell page region offset, relative to BAR0.
+    pub const DB_PAGE_OFF: usize = 0xC8;
+    /// `u32` doorbell page size (must be a page multiple).
+    pub const DB_PAGE_SIZE: usize = 0xD0;
+    /// `u64` shared-memory (SMC) window offset, relative to the SR-IOV base.
+    pub const SHM_OFF: usize = 0x70;
+    /// `u64` SR-IOV register config base offset, relative to BAR0.
+    pub const SRIOV_REG_CFG_BASE_OFF: usize = 0x108;
+}
 
 pub const PAGE_SIZE32: u32 = 4096;
 pub const PAGE_SIZE64: u64 = 4096;
@@ -100,12 +118,14 @@ open_enum! {
     pub enum SmcMessageType: u8 {
         SMC_MSG_TYPE_ESTABLISH_HWC = 1,
         SMC_MSG_TYPE_DESTROY_HWC = 2,
+        SMC_MSG_TYPE_HOST_MGMT_READY = 3,
         SMC_MSG_TYPE_REPORT_HWC_TIMEOUT = 4,
     }
 }
 
 pub const SMC_MSG_TYPE_ESTABLISH_HWC_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_DESTROY_HWC_VERSION: u8 = 0;
+pub const SMC_MSG_TYPE_HOST_MGMT_READY_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION: u8 = 1;
 
 #[repr(C)]
@@ -324,6 +344,10 @@ open_enum! {
         GDMA_CREATE_DMA_REGION = 25,
         GDMA_DMA_REGION_ADD_PAGES = 26,
         GDMA_DESTROY_DMA_REGION = 27,
+        GDMA_CREATE_PD = 29,
+        GDMA_DESTROY_PD = 30,
+        GDMA_CREATE_MR = 31,
+        GDMA_DESTROY_MR = 32,
         GDMA_CHANGE_MSIX_FOR_EQ = 81,
     }
 }
@@ -341,6 +365,10 @@ pub struct GdmaMsgHdr {
 pub const GDMA_STANDARD_HEADER_TYPE: u32 = 0;
 
 pub const GDMA_MESSAGE_V1: u16 = 1;
+
+pub const GDMA_MESSAGE_V2: u16 = 2;
+
+pub const GDMA_MESSAGE_V3: u16 = 3;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes, PartialEq, Eq)]
@@ -381,6 +409,14 @@ pub struct GdmaRespHdr {
     pub status: u32,
     pub reserved: u32,
 }
+
+/// [`GdmaRespHdr::status`] value a device returns for a command it does not
+/// implement. The guest's GDMA client (`hw_channel.c`) maps this specific code
+/// to `-EOPNOTSUPP` and handles it gracefully (logging at most once), whereas
+/// any other non-zero status is treated as a hard `-EPROTO` protocol error and
+/// logged on every occurrence. Mirrors `GDMA_STATUS_CMD_UNSUPPORTED` in the
+/// Linux MANA driver's `gdma.h`.
+pub const GDMA_STATUS_CMD_UNSUPPORTED: u32 = 0xffffffff;
 
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -556,10 +592,75 @@ pub struct GdmaCreateDmaRegionResp {
     pub gdma_region: u64,
 }
 
+/// Adds more pages to a DMA region whose `GDMA_CREATE_DMA_REGION` request
+/// carried fewer pages (`page_addr_list_len`) than the region's total
+/// (`page_count`). The driver sends one or more of these, each appending
+/// `page_addr_list_len` page addresses, until the region's page list is
+/// complete and the region becomes usable.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDmaRegionAddPagesReq {
+    pub gdma_region: u64,
+    pub page_addr_list_len: u32,
+    pub reserved: u32,
+    // Followed by a u64 page list of length `page_addr_list_len`.
+}
+
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct GdmaDestroyDmaRegionReq {
     pub gdma_region: u64,
+}
+
+/// Creates a protection domain: a handle namespace under which memory regions
+/// are registered. `flags` carries the protection-domain flags (bit 0 permits
+/// GPA-addressed memory regions in this domain).
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreatePdReq {
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreatePdResp {
+    pub pd_handle: u64,
+    pub pd_id: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDestroyPdReq {
+    pub pd_handle: u64,
+}
+
+/// Registers a memory region within a protection domain. Only the leading
+/// fixed fields are modeled; the request carries a per-`mr_type` trailer
+/// (virtual address, DMA region handle, access flags) that the emulator does
+/// not consult, because its data path addresses guest memory by GPA and never
+/// resolves a memory key.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreateMrReq {
+    pub pd_handle: u64,
+    pub mr_type: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaCreateMrResp {
+    pub mr_handle: u64,
+    pub lkey: u32,
+    pub rkey: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaDestroyMrReq {
+    pub mr_handle: u64,
 }
 
 #[repr(C)]

@@ -6,6 +6,7 @@
 use crate::gdma_driver::GdmaDriver;
 use crate::mana::ResourceArena;
 use crate::resources::Resource;
+use gdma_defs::GDMA_MESSAGE_V2;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
@@ -16,17 +17,23 @@ use gdma_defs::bnic::MANA_VTL2_ASSIGN_SERIAL_NUMBER_RESPONSE_V1;
 use gdma_defs::bnic::MANA_VTL2_MOVE_FILTER_REQUEST_V2;
 use gdma_defs::bnic::MANA_VTL2_MOVE_FILTER_RESPONSE_V1;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
+use gdma_defs::bnic::ManaCfgRxSteerResp;
 use gdma_defs::bnic::ManaCommandCode;
 use gdma_defs::bnic::ManaConfigVportReq;
 use gdma_defs::bnic::ManaConfigVportResp;
 use gdma_defs::bnic::ManaCreateWqobjReq;
 use gdma_defs::bnic::ManaCreateWqobjResp;
 use gdma_defs::bnic::ManaDestroyWqobjReq;
+use gdma_defs::bnic::ManaFenceRqReq;
 use gdma_defs::bnic::ManaMoveFilterVTL2PrivilegedReq;
 use gdma_defs::bnic::ManaQueryDeviceCfgReq;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
 use gdma_defs::bnic::ManaQueryFilterStateReq;
 use gdma_defs::bnic::ManaQueryFilterStateResponse;
+#[cfg(test)]
+use gdma_defs::bnic::ManaQueryPhyStatisticsRequest;
+#[cfg(test)]
+use gdma_defs::bnic::ManaQueryPhyStatisticsResponse;
 use gdma_defs::bnic::ManaQueryStatisticsRequest;
 use gdma_defs::bnic::ManaQueryStatisticsResponse;
 use gdma_defs::bnic::ManaQueryVportCfgReq;
@@ -154,42 +161,104 @@ impl<'a, T: DeviceBacking> BnicDriver<'a, T> {
             .await
     }
 
+    /// Fences a receive queue, blocking until the device posts the fence
+    /// completion on the queue's CQ. The Linux driver issues this on RSS
+    /// reconfiguration and on vport teardown to ensure in-flight receive
+    /// completions have drained before the steering table changes. This Rust
+    /// driver does not fence on its datapath, so the method exists to drive the
+    /// device-side fence barrier from the conformance tests.
+    pub async fn fence_rq(&mut self, wq_obj_handle: u64) -> anyhow::Result<()> {
+        self.gdma
+            .request(
+                ManaCommandCode::MANA_FENCE_RQ.0,
+                self.dev_id,
+                ManaFenceRqReq { wq_obj_handle },
+            )
+            .await
+    }
+
     #[tracing::instrument(skip(self, config), level = "debug", err)]
     pub async fn config_vport_rx(
         &mut self,
         vport: u64,
         config: &RxConfig<'_>,
     ) -> anyhow::Result<()> {
-        #[repr(C)]
-        #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
-        struct Req {
-            req: ManaCfgRxSteerReq,
-            table: [u64; 128],
-        }
-
-        let mut req = Req {
-            req: ManaCfgRxSteerReq {
-                vport,
-                num_indir_entries: config.indirection_table.map_or(0, |t| t.len() as u16),
-                indir_tab_offset: (size_of::<GdmaReqHdr>() + size_of::<ManaCfgRxSteerReq>()) as u16,
-                rx_enable: config.rx_enable.into(),
-                rss_enable: config.rss_enable.into(),
-                update_default_rxobj: config.default_rxobj.is_some().into(),
-                update_hashkey: config.hash_key.is_some().into(),
-                update_indir_tab: config.indirection_table.is_some().into(),
-                reserved: 0,
-                default_rxobj: config.default_rxobj.unwrap_or(0),
-                hashkey: *config.hash_key.unwrap_or(&[0; 40]),
-            },
-            table: FromZeros::new_zeroed(),
+        let num_indir_entries = config.indirection_table.map_or(0, |t| t.len() as u16);
+        let steer_req = |indir_tab_offset: u16| ManaCfgRxSteerReq {
+            vport,
+            num_indir_entries,
+            indir_tab_offset,
+            rx_enable: config.rx_enable.into(),
+            rss_enable: config.rss_enable.into(),
+            update_default_rxobj: config.default_rxobj.is_some().into(),
+            update_hashkey: config.hash_key.is_some().into(),
+            update_indir_tab: config.indirection_table.is_some().into(),
+            reserved: 0,
+            default_rxobj: config.default_rxobj.unwrap_or(0),
+            hashkey: *config.hash_key.unwrap_or(&[0; 40]),
         };
-        if let Some(table) = config.indirection_table {
-            req.table[..table.len()].copy_from_slice(table);
-        }
 
-        self.gdma
-            .request(ManaCommandCode::MANA_CONFIG_VPORT_RX.0, self.dev_id, req)
-            .await
+        if config.cqe_coalescing {
+            // GDMA_MESSAGE_V2 form: negotiate RX CQE coalescing. The request
+            // inserts `cqe_coalescing_enable` (followed by 7 reserved bytes)
+            // between the fixed struct and the indirection table, so the table
+            // moves 8 bytes later -- reflected in `indir_tab_offset`. Like the
+            // Linux driver, the enable byte is only meaningful when receive is
+            // being enabled. The device replies with the coalescing window it
+            // honors.
+            #[repr(C)]
+            #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+            struct ReqV2 {
+                req: ManaCfgRxSteerReq,
+                cqe_coalescing_enable: u8,
+                reserved2: [u8; 7],
+                table: [u64; 128],
+            }
+
+            let mut req = ReqV2 {
+                req: steer_req(
+                    (size_of::<GdmaReqHdr>() + size_of::<ManaCfgRxSteerReq>() + 8) as u16,
+                ),
+                cqe_coalescing_enable: u8::from(config.rx_enable != Some(false)),
+                reserved2: [0; 7],
+                table: FromZeros::new_zeroed(),
+            };
+            if let Some(table) = config.indirection_table {
+                req.table[..table.len()].copy_from_slice(table);
+            }
+
+            let _resp: (ManaCfgRxSteerResp, u32) = self
+                .gdma
+                .request_version(
+                    ManaCommandCode::MANA_CONFIG_VPORT_RX.0,
+                    GDMA_MESSAGE_V2,
+                    ManaCommandCode::MANA_CONFIG_VPORT_RX.0,
+                    GDMA_MESSAGE_V2,
+                    self.dev_id,
+                    req,
+                )
+                .await?;
+            Ok(())
+        } else {
+            #[repr(C)]
+            #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+            struct Req {
+                req: ManaCfgRxSteerReq,
+                table: [u64; 128],
+            }
+
+            let mut req = Req {
+                req: steer_req((size_of::<GdmaReqHdr>() + size_of::<ManaCfgRxSteerReq>()) as u16),
+                table: FromZeros::new_zeroed(),
+            };
+            if let Some(table) = config.indirection_table {
+                req.table[..table.len()].copy_from_slice(table);
+            }
+
+            self.gdma
+                .request(ManaCommandCode::MANA_CONFIG_VPORT_RX.0, self.dev_id, req)
+                .await
+        }
     }
 
     #[tracing::instrument(skip(self), level = "debug", err)]
@@ -218,6 +287,27 @@ impl<'a, T: DeviceBacking> BnicDriver<'a, T> {
                 ManaCommandCode::MANA_QUERY_STATS.0,
                 self.dev_id,
                 ManaQueryStatisticsRequest {
+                    requested_statistics,
+                },
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// Queries physical-port statistics (`MANA_QUERY_PHY_STAT`). Only the
+    /// conformance tests drive this directly; the Linux driver issues it from
+    /// `ethtool -S`.
+    #[cfg(test)]
+    pub async fn query_phy_stats(
+        &mut self,
+        requested_statistics: u64,
+    ) -> anyhow::Result<ManaQueryPhyStatisticsResponse> {
+        let resp: ManaQueryPhyStatisticsResponse = self
+            .gdma
+            .request(
+                ManaCommandCode::MANA_QUERY_PHY_STAT.0,
+                self.dev_id,
+                ManaQueryPhyStatisticsRequest {
                     requested_statistics,
                 },
             )
@@ -298,6 +388,10 @@ pub struct RxConfig<'a> {
     pub default_rxobj: Option<u64>,
     /// The RSS indirection table.
     pub indirection_table: Option<&'a [u64]>,
+    /// Request RX CQE coalescing. When set, the request is sent in its
+    /// `GDMA_MESSAGE_V2` form so the device coalesces up to four receive
+    /// completions into a single CQE.
+    pub cqe_coalescing: bool,
 }
 
 pub struct WqConfig {

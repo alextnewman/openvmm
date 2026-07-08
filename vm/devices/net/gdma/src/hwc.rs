@@ -2,24 +2,36 @@
 // Licensed under the MIT License.
 
 use crate::bnic::BasicNic;
+use crate::bnic::BnicStatusError;
 use crate::dma::DmaRegion;
+use crate::dma::DmaRegionBuilder;
 use crate::queues::QueueAllocError;
 use crate::queues::Queues;
 use anyhow::Context;
 use anyhow::anyhow;
+use gdma_defs::EqeDataReconfig;
 use gdma_defs::GDMA_EQE_HWC_INIT_DATA;
 use gdma_defs::GDMA_EQE_HWC_INIT_DONE;
 use gdma_defs::GDMA_EQE_HWC_INIT_EQ_ID_DB;
+use gdma_defs::GDMA_EQE_HWC_RECONFIG_DATA;
 use gdma_defs::GDMA_EQE_HWC_RESET_REQUEST;
 use gdma_defs::GDMA_EQE_TEST_EVENT;
 use gdma_defs::GdmaChangeMsixVectorIndexForEq;
 use gdma_defs::GdmaCreateDmaRegionReq;
 use gdma_defs::GdmaCreateDmaRegionResp;
+use gdma_defs::GdmaCreateMrReq;
+use gdma_defs::GdmaCreateMrResp;
+use gdma_defs::GdmaCreatePdReq;
+use gdma_defs::GdmaCreatePdResp;
 use gdma_defs::GdmaCreateQueueReq;
 use gdma_defs::GdmaCreateQueueResp;
+use gdma_defs::GdmaDestroyDmaRegionReq;
+use gdma_defs::GdmaDestroyMrReq;
+use gdma_defs::GdmaDestroyPdReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDevType;
 use gdma_defs::GdmaDisableQueueReq;
+use gdma_defs::GdmaDmaRegionAddPagesReq;
 use gdma_defs::GdmaGenerateResetEventReq;
 use gdma_defs::GdmaGenerateTestEventReq;
 use gdma_defs::GdmaListDevicesResp;
@@ -31,6 +43,8 @@ use gdma_defs::GdmaRequestType;
 use gdma_defs::GdmaRespHdr;
 use gdma_defs::GdmaVerifyVerReq;
 use gdma_defs::GdmaVerifyVerResp;
+use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT;
+use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT;
 use gdma_defs::HWC_DEV_ID;
 use gdma_defs::HWC_INIT_DATA_CQID;
 use gdma_defs::HWC_INIT_DATA_GPA_MKEY;
@@ -47,6 +61,7 @@ use gdma_defs::HwcRxOob;
 use gdma_defs::HwcTxOob;
 use gdma_defs::PAGE_SIZE64;
 use gdma_defs::access::WqeAccess;
+use gdma_defs::bnic::bnic_status;
 use guestmem::Limit;
 use guestmem::MemoryRead;
 use guestmem::MemoryWrite;
@@ -60,14 +75,19 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+// `instance` must be 0. Different drivers interpret the device-list response
+// in two ways: one treats each entry as an opaque `{ ty, instance }` device id
+// and round-trips whatever instance we report; another reads the same 16-bit
+// field as a secondary client-instance index and silently discards any entry
+// whose value is non-zero. A non-zero value here would cause that second driver
+// to drop the basic-NIC client, so its child device is never enumerated.
 const BNIC_DEV_ID: GdmaDevId = GdmaDevId {
     ty: GdmaDevType::GDMA_DEVICE_MANA,
-    instance: 1,
+    instance: 0,
 };
 
 pub struct HwControl {
     state: HwState,
-    _eq_id: u32,
     cq_id: u32,
     sq_id: u32,
     rq_id: u32,
@@ -81,10 +101,12 @@ impl InspectTaskMut<HwControl> for Devices {
         if let Some(hwc) = hwc {
             resp.child("hwc", |req| {
                 req.respond()
-                    .field("eq_id", hwc._eq_id)
+                    .field("eq_id", hwc.state.hwc_eq_id)
                     .field("cq_id", hwc.cq_id)
                     .field("sq_id", hwc.sq_id)
-                    .field("rq_id", hwc.rq_id);
+                    .field("rq_id", hwc.rq_id)
+                    .field("pds", hwc.state.pds.len())
+                    .field("mrs", hwc.state.mrs.len());
             })
             .field("bnic/enabled", hwc.bnic_enabled);
         }
@@ -98,7 +120,29 @@ pub struct Devices {
 
 pub struct HwState {
     pub queues: Arc<Queues>,
-    pub dma_regions: Slab<DmaRegion>,
+    /// The event queue created for the HW channel during HWC init. Async
+    /// device events that the driver's HW-channel EQE handler processes (for
+    /// example vport link-status changes) are posted here.
+    pub hwc_eq_id: u32,
+    pub dma_regions: Slab<DmaRegionState>,
+    /// Live protection-domain handles. A protection domain is a handle
+    /// namespace for memory regions; the emulated data path addresses guest
+    /// memory by GPA and never resolves a memory key, so a domain needs no
+    /// backing state beyond a live handle. Tracked so create/destroy pair up
+    /// and a memory-region create can be validated against a live domain.
+    pub pds: Slab<()>,
+    /// Live memory-region handles. Modeled as opaque handles for the same
+    /// reason as [`HwState::pds`]: the data path does not consult memory keys.
+    pub mrs: Slab<()>,
+}
+
+/// A DMA region slot. A region whose page list spans multiple HW channel
+/// messages stays `Building` until every page has arrived, then becomes
+/// `Ready`; single-message regions are `Ready` immediately. Only `Ready`
+/// regions can be bound to a queue.
+pub enum DmaRegionState {
+    Building(DmaRegionBuilder),
+    Ready(DmaRegion),
 }
 
 impl HwState {
@@ -111,6 +155,12 @@ impl HwState {
             .dma_regions
             .get(gdma_region.wrapping_sub(1) as usize)
             .context("dma region not found")?;
+        let region = match region {
+            DmaRegionState::Ready(region) => region,
+            DmaRegionState::Building(_) => {
+                anyhow::bail!("dma region page list is incomplete")
+            }
+        };
         if region.len() != expected_size as usize {
             anyhow::bail!("dma region size does not match");
         }
@@ -122,6 +172,38 @@ impl HwState {
             .try_remove(gdma_region.wrapping_sub(1) as usize)
             .context("invalid gdma region")?;
         Ok(())
+    }
+
+    /// Post an asynchronous vport link-status event on the HW channel EQ.
+    ///
+    /// A MANA vport does not implicitly come up "link up": the device reports
+    /// the operational link state to the driver through a reconfig EQE on the
+    /// HW channel event queue. The Windows VF miniport waits for this event
+    /// before it indicates media-connect to NDIS, so until the device sends it
+    /// the guest network stack stays media-disconnected and transmits nothing
+    /// (no ARP/DHCP) even though the data path is fully configured. (The Linux
+    /// netdev driver is not sensitive to this because it marks the carrier up
+    /// unconditionally at probe and treats the reconfig event as supplementary.)
+    /// Report link-up when the guest enables vport receive, link-down when it
+    /// disables it. The event names the affected vport by index in its 24-bit
+    /// value field.
+    pub fn post_vport_link_status(&self, vport_index: u32, connected: bool) {
+        let data_type = if connected {
+            HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT
+        } else {
+            HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT
+        };
+        let value = vport_index.to_le_bytes();
+        self.queues.post_eq(
+            self.hwc_eq_id,
+            GDMA_EQE_HWC_RECONFIG_DATA,
+            EqeDataReconfig {
+                data: [value[0], value[1], value[2]],
+                data_type,
+                reserved1: [0; 8],
+            }
+            .as_bytes(),
+        );
     }
 }
 
@@ -183,9 +265,11 @@ impl HwControl {
         Ok(Self {
             state: HwState {
                 queues,
+                hwc_eq_id: eq_id,
                 dma_regions: Slab::new(),
+                pds: Slab::new(),
+                mrs: Slab::new(),
             },
-            _eq_id: eq_id,
             cq_id,
             sq_id,
             rq_id,
@@ -227,11 +311,17 @@ impl HwControl {
                 .read_plain()
                 .context("reading request message header")?;
 
-            if hdr.req.msg_size as u64 > PAGE_SIZE64 {
-                anyhow::bail!(
-                    "request message size {} exceeds page size {PAGE_SIZE64}",
-                    hdr.req.msg_size
-                );
+            // The authoritative request length is the work request's posted data
+            // length (its out-of-band length), not the header's self-reported
+            // `msg_size`. A physical function sets `msg_size` to the request's
+            // fixed base size and conveys the true length -- including a
+            // variable-length trailer such as a DMA region page array -- via the
+            // work-request length; bounding the read by `msg_size` would truncate
+            // that trailer. A virtual function posts the work request at exactly
+            // `msg_size` bytes, so the two are equivalent for it.
+            let req_len = MemoryRead::len(&read);
+            if req_len as u64 > PAGE_SIZE64 {
+                anyhow::bail!("request message length {req_len} exceeds page size {PAGE_SIZE64}");
             }
             if hdr.resp.msg_size as u64 > PAGE_SIZE64 {
                 anyhow::bail!(
@@ -240,7 +330,7 @@ impl HwControl {
                 );
             }
 
-            let mut read = MemoryRead::limit(read, hdr.req.msg_size as usize);
+            let mut read = MemoryRead::limit(read, req_len);
             read.skip(size_of_val(&hdr))
                 .context("message size too small")?;
 
@@ -253,8 +343,19 @@ impl HwControl {
             let r = match hdr.req.msg_type >> 16 {
                 0 => self.handle_req(&hdr, read, write),
                 _ => {
-                    // Device specific.
-                    if hdr.dev_id == BNIC_DEV_ID && self.bnic_enabled {
+                    // Device-specific (BNIC/MANA) command. The MANA client is
+                    // provisioned by the host as part of hardware-channel
+                    // bring-up: completing HWC setup delivers an init EQE that
+                    // carries the client's pdid and resource limits, after which
+                    // the client is addressable. `GDMA_REGISTER_DEVICE` is an
+                    // optional, redundant confirmation -- some drivers send it
+                    // (the in-tree mana_driver and the Linux driver) and others
+                    // skip it, issuing MANA commands directly after HWC init (the
+                    // Windows VF driver, and a physical function). Requiring an
+                    // explicit register here would wrongly reject the latter.
+                    // Reaching this dispatch means the HWC is live, so accept any
+                    // command addressed to the MANA client.
+                    if hdr.dev_id == BNIC_DEV_ID {
                         devices
                             .bnic
                             .handle_req(&mut self.state, &hdr, read, write)
@@ -268,8 +369,26 @@ impl HwControl {
             let (status, response_len) = match r {
                 Ok(response_len) => (0, response_len),
                 Err(err) => {
-                    tracing::warn!(msg_type = hdr.req.msg_type, dev_id = ?hdr.dev_id, error = err.as_ref() as &dyn std::error::Error, "req error");
-                    (1, 0)
+                    // BNIC client messages carry device-specific status codes:
+                    // surface the code a handler tagged onto the error, else the
+                    // device's generic "not set by handler" default. Core GDMA
+                    // requests keep the generic non-zero failure code.
+                    let status = err.downcast_ref::<BnicStatusError>().map_or(
+                        if hdr.req.msg_type >> 16 != 0 && hdr.dev_id == BNIC_DEV_ID {
+                            bnic_status::NOT_SET_BY_HANDLER
+                        } else {
+                            1
+                        },
+                        |e| e.status,
+                    );
+                    tracing::warn!(
+                        msg_type = hdr.req.msg_type,
+                        dev_id = ?hdr.dev_id,
+                        status,
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "req error"
+                    );
+                    (status, 0)
                 }
             };
 
@@ -424,22 +543,66 @@ impl HwControl {
             GdmaRequestType::GDMA_CREATE_DMA_REGION => {
                 let req: GdmaCreateDmaRegionReq =
                     read.read_plain().context("reading dma region request")?;
-                if req.page_addr_list_len != req.page_count {
-                    anyhow::bail!("large regions not supported");
-                }
                 let pages: Vec<u64> = read
                     .read_n(req.page_addr_list_len as usize)
                     .context("reading dma region pages")?;
 
-                let dma_region = DmaRegion::new(pages, req.offset_in_page, req.length)
-                    .context("failed to parse dma region input")?;
-                let gdma_region = self.state.dma_regions.insert(dma_region) as u64 + 1;
+                // The guest may deliver the page list across multiple messages:
+                // when `page_addr_list_len` is short of `page_count`, the rest
+                // arrive via GDMA_DMA_REGION_ADD_PAGES. Hold the region as
+                // `Building` until it is whole, then finalize it.
+                let builder =
+                    DmaRegionBuilder::new(pages, req.offset_in_page, req.length, req.page_count)
+                        .context("failed to parse dma region input")?;
+                let state = if builder.is_complete() {
+                    DmaRegionState::Ready(
+                        builder
+                            .build()
+                            .context("failed to parse dma region input")?,
+                    )
+                } else {
+                    DmaRegionState::Building(builder)
+                };
+                let gdma_region = self.state.dma_regions.insert(state) as u64 + 1;
 
                 let resp = GdmaCreateDmaRegionResp { gdma_region };
                 write
                     .write(resp.as_bytes())
                     .context("writing dma region response")?;
                 size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DMA_REGION_ADD_PAGES => {
+                let req: GdmaDmaRegionAddPagesReq =
+                    read.read_plain().context("reading add pages request")?;
+                let pages: Vec<u64> = read
+                    .read_n(req.page_addr_list_len as usize)
+                    .context("reading add pages list")?;
+
+                let slot = self
+                    .state
+                    .dma_regions
+                    .get_mut(req.gdma_region.wrapping_sub(1) as usize)
+                    .context("dma region not found")?;
+                let DmaRegionState::Building(builder) = slot else {
+                    anyhow::bail!("dma region is not awaiting more pages");
+                };
+                builder
+                    .add_pages(&pages)
+                    .context("adding pages to dma region")?;
+                if builder.is_complete() {
+                    let region = builder.build().context("finalizing dma region")?;
+                    *slot = DmaRegionState::Ready(region);
+                }
+                0
+            }
+            GdmaRequestType::GDMA_DESTROY_DMA_REGION => {
+                let req: GdmaDestroyDmaRegionReq = read
+                    .read_plain()
+                    .context("reading destroy dma region request")?;
+                self.state
+                    .remove_dma_region(req.gdma_region)
+                    .context("destroying dma region")?;
+                0
             }
             GdmaRequestType::GDMA_CREATE_QUEUE => {
                 let req: GdmaCreateQueueReq = read.read_plain().context("reading queue request")?;
@@ -499,6 +662,75 @@ impl HwControl {
                 }
 
                 self.bnic_enabled = false;
+                0
+            }
+            GdmaRequestType::GDMA_CREATE_PD => {
+                // A protection domain is a handle namespace for memory regions.
+                // The emulated data path addresses guest memory by GPA and never
+                // resolves a memory key, so a domain needs no backing state
+                // beyond a live handle: allocate one and report it, with `pd_id`
+                // mirroring the handle. The Windows VF driver creates a global
+                // domain while starting the device to bring up its RDMA/NDK
+                // capability; the Linux NIC driver never issues this.
+                let _req: GdmaCreatePdReq =
+                    read.read_plain().context("reading create pd request")?;
+                let key = self.state.pds.insert(());
+                let resp = GdmaCreatePdResp {
+                    pd_handle: key as u64 + 1,
+                    pd_id: key as u32 + 1,
+                    reserved: 0,
+                };
+                write
+                    .write(resp.as_bytes())
+                    .context("writing create pd response")?;
+                size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DESTROY_PD => {
+                let req: GdmaDestroyPdReq =
+                    read.read_plain().context("reading destroy pd request")?;
+                self.state
+                    .pds
+                    .try_remove(req.pd_handle.wrapping_sub(1) as usize)
+                    .context("destroying unknown pd handle")?;
+                0
+            }
+            GdmaRequestType::GDMA_CREATE_MR => {
+                // A memory region is registered within a protection domain. As
+                // with GDMA_CREATE_PD, only the handle matters to the emulator:
+                // the data path never resolves the returned keys, so report an
+                // opaque handle and usable, non-zero keys. Validate that the
+                // referenced domain is live.
+                let req: GdmaCreateMrReq =
+                    read.read_plain().context("reading create mr request")?;
+                if !self
+                    .state
+                    .pds
+                    .contains(req.pd_handle.wrapping_sub(1) as usize)
+                {
+                    anyhow::bail!(
+                        "create mr references unknown pd handle {:#x}",
+                        req.pd_handle
+                    );
+                }
+                let key = self.state.mrs.insert(());
+                let mem_key = key as u32 + 1;
+                let resp = GdmaCreateMrResp {
+                    mr_handle: key as u64 + 1,
+                    lkey: mem_key,
+                    rkey: mem_key,
+                };
+                write
+                    .write(resp.as_bytes())
+                    .context("writing create mr response")?;
+                size_of_val(&resp)
+            }
+            GdmaRequestType::GDMA_DESTROY_MR => {
+                let req: GdmaDestroyMrReq =
+                    read.read_plain().context("reading destroy mr request")?;
+                self.state
+                    .mrs
+                    .try_remove(req.mr_handle.wrapping_sub(1) as usize)
+                    .context("destroying unknown mr handle")?;
                 0
             }
             ty => {

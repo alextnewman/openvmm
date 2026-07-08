@@ -532,6 +532,19 @@ impl<T: DeviceBacking> Vport<T> {
         Ok(())
     }
 
+    /// Fences a receive object, blocking until the device posts the fence
+    /// completion on the object's CQ. The Linux driver issues this on RSS
+    /// reconfiguration and on vport teardown so in-flight receive completions
+    /// drain ahead of the steering change. This Rust driver does not fence on
+    /// its own datapath; the method exists so conformance tests can exercise the
+    /// device-side fence barrier.
+    pub async fn fence_rq(&self, wq_obj_handle: u64) -> anyhow::Result<()> {
+        let mut gdma = self.inner.gdma.lock().await;
+        BnicDriver::new(&mut *gdma, self.inner.dev_id)
+            .fence_rq(wq_obj_handle)
+            .await
+    }
+
     /// Move filter between VTL2 VF vport and VTL0 VF vport
     pub async fn move_filter(&self, direction_to_vtl0: u8) -> anyhow::Result<()> {
         if let Some(to_vtl0) = self.vport_state.get_direction_to_vtl0() {

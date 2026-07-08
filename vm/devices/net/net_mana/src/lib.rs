@@ -15,11 +15,14 @@ use gdma_defs::CqeParams;
 use gdma_defs::GDMA_EQE_COMPLETION;
 use gdma_defs::Sge;
 use gdma_defs::WqeHeader;
+use gdma_defs::bnic::CQE_RX_COALESCED_4;
+use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::CQE_RX_OKAY;
 use gdma_defs::bnic::CQE_TX_GDMA_ERR;
 use gdma_defs::bnic::CQE_TX_INVALID_OOB;
 use gdma_defs::bnic::CQE_TX_OKAY;
 use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+use gdma_defs::bnic::MANA_RXCOMP_OOB_NUM_PPI;
 use gdma_defs::bnic::MANA_SHORT_PKT_FMT;
 use gdma_defs::bnic::ManaQueryStatisticsResponse;
 use gdma_defs::bnic::ManaRxcompOob;
@@ -374,6 +377,7 @@ impl<T: DeviceBacking> ManaEndpoint<T> {
             avail_rx: VecDeque::new(),
             posted_rx: VecDeque::new(),
             rx_max: rx_max as usize,
+            rx_overflow: VecDeque::new(),
             posted_tx: VecDeque::new(),
             dropped_tx: VecDeque::new(),
             tx_max: tx_max as usize,
@@ -421,6 +425,10 @@ impl<T: DeviceBacking> ManaEndpoint<T> {
         }
 
         let indirection_table;
+        // Production net_mana keeps the conservative one-CQE-per-packet wire
+        // behavior and does not request RX CQE coalescing. The emulator's
+        // coalescing path is exercised by the real Linux driver (ethtool -C) and
+        // by a dedicated datapath test that opts in via `config_rx` directly.
         let rx_config = if let Some(rss) = rss {
             indirection_table = rss
                 .indirection_table
@@ -440,6 +448,7 @@ impl<T: DeviceBacking> ManaEndpoint<T> {
                 hash_key: Some(rss.key.try_into().ok().context("wrong hash key size")?),
                 default_rxobj: Some(queue_resources[0].rxq.wq_obj()),
                 indirection_table: Some(&indirection_table),
+                cqe_coalescing: false,
             }
         } else {
             RxConfig {
@@ -448,6 +457,7 @@ impl<T: DeviceBacking> ManaEndpoint<T> {
                 hash_key: None,
                 default_rxobj: Some(queue_resources[0].rxq.wq_obj()),
                 indirection_table: None,
+                cqe_coalescing: false,
             }
         };
 
@@ -492,6 +502,7 @@ impl<T: DeviceBacking> Endpoint for ManaEndpoint<T> {
                 hash_key: None,
                 default_rxobj: None,
                 indirection_table: None,
+                cqe_coalescing: false,
             })
             .instrument(tracing::info_span!(
                 "clearing rx configuration",
@@ -609,6 +620,11 @@ pub struct ManaQueue<T: DeviceBacking> {
     posted_rx: VecDeque<PostedRx>,
     rx_max: usize,
 
+    /// Packets decoded from a coalesced CQE that did not fit in the caller's
+    /// `rx_poll` slice. They are already fully processed (header/data written)
+    /// and are handed out first on subsequent `rx_poll` calls.
+    rx_overflow: VecDeque<RxId>,
+
     posted_tx: VecDeque<PostedTx>,
     dropped_tx: VecDeque<TxId>,
     tx_max: usize,
@@ -659,10 +675,13 @@ struct QueueStats {
     rx_packets: Counter,
     rx_vlan_packets: Counter,
     rx_errors: Counter,
+    rx_fence: Counter,
 
     interrupts: Counter,
 
     tx_packets_coalesced: Counter,
+    rx_packets_coalesced: Counter,
+    rx_packets_hashed: Counter,
 }
 
 impl<T: DeviceBacking> InspectMut for ManaQueue<T> {
@@ -966,34 +985,76 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
     ) -> anyhow::Result<usize> {
         let mut i = 0;
         let mut commit = false;
+
+        // Hand out any packets stashed from a previous coalesced CQE that did
+        // not fit in the caller's slice before decoding new completions.
         while i < packets.len() {
-            if let Some(cqe) = self.rx_cq.pop() {
-                let rx = self.posted_rx.pop_front().unwrap();
-                let rx_oob = ManaRxcompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
-                match rx_oob.cqe_hdr.cqe_type() {
-                    CQE_RX_OKAY => {
-                        let ip_checksum = if rx_oob.flags.rx_iphdr_csum_succeed() {
-                            RxChecksumState::Good
-                        } else if rx_oob.flags.rx_iphdr_csum_fail() {
-                            RxChecksumState::Bad
-                        } else {
-                            RxChecksumState::Unknown
-                        };
-                        let (l4_protocol, l4_checksum) = if rx_oob.flags.rx_tcp_csum_succeed() {
-                            (L4Protocol::Tcp, RxChecksumState::Good)
-                        } else if rx_oob.flags.rx_tcp_csum_fail() {
-                            (L4Protocol::Tcp, RxChecksumState::Bad)
-                        } else if rx_oob.flags.rx_udp_csum_succeed() {
-                            (L4Protocol::Udp, RxChecksumState::Good)
-                        } else if rx_oob.flags.rx_udp_csum_fail() {
-                            (L4Protocol::Udp, RxChecksumState::Bad)
-                        } else {
-                            (L4Protocol::Unknown, RxChecksumState::Unknown)
-                        };
-                        let vlantag = rx_oob.flags.rx_vlantag_present().then(|| {
-                            VlanMetadata::new().with_vlan_id(rx_oob.flags.rx_vlan_id() as u16)
-                        });
-                        let len = rx_oob.ppi[0].pkt_len.into();
+            if let Some(id) = self.rx_overflow.pop_front() {
+                packets[i] = id;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+
+        while i < packets.len() {
+            let Some(cqe) = self.rx_cq.pop() else {
+                if !self.rx_cq_armed {
+                    self.rx_cq.arm();
+                    self.rx_cq_armed = true;
+                }
+                break;
+            };
+
+            let rx_oob = ManaRxcompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
+            let cqe_type = rx_oob.cqe_hdr.cqe_type();
+            match cqe_type {
+                CQE_RX_OKAY | CQE_RX_COALESCED_4 => {
+                    // The checksum, VLAN, and hash-type results carried in the
+                    // OOB are common to every packet in a coalesced batch; only
+                    // the per-packet length (and hash) vary. Compute the common
+                    // metadata once.
+                    let ip_checksum = if rx_oob.flags.rx_iphdr_csum_succeed() {
+                        RxChecksumState::Good
+                    } else if rx_oob.flags.rx_iphdr_csum_fail() {
+                        RxChecksumState::Bad
+                    } else {
+                        RxChecksumState::Unknown
+                    };
+                    let (l4_protocol, l4_checksum) = if rx_oob.flags.rx_tcp_csum_succeed() {
+                        (L4Protocol::Tcp, RxChecksumState::Good)
+                    } else if rx_oob.flags.rx_tcp_csum_fail() {
+                        (L4Protocol::Tcp, RxChecksumState::Bad)
+                    } else if rx_oob.flags.rx_udp_csum_succeed() {
+                        (L4Protocol::Udp, RxChecksumState::Good)
+                    } else if rx_oob.flags.rx_udp_csum_fail() {
+                        (L4Protocol::Udp, RxChecksumState::Bad)
+                    } else {
+                        (L4Protocol::Unknown, RxChecksumState::Unknown)
+                    };
+                    let vlantag = rx_oob.flags.rx_vlantag_present().then(|| {
+                        VlanMetadata::new().with_vlan_id(rx_oob.flags.rx_vlan_id() as u16)
+                    });
+
+                    let coalesced = cqe_type == CQE_RX_COALESCED_4;
+
+                    // The RSS hash type is carried once in the OOB flags and
+                    // applies to every packet in a coalesced batch. Count the
+                    // packets the device hashed so the offload is observable
+                    // (e.g. via `ethtool`-style inspection); mirrors the way the
+                    // Linux driver reads the same field to steer receives.
+                    let hashed = rx_oob.flags.rx_hashtype() != 0;
+
+                    // A coalesced CQE describes up to MANA_RXCOMP_OOB_NUM_PPI
+                    // packets, each consuming one posted receive buffer in order;
+                    // a zero length terminates the batch. CQE_RX_OKAY is the
+                    // single-packet case and always describes exactly ppi[0].
+                    for ppi in 0..MANA_RXCOMP_OOB_NUM_PPI {
+                        let len: usize = rx_oob.ppi[ppi].pkt_len.into();
+                        if coalesced && len == 0 {
+                            break;
+                        }
+                        let rx = self.posted_rx.pop_front().unwrap();
                         pool.write_header(
                             rx.id,
                             &RxMetadata {
@@ -1015,42 +1076,74 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                             pool.write_data(rx.id, &data);
                         }
                         self.stats.rx_packets.increment();
+                        if hashed {
+                            self.stats.rx_packets_hashed.increment();
+                        }
+                        if coalesced {
+                            self.stats.rx_packets_coalesced.increment();
+                        }
                         if vlantag.is_some() {
                             self.stats.rx_vlan_packets.increment();
                         }
-                        packets[i] = rx.id;
-                        i += 1;
+                        self.rx_wq.advance_head(rx.wqe_len);
+                        if rx.bounced_len_with_padding > 0 {
+                            self.rx_bounce_buffer
+                                .as_mut()
+                                .unwrap()
+                                .free(rx.bounced_len_with_padding);
+                        }
+                        // Replenish the rq, if possible.
+                        commit |= self.push_rqe(pool);
+
+                        // Deliver to the caller if there is room, otherwise stash
+                        // the already-processed packet for the next poll.
+                        if i < packets.len() {
+                            packets[i] = rx.id;
+                            i += 1;
+                        } else {
+                            self.rx_overflow.push_back(rx.id);
+                        }
+
+                        if !coalesced {
+                            break;
+                        }
                     }
-                    ty => {
-                        tracelimit::error_ratelimited!(
-                            ty,
-                            vendor_err = rx_oob.cqe_hdr.vendor_err(),
-                            rx_cq_id = self.rx_cq.id(),
-                            rx_wq_id = self.rx_wq.id(),
-                            rx_vlantag_present = rx_oob.flags.rx_vlantag_present(),
-                            rx_vlan_id = rx_oob.flags.rx_vlan_id(),
-                            "invalid rx cqe type"
-                        );
-                        self.trace_rx_wqe_from_offset(rx_oob.rx_wqe_offset);
-                        self.stats.rx_errors.increment();
-                        self.avail_rx.push_back(rx.id);
+                }
+                CQE_RX_OBJECT_FENCE => {
+                    // A receive fence is a bare ordering barrier: it carries no
+                    // packet and consumes no posted receive buffer. On real
+                    // hardware the Linux driver completes its `fence_event` and
+                    // returns immediately. Signal it via a counter (so callers
+                    // can observe that the fence landed) and continue draining;
+                    // crucially, do NOT pop `posted_rx`, advance the receive
+                    // queue, or replenish the rq -- doing so would consume a
+                    // buffer the fence never claimed and corrupt rq accounting.
+                    self.stats.rx_fence.increment();
+                }
+                ty => {
+                    let rx = self.posted_rx.pop_front().unwrap();
+                    tracelimit::error_ratelimited!(
+                        ty,
+                        vendor_err = rx_oob.cqe_hdr.vendor_err(),
+                        rx_cq_id = self.rx_cq.id(),
+                        rx_wq_id = self.rx_wq.id(),
+                        rx_vlantag_present = rx_oob.flags.rx_vlantag_present(),
+                        rx_vlan_id = rx_oob.flags.rx_vlan_id(),
+                        "invalid rx cqe type"
+                    );
+                    self.trace_rx_wqe_from_offset(rx_oob.rx_wqe_offset);
+                    self.stats.rx_errors.increment();
+                    self.avail_rx.push_back(rx.id);
+                    self.rx_wq.advance_head(rx.wqe_len);
+                    if rx.bounced_len_with_padding > 0 {
+                        self.rx_bounce_buffer
+                            .as_mut()
+                            .unwrap()
+                            .free(rx.bounced_len_with_padding);
                     }
+                    // Replenish the rq, if possible.
+                    commit |= self.push_rqe(pool);
                 }
-                self.rx_wq.advance_head(rx.wqe_len);
-                if rx.bounced_len_with_padding > 0 {
-                    self.rx_bounce_buffer
-                        .as_mut()
-                        .unwrap()
-                        .free(rx.bounced_len_with_padding);
-                }
-                // Replenish the rq, if possible.
-                commit |= self.push_rqe(pool);
-            } else {
-                if !self.rx_cq_armed {
-                    self.rx_cq.arm();
-                    self.rx_cq_armed = true;
-                }
-                break;
             }
         }
         if commit {
@@ -1637,13 +1730,17 @@ impl Inspect for ContiguousBufferManager {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow, ensure};
-    use user_driver_emulated_mock::DeviceTestMemory;
+    use user_driver_emulated_mock::HeapDmaClient;
 
     #[test]
     fn page_counts_powers_of_two_only() -> Result<()> {
+        // Use a host-page-agnostic heap allocator rather than the
+        // `page_pool_alloc`/`sparse_mmap` test backing: this test only exercises
+        // the power-of-two gate and never programs the device, and the heap
+        // allocator runs on 16K- and 64K-page hosts (e.g. macOS arm64) too.
+        let dma_client: Arc<dyn DmaClient> = Arc::new(HeapDmaClient);
         for i in 1..35 {
-            let dtm = DeviceTestMemory::new(Into::<u64>::into(i) * 2, false, "test");
-            match ContiguousBufferManager::new(dtm.dma_client(), i) {
+            match ContiguousBufferManager::new(dma_client.clone(), i) {
                 Ok(_) => {
                     ensure!(
                         i.is_power_of_two(),

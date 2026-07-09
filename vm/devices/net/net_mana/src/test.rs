@@ -2854,6 +2854,346 @@ async fn rx_fence_cqe_is_bare_completion(driver: DefaultDriver) {
     endpoint.stop().await;
 }
 
+// ===========================================================================
+// TX offload-emulation gap coverage: `suppress_txcqe_gen` and `is_encap`.
+//
+// Both OOB bits are idle on the wire for today's Linux and Windows VF guests,
+// so these are faithfulness / future-proofing behaviors rather than live bugs.
+// The tests drive the *real* device stack (`GdmaDevice` + `EmulatedDevice` +
+// the datapath task) via the synthetic `pal_async` runtime, injecting raw
+// transmit WQEs whose OOB carries bits the `ManaQueue` client never sets, then
+// observing the device's own completions and the metadata it hands the backend.
+// ===========================================================================
+
+/// Shared capture of the transmit metadata the device produces. The recording
+/// backend's `tx_avail` clones each packet's device-built
+/// [`net_backend::TxMetadata`] here so a test can assert the exact offload
+/// geometry `process_sqe` derived from the wire OOB.
+#[derive(Clone, Default)]
+struct TxRecord {
+    metas: Arc<Mutex<Vec<net_backend::TxMetadata>>>,
+}
+
+/// Backend endpoint that records device-built transmit metadata and completes
+/// transmits either synchronously (inline, exercising the device's synchronous
+/// completion path) or asynchronously (deferred to `tx_poll`, exercising
+/// `process_backend`'s FIFO suppression), selected by `async_mode`.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingEndpoint {
+    async_mode: bool,
+    record: TxRecord,
+}
+
+#[async_trait]
+impl Endpoint for RecordingEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "tx-offload-recording-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        for _ in config {
+            queues.push(Box::new(RecordingQueue {
+                async_mode: self.async_mode,
+                record: self.record.clone(),
+                tx_done: VecDeque::new(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 64,
+        }
+    }
+}
+
+/// Backend queue behind [`RecordingEndpoint`]. It never reads guest memory
+/// (no `linearize`), so a test can inject a WQE with a single unbacked SGE and
+/// still have the device build and hand over metadata.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingQueue {
+    async_mode: bool,
+    record: TxRecord,
+    tx_done: VecDeque<TxId>,
+}
+
+impl Queue for RecordingQueue {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.async_mode && !self.tx_done.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, _done: &[RxId]) {}
+
+    fn rx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        // The device calls `tx_avail` once per transmit WQE; the head segment
+        // carries the `TxMetadata` it built from the wire OOB. Capture it
+        // without touching guest memory, then complete inline or defer to
+        // `tx_poll` per `async_mode`.
+        if let Some(net_backend::TxSegmentType::Head(meta)) = segments.first().map(|s| &s.ty) {
+            self.record.metas.lock().push(meta.clone());
+            if self.async_mode {
+                self.tx_done.push_back(meta.id);
+            }
+        }
+        Ok((!self.async_mode, segments.len()))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        let n = done.len().min(self.tx_done.len());
+        for (d, s) in done.iter_mut().zip(self.tx_done.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+}
+
+/// Builds the real device stack behind a [`RecordingEndpoint`] and brings the
+/// datapath up to the point where injected transmit WQEs are serviced.
+///
+/// Mirrors [`new_test_queue`], but (1) uses the recording backend, (2) issues
+/// the `MANA_CONFIG_VPORT_RX` (`config_rx`) that actually starts the device's
+/// datapath task -- without it the injected WQEs would never be polled -- and
+/// (3) returns the [`ManaDevice`] so the caller keeps the device task alive for
+/// the duration of the test.
+async fn new_recording_harness(
+    driver: &DefaultDriver,
+    async_mode: bool,
+) -> (
+    ManaQueue<TestEmulatedDevice>,
+    ResourceArena,
+    ManaEndpoint<TestEmulatedDevice>,
+    ManaDevice<TestEmulatedDevice>,
+    TxRecord,
+) {
+    let record = TxRecord::default();
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "tx offload gap test");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(RecordingEndpoint {
+                async_mode,
+                record: record.clone(),
+            }),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Enabling the receive path is what triggers `start_vport_datapath`, so the
+    // device begins polling the send queue for the WQEs the test injects.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    (queue, arena, endpoint, thing, record)
+}
+
+/// Posts a raw transmit WQE carrying `oob` and one scatter-gather entry the
+/// backend never reads, bypassing `ManaQueue::tx_avail` so a test can set wire
+/// OOB bits the client never emits. The caller rings the doorbell via
+/// `queue.tx_wq.commit()` after posting all WQEs.
+fn post_raw_tx_wqe<T: zerocopy::IntoBytes + zerocopy::Immutable + zerocopy::KnownLayout>(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    oob: T,
+) {
+    let sge = gdma_defs::Sge {
+        address: 0,
+        mem_key: queue.mem_key,
+        size: 64,
+    };
+    queue.tx_wq.push(oob, [sge]).expect("tx wq not full");
+}
+
+/// The device must not post a TX CQE for a WQE whose short OOB sets
+/// `suppress_txcqe_gen`. Synchronous backend completion path.
+#[async_test]
+async fn tx_suppress_txcqe_gen_sync_suppresses_completion(driver: DefaultDriver) {
+    let (mut queue, arena, mut endpoint, _device, _record) =
+        new_recording_harness(&driver, false).await;
+
+    // WQE A requests suppression; WQE B (the canary) does not. B's completion
+    // proves the device processed past A in order, so the absence of a second
+    // CQE is a positive result -- not merely "A hasn't been serviced yet".
+    let mut suppressed = gdma_defs::bnic::ManaTxOob::new_zeroed();
+    suppressed.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe(&mut queue, suppressed);
+    post_raw_tx_wqe(&mut queue, gdma_defs::bnic::ManaTxOob::new_zeroed());
+    queue.tx_wq.commit();
+
+    run_executor_for(250).await;
+
+    let mut cqes = 0;
+    while queue.tx_cq.pop().is_some() {
+        cqes += 1;
+    }
+    assert_eq!(
+        cqes, 1,
+        "exactly one TX CQE: the suppressed WQE posts none, the canary posts one"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// Same as above, but the backend completes asynchronously (via `tx_poll`), so
+/// the suppression decision travels through `process_backend`'s per-SQ FIFO of
+/// pending-suppress flags instead of the synchronous path.
+#[async_test]
+async fn tx_suppress_txcqe_gen_async_suppresses_completion(driver: DefaultDriver) {
+    let (mut queue, arena, mut endpoint, _device, _record) =
+        new_recording_harness(&driver, true).await;
+
+    let mut suppressed = gdma_defs::bnic::ManaTxOob::new_zeroed();
+    suppressed.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe(&mut queue, suppressed);
+    post_raw_tx_wqe(&mut queue, gdma_defs::bnic::ManaTxOob::new_zeroed());
+    queue.tx_wq.commit();
+
+    run_executor_for(250).await;
+
+    let mut cqes = 0;
+    while queue.tx_cq.pop().is_some() {
+        cqes += 1;
+    }
+    assert_eq!(
+        cqes, 1,
+        "the FIFO suppress flag must drop the suppressed WQE's async completion"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// For an encapsulated packet (`is_encap`, long OOB format) the device must
+/// build *inner* offload geometry: the inner IP header sits at
+/// `inner_frame_offset + inner_ip_rel_offset`, everything before it folds into
+/// `l2_len`, `l3_len` spans from there to `trans_off`, and the IP version comes
+/// from `inner_is_ipv6`.
+#[async_test]
+async fn tx_is_encap_builds_inner_offload_metadata(driver: DefaultDriver) {
+    let (mut queue, arena, mut endpoint, _device, record) =
+        new_recording_harness(&driver, false).await;
+
+    // Inner IPv4 header at offset 64 (= 50 + 14), 20 bytes long, inner L4 at 84.
+    let mut oob = gdma_defs::bnic::ManaTxOob::new_zeroed();
+    oob.s_oob
+        .set_pkt_fmt(gdma_defs::bnic::MANA_LONG_PKT_FMT);
+    oob.s_oob.set_trans_off(84);
+    oob.s_oob.set_comp_tcp_csum(true);
+    oob.l_oob.set_is_encap(true);
+    oob.l_oob.set_inner_is_ipv6(false);
+    oob.l_oob.set_inner_frame_offset(50);
+    oob.l_oob.set_inner_ip_rel_offset(14);
+    post_raw_tx_wqe(&mut queue, oob);
+    queue.tx_wq.commit();
+
+    run_executor_for(250).await;
+
+    {
+        let metas = record.metas.lock();
+        assert_eq!(metas.len(), 1, "device must build exactly one tx metadata");
+        let m = &metas[0];
+        assert_eq!(
+            m.l2_len, 64,
+            "l2_len folds outer + tunnel + inner-L2 before the inner IP header"
+        );
+        assert_eq!(
+            m.l3_len, 20,
+            "inner IPv4 header length = trans_off - inner_ip_off"
+        );
+        assert_eq!(
+            m.transport_header_offset, 84,
+            "inner L4 offset passes through from trans_off"
+        );
+        assert!(m.flags.is_ipv4(), "inner_is_ipv6=false selects IPv4");
+        assert!(!m.flags.is_ipv6());
+        assert!(
+            m.flags.offload_tcp_checksum(),
+            "comp_tcp_csum requests an inner TCP checksum"
+        );
+        assert_eq!(
+            m.l2_len as u16 + m.l3_len,
+            m.transport_header_offset,
+            "the l2_len + l3_len == transport_header_offset invariant must hold"
+        );
+    }
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
 /// Backend state for [`FenceOrderEndpoint`]. Receive completions are injected
 /// by the test (via `staged`) rather than produced from transmitted frames, and
 /// -- unlike a loopback backend -- staging does NOT wake the device's receive

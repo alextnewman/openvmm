@@ -80,6 +80,7 @@ use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use net_backend_resources::mac_address::MacAddress;
 use slab::Slab;
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -602,6 +603,7 @@ async fn start_vport_datapath(
             .map(|i| SqChannel {
                 sq_id: vport.queue_cfg.tx[i].wq_id,
                 sq_cq_id: vport.queue_cfg.tx[i].cq_id,
+                pending_suppress: VecDeque::new(),
             })
             .collect();
 
@@ -701,6 +703,87 @@ struct QueueCfg {
 struct SqChannel {
     sq_id: u32,
     sq_cq_id: u32,
+    /// FIFO of pending `suppress_txcqe_gen` flags for packets that were handed
+    /// to the backend and will complete asynchronously. Pushed in submission
+    /// order by [`TxRxTask::process_sqe`] and popped in completion order by
+    /// [`TxRxTask::process_backend`], so a suppressed packet's asynchronous
+    /// completion posts no CQE while non-suppressed reclaim stays strictly 1:1.
+    pending_suppress: VecDeque<bool>,
+}
+
+/// Layer-2/3 geometry and IP-version selection derived from a transmit OOB,
+/// used to populate the [`TxMetadata`] the backend consumes for checksum and
+/// segmentation offloads.
+struct TxOffloadGeometry {
+    /// Bytes preceding the offload L3 (IP) header: the Ethernet header for a
+    /// normal packet, or the entire outer + tunnel + inner-L2 prefix for an
+    /// encapsulated one.
+    l2_len: u8,
+    /// Length of the offload L3 (IP) header.
+    l3_len: u16,
+    /// Absolute offset of the offload L4 (TCP/UDP) header.
+    transport_header_offset: u16,
+    /// Whether the offloaded IP header is IPv4.
+    is_ipv4: bool,
+    /// Whether the offloaded IP header is IPv6.
+    is_ipv6: bool,
+    /// VLAN tag to inject, if requested by the guest.
+    vlan: Option<net_backend::VlanMetadata>,
+}
+
+/// Derives the offload geometry from a transmit OOB.
+///
+/// For a normal packet the checksum/segmentation engine operates on the outer
+/// headers, so the geometry comes from the short OOB (`trans_off`,
+/// `is_outer_ipv4`/`is_outer_ipv6`) plus any injected VLAN tag.
+///
+/// For an encapsulated packet (`is_encap`, long format) the engine operates on
+/// the *inner* headers instead. `inner_frame_offset` locates the inner L2 frame
+/// within the packet and `inner_ip_rel_offset` locates the inner L3 header
+/// within that frame, so the inner IP header begins at their sum; `trans_off`
+/// already refers to the inner L4 header and `inner_is_ipv6` selects the inner
+/// IP version. Everything before the inner IP header (outer L2/L3, tunnel,
+/// inner L2) is folded into `l2_len` so the
+/// `l2_len + l3_len == transport_header_offset` invariant still holds. Note
+/// `is_encap` is never set by current Linux or Windows guests, so this path is
+/// inert for today's traffic; modeling it keeps the device faithful for future
+/// tunnel-offload guests.
+fn tx_offload_geometry(oob: &ManaTxOob) -> TxOffloadGeometry {
+    let is_long = oob.s_oob.pkt_fmt() == MANA_LONG_PKT_FMT;
+    let trans_off = oob.s_oob.trans_off();
+
+    let vlan = (is_long && oob.l_oob.inject_vlan_pri_tag()).then(|| {
+        net_backend::VlanMetadata::new()
+            .with_priority(oob.l_oob.pcp())
+            .with_drop_eligible_indicator(oob.l_oob.dei())
+            .with_vlan_id(oob.l_oob.vlan_id())
+    });
+
+    if is_long && oob.l_oob.is_encap() {
+        let inner_ip_off = oob.l_oob.inner_frame_offset() + oob.l_oob.inner_ip_rel_offset();
+        TxOffloadGeometry {
+            l2_len: inner_ip_off.min(u8::MAX as u16) as u8,
+            l3_len: trans_off.saturating_sub(inner_ip_off),
+            transport_header_offset: trans_off,
+            is_ipv4: !oob.l_oob.inner_is_ipv6(),
+            is_ipv6: oob.l_oob.inner_is_ipv6(),
+            vlan,
+        }
+    } else {
+        let l2_len: u32 = if vlan.is_some() {
+            net_backend::ETHERNET_VLAN_HEADER_LEN
+        } else {
+            net_backend::ETHERNET_HEADER_LEN
+        };
+        TxOffloadGeometry {
+            l2_len: l2_len as u8,
+            l3_len: trans_off.clamp(l2_len as u16, 255) - l2_len as u16,
+            transport_header_offset: trans_off,
+            is_ipv4: oob.s_oob.is_outer_ipv4(),
+            is_ipv6: oob.s_oob.is_outer_ipv6() && !oob.s_oob.is_outer_ipv4(),
+            vlan,
+        }
+    }
 }
 
 impl BasicNic {
@@ -1421,20 +1504,7 @@ impl TxRxTask {
 
         let sge0 = sqe.sgl().first().context("no sgl")?;
         let total_len: usize = sqe.sgl().iter().map(|sge| sge.size as usize).sum();
-        let (l2_len, vlan) =
-            if oob.s_oob.pkt_fmt() == MANA_LONG_PKT_FMT && oob.l_oob.inject_vlan_pri_tag() {
-                (
-                    net_backend::ETHERNET_VLAN_HEADER_LEN,
-                    Some(
-                        net_backend::VlanMetadata::new()
-                            .with_priority(oob.l_oob.pcp())
-                            .with_drop_eligible_indicator(oob.l_oob.dei())
-                            .with_vlan_id(oob.l_oob.vlan_id()),
-                    ),
-                )
-            } else {
-                (net_backend::ETHERNET_HEADER_LEN, None)
-            };
+        let geometry = tx_offload_geometry(&oob);
 
         let mut meta = TxMetadata {
             id: TxId(slot as u32),
@@ -1444,14 +1514,14 @@ impl TxRxTask {
                 .with_offload_ip_header_checksum(oob.s_oob.comp_iphdr_csum())
                 .with_offload_tcp_checksum(oob.s_oob.comp_tcp_csum())
                 .with_offload_udp_checksum(oob.s_oob.comp_udp_csum())
-                .with_is_ipv4(oob.s_oob.is_outer_ipv4())
-                .with_is_ipv6(oob.s_oob.is_outer_ipv6() && !oob.s_oob.is_outer_ipv4()),
-            l2_len: l2_len as u8,
-            l3_len: oob.s_oob.trans_off().clamp(l2_len as u16, 255) - l2_len as u16,
+                .with_is_ipv4(geometry.is_ipv4)
+                .with_is_ipv6(geometry.is_ipv6),
+            l2_len: geometry.l2_len,
+            l3_len: geometry.l3_len,
             l4_len: 0,
-            transport_header_offset: oob.s_oob.trans_off(),
+            transport_header_offset: geometry.transport_header_offset,
             max_segment_size: 0,
-            vlan,
+            vlan: geometry.vlan,
         };
 
         if sqe.header.params.client_oob_in_sgl() {
@@ -1500,10 +1570,23 @@ impl TxRxTask {
                 len: sge.size,
             });
         }
+        let suppress_cqe = oob.s_oob.suppress_txcqe_gen();
         let (sync, count) = self.epqueue.tx_avail(&mut self.pool, tx_segments)?;
         if sync || count == 0 {
             tracing::trace!("tx sync complete");
-            self.post_tx_completion(slot);
+            // Honor the guest's request to suppress this packet's TX completion.
+            // When set, the device must not post a CQE; the driver is then
+            // responsible for reclaiming the WQE via a later, non-suppressed
+            // completion (Linux/Windows guests never set the bit today).
+            if !suppress_cqe {
+                self.post_tx_completion(slot);
+            }
+        } else {
+            // The packet completes asynchronously via `tx_poll`, where the OOB
+            // is no longer available. Remember whether its completion must be
+            // suppressed so `process_backend` can honor it in FIFO order.
+            let idx = slot.min(self.sqs.len().saturating_sub(1));
+            self.sqs[idx].pending_suppress.push_back(suppress_cqe);
         }
         Ok(())
     }
@@ -1587,7 +1670,16 @@ impl TxRxTask {
         let mut packets = [TxId(0)];
         if self.epqueue.tx_poll(&mut self.pool, &mut packets)? > 0 {
             tracing::trace!("tx async complete");
-            self.post_tx_completion(packets[0].0 as usize);
+            let slot = packets[0].0 as usize;
+            // Honor a deferred TX-CQE suppression recorded when this packet was
+            // submitted (see `process_sqe`). Completions for a given send queue
+            // arrive in submission order, so a FIFO of pending flags stays
+            // aligned with the packets; default to posting if none was recorded.
+            let idx = slot.min(self.sqs.len().saturating_sub(1));
+            let suppress_cqe = self.sqs[idx].pending_suppress.pop_front().unwrap_or(false);
+            if !suppress_cqe {
+                self.post_tx_completion(slot);
+            }
         }
 
         Ok(())
@@ -1705,6 +1797,7 @@ impl AsyncRun<TxRxTask> for TxRxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gdma_defs::bnic::ManaTxLongOob;
     use gdma_defs::bnic::MANA_HASH_TCP_IPV4;
 
     /// The Microsoft-standard RSS hash key (matches the published Toeplitz
@@ -1794,5 +1887,95 @@ mod tests {
         let oob = &pool.rx_packets[id.0 as usize].oob;
         assert_eq!(oob.flags.rx_hashtype(), 0);
         assert_eq!(oob.ppi[0].pkt_hash, 0);
+    }
+
+    /// A normal (non-encapsulated) TCP/IPv4 packet takes outer geometry from the
+    /// short OOB: a bare Ethernet L2 prefix, `l3_len` spanning to `trans_off`,
+    /// and the IPv4 flag from `is_outer_ipv4`.
+    #[test]
+    fn tx_offload_geometry_outer_ipv4() {
+        let oob = ManaTxOob {
+            s_oob: ManaTxShortOob::new()
+                .with_is_outer_ipv4(true)
+                .with_trans_off(34),
+            ..FromZeros::new_zeroed()
+        };
+        let g = tx_offload_geometry(&oob);
+        assert_eq!(g.l2_len, net_backend::ETHERNET_HEADER_LEN as u8);
+        assert_eq!(g.l3_len, 34 - net_backend::ETHERNET_HEADER_LEN as u16);
+        assert_eq!(g.transport_header_offset, 34);
+        assert!(g.is_ipv4);
+        assert!(!g.is_ipv6);
+        assert!(g.vlan.is_none());
+        assert_eq!(g.l2_len as u16 + g.l3_len, g.transport_header_offset);
+    }
+
+    /// A VLAN-tagged (long OOB, `inject_vlan_pri_tag`) but non-encapsulated
+    /// packet widens the outer L2 to the 802.1Q header length and carries the
+    /// tag through to the backend.
+    #[test]
+    fn tx_offload_geometry_outer_vlan() {
+        let oob = ManaTxOob {
+            s_oob: ManaTxShortOob::new()
+                .with_pkt_fmt(MANA_LONG_PKT_FMT)
+                .with_is_outer_ipv4(true)
+                .with_trans_off(38),
+            l_oob: ManaTxLongOob::new()
+                .with_inject_vlan_pri_tag(true)
+                .with_pcp(3)
+                .with_vlan_id(100),
+            ..FromZeros::new_zeroed()
+        };
+        let g = tx_offload_geometry(&oob);
+        assert_eq!(g.l2_len, net_backend::ETHERNET_VLAN_HEADER_LEN as u8);
+        assert_eq!(g.l3_len, 38 - net_backend::ETHERNET_VLAN_HEADER_LEN as u16);
+        let vlan = g.vlan.expect("vlan tag propagated");
+        assert_eq!(vlan.priority(), 3);
+        assert_eq!(vlan.vlan_id(), 100);
+    }
+
+    /// An encapsulated packet (`is_encap`, long OOB) takes *inner* geometry: the
+    /// inner IP header sits at `inner_frame_offset + inner_ip_rel_offset`, the
+    /// outer + tunnel + inner-L2 prefix folds into `l2_len`, and the IP version
+    /// comes from `inner_is_ipv6`.
+    #[test]
+    fn tx_offload_geometry_inner_encap() {
+        let oob = ManaTxOob {
+            s_oob: ManaTxShortOob::new()
+                .with_pkt_fmt(MANA_LONG_PKT_FMT)
+                .with_trans_off(84),
+            l_oob: ManaTxLongOob::new()
+                .with_is_encap(true)
+                .with_inner_is_ipv6(true)
+                .with_inner_frame_offset(50)
+                .with_inner_ip_rel_offset(14),
+            ..FromZeros::new_zeroed()
+        };
+        let g = tx_offload_geometry(&oob);
+        assert_eq!(g.l2_len, 64);
+        assert_eq!(g.l3_len, 84 - 64);
+        assert_eq!(g.transport_header_offset, 84);
+        assert!(!g.is_ipv4);
+        assert!(g.is_ipv6, "inner_is_ipv6=true selects IPv6");
+        assert_eq!(g.l2_len as u16 + g.l3_len, g.transport_header_offset);
+    }
+
+    /// `l2_len` is a `u8`, but the inner IP header of a deeply nested tunnel can
+    /// begin past byte 255. Saturating the fold keeps the field in range rather
+    /// than wrapping to a bogus (tiny) offset.
+    #[test]
+    fn tx_offload_geometry_inner_l2_saturates() {
+        let oob = ManaTxOob {
+            s_oob: ManaTxShortOob::new()
+                .with_pkt_fmt(MANA_LONG_PKT_FMT)
+                .with_trans_off(300),
+            l_oob: ManaTxLongOob::new()
+                .with_is_encap(true)
+                .with_inner_frame_offset(300)
+                .with_inner_ip_rel_offset(0),
+            ..FromZeros::new_zeroed()
+        };
+        let g = tx_offload_geometry(&oob);
+        assert_eq!(g.l2_len, u8::MAX, "inner L2 fold saturates the u8 field");
     }
 }

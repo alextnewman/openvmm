@@ -42,6 +42,7 @@ use gdma_defs::GdmaCreateQueueResp;
 use gdma_defs::GdmaDestroyDmaRegionReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDisableQueueReq;
+use gdma_defs::GdmaDmaRegionAddPagesReq;
 #[cfg(test)]
 use gdma_defs::GdmaGenerateResetEventReq;
 use gdma_defs::GdmaGenerateTestEventReq;
@@ -1463,37 +1464,70 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         dev_id: GdmaDevId,
         mem: MemoryBlock,
     ) -> anyhow::Result<u64> {
+        // The HW channel request budget bounds how many page addresses fit in a
+        // single message. Send the first chunk in GDMA_CREATE_DMA_REGION and any
+        // remainder in follow-up GDMA_DMA_REGION_ADD_PAGES messages; the device
+        // assembles them into one region. A region that fits in one message
+        // (<= PAGES_PER_MSG pages) is described by a lone CREATE, exactly as
+        // before.
+        const PAGES_PER_MSG: usize = 16;
+
+        let length = mem.len() as u64;
+        let offset_in_page = mem.offset_in_page();
+        let page_addrs: Vec<u64> = mem.pfns().iter().map(|&pfn| pfn * PAGE_SIZE64).collect();
+        let total = page_addrs.len();
+        let mut chunks = page_addrs.chunks(PAGES_PER_MSG);
+        let first = chunks.next().context("region has no pages")?;
+
         #[repr(C)]
         #[derive(IntoBytes, Immutable, KnownLayout)]
-        struct Req {
+        struct CreateReq {
             req: GdmaCreateDmaRegionReq,
-            pages: [u64; 16],
+            pages: [u64; PAGES_PER_MSG],
         }
-        let pages = mem.pfns();
-        let mut req = Req {
+        let mut create = CreateReq {
             req: GdmaCreateDmaRegionReq {
-                length: mem.len() as u64,
-                offset_in_page: mem.offset_in_page(),
+                length,
+                offset_in_page,
                 gdma_page_type: GDMA_PAGE_TYPE_4K,
-                page_count: pages.len() as u32,
-                page_addr_list_len: pages.len() as u32,
+                page_count: total as u32,
+                page_addr_list_len: first.len() as u32,
             },
-            pages: [0; 16],
+            pages: [0; PAGES_PER_MSG],
         };
-        for (d, &s) in req.pages[..pages.len()].iter_mut().zip(pages) {
-            *d = s * PAGE_SIZE64;
-        }
+        create.pages[..first.len()].copy_from_slice(first);
         let resp: GdmaCreateDmaRegionResp = self
-            .request(GdmaRequestType::GDMA_CREATE_DMA_REGION.0, dev_id, req)
+            .request(GdmaRequestType::GDMA_CREATE_DMA_REGION.0, dev_id, create)
             .await?;
 
+        // Register the region for teardown before sending the remaining pages so
+        // a failure mid-stream still cleans up what the device created.
         arena.push(Resource::MemoryBlock(ManuallyDrop::new(mem)));
         arena.push(Resource::DmaRegion {
             dev_id,
             gdma_region: resp.gdma_region,
         });
 
-        // TODO: AddPages for larger region
+        #[repr(C)]
+        #[derive(IntoBytes, Immutable, KnownLayout)]
+        struct AddPagesReq {
+            req: GdmaDmaRegionAddPagesReq,
+            pages: [u64; PAGES_PER_MSG],
+        }
+        for chunk in chunks {
+            let mut add = AddPagesReq {
+                req: GdmaDmaRegionAddPagesReq {
+                    gdma_region: resp.gdma_region,
+                    page_addr_list_len: chunk.len() as u32,
+                    reserved: 0,
+                },
+                pages: [0; PAGES_PER_MSG],
+            };
+            add.pages[..chunk.len()].copy_from_slice(chunk);
+            self.request::<_, ()>(GdmaRequestType::GDMA_DMA_REGION_ADD_PAGES.0, dev_id, add)
+                .await?;
+        }
+
         Ok(resp.gdma_region)
     }
 

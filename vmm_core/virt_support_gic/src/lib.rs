@@ -9,6 +9,9 @@
 pub use gicd::Distributor;
 pub use gicr::Redistributor;
 
+#[cfg(test)]
+mod model_tests;
+
 mod gicd {
     use super::Redistributor;
     use super::gicr::PRIORITY_WORD_MASK;

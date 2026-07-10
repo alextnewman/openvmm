@@ -384,6 +384,14 @@ pub struct GdmaRespHdr {
     pub reserved: u32,
 }
 
+/// [`GdmaRespHdr::status`] value a device returns for a command it does not
+/// implement. The guest's GDMA client (`hw_channel.c`) maps this specific code
+/// to `-EOPNOTSUPP` and handles it gracefully (logging at most once), whereas
+/// any other non-zero status is treated as a hard `-EPROTO` protocol error and
+/// logged on every occurrence. Mirrors `GDMA_STATUS_CMD_UNSUPPORTED` in the
+/// Linux MANA driver's `gdma.h`.
+pub const GDMA_STATUS_CMD_UNSUPPORTED: u32 = 0xffffffff;
+
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct GdmaGenerateTestEventReq {

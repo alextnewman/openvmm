@@ -190,6 +190,7 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
             hv1,
             mappings: Default::default(),
             synic_ports: Default::default(),
+            gic_msi: self.config.processor_topology.gic_msi(),
         });
 
         let mut vps = Vec::new();
@@ -259,6 +260,17 @@ impl virt::Partition for HvfPartition {
 
     fn request_msi(&self, _vtl: Vtl, _request: virt::irqcon::MsiRequest) {
         tracelimit::warn_ratelimited!("msis not supported");
+    }
+
+    fn as_signal_msi(&self, _minimum_vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
+        let v2m = match &self.inner.gic_msi {
+            vm_topology::processor::aarch64::GicMsiController::V2m(v2m) => v2m,
+            _ => return None,
+        };
+        let irqcon = self.inner.clone() as Arc<dyn virt::irqcon::ControlGic>;
+        Some(Arc::new(virt::aarch64::gic_v2m::GicV2mSignalMsi::new(
+            v2m, irqcon,
+        )))
     }
 
     fn request_yield(&self, vp_index: VpIndex) {
@@ -490,6 +502,7 @@ struct HvfPartitionInner {
     #[inspect(with = "|x| inspect::adhoc(|req| inspect::iter_by_index(&*x.lock()).inspect(req))")]
     mappings: Mutex<Vec<MemoryRange>>,
     synic_ports: virt::synic::SynicPortMap,
+    gic_msi: vm_topology::processor::aarch64::GicMsiController,
 }
 
 #[derive(Inspect)]

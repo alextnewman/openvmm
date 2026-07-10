@@ -11,6 +11,7 @@
 
 mod abi;
 mod hypercall;
+mod vp_actor;
 mod vp_state;
 
 use crate::hypercall::HvfHypercallHandler;
@@ -39,16 +40,15 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::convert::Infallible;
 use std::future::poll_fn;
+use std::num::NonZeroU64;
 use std::ops::Deref;
-use std::ops::Range;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
-use std::task::Waker;
-use std::task::ready;
 use std::time::Duration;
 use thiserror::Error;
 use virt::BindProcessor;
@@ -69,9 +69,62 @@ use vmcore::reference_time::GetReferenceTime;
 use vmcore::reference_time::ReferenceTimeResult;
 use vmcore::reference_time::ReferenceTimeSource;
 use vmcore::synic::GuestEventPort;
+use vmcore::vmtime::VmTime;
 use vmcore::vmtime::VmTimeAccess;
 
 const HV_ARM64_HVC_SMCCC_IDENTIFIER: u32 = (1 << 30) | (6 << 24) | 1;
+const HV_CALL_SYNC_CONTEXT: u16 = 0x0019;
+const HV_CALL_SYNC_CONTEXT_EX: u16 = 0x001a;
+const HV_CALL_FLUSH_TLB: u16 = 0x00d6;
+const HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00d7;
+const HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00d8;
+
+enum HvfLocalHypercall {
+    Complete(hvdef::hypercall::HypercallOutput),
+    SyncContext,
+}
+
+/// Hypercalls handled directly by the HVF backend.
+fn hvf_local_hypercall(control: hvdef::hypercall::Control) -> Option<HvfLocalHypercall> {
+    let call = match control.code() {
+        HV_CALL_FLUSH_TLB | HV_CALL_SYNC_CONTEXT | HV_CALL_SYNC_CONTEXT_EX => {
+            HvfLocalHypercall::SyncContext
+        }
+        HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS
+        | HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS => HvfLocalHypercall::Complete(
+            hvdef::hypercall::HypercallOutput::SUCCESS.with_elements_processed(control.rep_count()),
+        ),
+        _ => return None,
+    };
+    Some(call)
+}
+
+#[cfg(test)]
+mod hvf_local_hypercall_tests {
+    use super::*;
+
+    #[test]
+    fn flush_tlb_synchronizes_vcpu_contexts() {
+        let control = hvdef::hypercall::Control::new().with_code(HV_CALL_FLUSH_TLB);
+        assert!(matches!(
+            hvf_local_hypercall(control),
+            Some(HvfLocalHypercall::SyncContext)
+        ));
+    }
+
+    #[test]
+    fn sparse_host_access_reports_all_elements_processed() {
+        let control = hvdef::hypercall::Control::new()
+            .with_code(HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS)
+            .with_rep_count(7);
+        let HvfLocalHypercall::Complete(output) = hvf_local_hypercall(control).unwrap() else {
+            panic!("sparse host-access hypercall was not completed locally");
+        };
+
+        assert!(output.call_status().is_ok());
+        assert_eq!(output.elements_processed(), 7);
+    }
+}
 
 #[derive(Debug)]
 pub struct HvfHypervisor;
@@ -176,13 +229,20 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
                 .config
                 .processor_topology
                 .vps_arch()
-                .map(|vp_info| HvfVpInner {
-                    needs_yield: NeedsYield::new(),
-                    vcpu: (!0).into(),
-                    message_queues: hv1_emulator::message_queues::MessageQueues::new(),
-                    waker: Default::default(),
-                    vp_info,
-                    cpu_on: Default::default(),
+                .map(|vp_info| {
+                    let power_state = if vp_info.base.vp_index.is_bsp() {
+                        VP_ON
+                    } else {
+                        VP_OFF
+                    };
+                    HvfVpInner {
+                        needs_yield: NeedsYield::new(),
+                        message_queues: hv1_emulator::message_queues::MessageQueues::new(),
+                        actor: vp_actor::VpActor::new(),
+                        vp_info,
+                        cpu_on: Default::default(),
+                        power_state: AtomicU8::new(power_state),
+                    }
                 })
                 .collect(),
             gicd,
@@ -192,6 +252,8 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
             mappings: Default::default(),
             synic_ports: Default::default(),
             gic_msi: self.config.processor_topology.gic_msi(),
+            id_registers: Default::default(),
+            partition_info_page: AtomicU64::new(0),
         });
 
         let mut vps = Vec::new();
@@ -212,11 +274,6 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
                         .config
                         .vmtime
                         .access(format!("vp{}", vp.base.vp_index.index())),
-                    gicr_range: {
-                        // Guaranteed to be Some since we validated GICv3 above.
-                        let gicr = vp.gicr.unwrap();
-                        gicr..gicr + aarch64defs::GIC_REDISTRIBUTOR_SIZE
-                    },
                 }),
             });
         }
@@ -228,7 +285,6 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
     }
 
     fn max_physical_address_size(&self) -> u8 {
-        // TODO
         40
     }
 }
@@ -293,6 +349,7 @@ impl virt::ResetPartition for HvfPartition {
     fn reset(&self) -> Result<(), Self::Error> {
         self.inner.gicd.reset();
         self.inner.hv1.guest_os_id.store(0, Ordering::Relaxed);
+        self.inner.partition_info_page.store(0, Ordering::Release);
         Ok(())
     }
 }
@@ -345,7 +402,7 @@ impl virt::irqcon::ControlGic for HvfPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
         if let Some(vp) = self.gicd.set_pending(irq_id, high) {
             if let Some(vp) = self.vps.get(vp as usize) {
-                vp.wake();
+                vp.notify();
             }
         }
     }
@@ -362,7 +419,7 @@ impl virt::synic::Synic for HvfPartitionInner {
                 .message_queues
                 .enqueue_message(sint, &HvMessage::new(HvMessageType(typ), 0, payload))
             {
-                vp.wake();
+                vp.notify();
             }
         }
     }
@@ -413,9 +470,9 @@ impl GuestEventPort for HvfEventPort {
                         .hv1
                         .synic
                         .signal_event(vp, sint, flag, &mut |vector, _auto_eoi| {
-                            if partition.gicd.raise_ppi(vp, vector) {
-                                tracing::debug!(vector, "ppi from event");
-                                partition.vps[vp.index() as usize].wake();
+                            let newly_pending = partition.gicd.raise_ppi(vp, vector);
+                            if newly_pending {
+                                partition.vps[vp.index() as usize].notify();
                             }
                         });
             }
@@ -519,6 +576,9 @@ struct HvfPartitionInner {
     mappings: Mutex<Vec<MemoryRange>>,
     synic_ports: virt::synic::SynicPortMap,
     gic_msi: vm_topology::processor::aarch64::GicMsiController,
+    #[inspect(skip)]
+    id_registers: Mutex<Option<IdRegisters>>,
+    partition_info_page: AtomicU64,
 }
 
 #[derive(Inspect)]
@@ -541,13 +601,20 @@ struct HvfVpInner {
     #[inspect(skip)]
     needs_yield: NeedsYield,
     vp_info: Aarch64VpInfo,
-    #[inspect(skip)]
-    vcpu: AtomicU64,
     message_queues: hv1_emulator::message_queues::MessageQueues,
     #[inspect(skip)]
-    waker: RwLock<Option<Waker>>,
+    actor: vp_actor::VpActor,
     cpu_on: Mutex<Option<CpuOnState>>,
+    #[inspect(skip)]
+    power_state: AtomicU8,
 }
+
+const VP_OFF: u8 = 0;
+const VP_ON_PENDING: u8 = 1;
+const VP_ON: u8 = 2;
+const PSCI_AFFINITY_ON: i32 = 0;
+const PSCI_AFFINITY_OFF: i32 = 1;
+const PSCI_AFFINITY_ON_PENDING: i32 = 2;
 
 #[derive(Debug, Inspect)]
 struct CpuOnState {
@@ -556,18 +623,17 @@ struct CpuOnState {
 }
 
 impl HvfVpInner {
-    fn cancel_run(&self) {
-        let vcpu: u64 = self.vcpu.load(Ordering::SeqCst);
-        if vcpu != !0 {
-            // SAFETY: `&vcpu` points to a list of vcpu IDs of length 1.
-            unsafe { abi::hv_vcpus_exit(&vcpu, 1) }.chk().unwrap();
-        }
+    fn try_cancel_run(&self) -> Result<(), HvfError> {
+        self.actor.try_cancel_run()
     }
 
-    fn wake(&self) {
-        if let Some(waker) = &*self.waker.read() {
-            waker.wake_by_ref();
-        }
+    fn cancel_run(&self) {
+        self.actor.cancel_run();
+    }
+
+    /// Requests this vCPU to observe work that has already been published.
+    fn notify(&self) {
+        self.actor.notify();
     }
 }
 
@@ -582,17 +648,140 @@ struct VpInitState {
     gicr: gic::Redistributor,
     hv1: ProcessorSynic,
     vmtime: VmTimeAccess,
-    #[inspect(debug)]
-    gicr_range: Range<u64>,
 }
 
-/// `ID_AA64PFR0_EL1.GIC` field (bits [27:24]); the value `0b0001` advertises the
-/// GICv3/v4 system-register CPU interface (ICC_* sysregs) to the guest.
+/// GICv3/v4 system-register CPU interface.
 const ID_AA64PFR0_EL1_GIC_CPUIF: u64 = 1 << 24;
-
-/// `ID_AA64DFR0_EL1.PMUVer` field (bits [11:8]); cleared to hide the PMU from the
-/// guest (see the PMU rationale in `bind`).
+const ID_AA64PFR0_EL1_GIC: u64 = 0xf << 24;
+const ID_AA64MMFR0_EL1_PARANGE: u64 = 0xf;
+const ID_AA64MMFR0_EL1_PARANGE_40BIT: u64 = 0b0010;
 const ID_AA64DFR0_EL1_PMUVER: u64 = 0xf << 8;
+const ID_AA64MMFR2_EL1_CNP: u64 = 0xf;
+const ID_AA64MMFR2_EL1_NV: u64 = 0xf << 24;
+const ID_AA64PFR0_EL1_EL2: u64 = 0xf << 8;
+const ID_AA64PFR0_EL1_EL2_IMP: u64 = 0b0001 << 8;
+const ID_AA64PFR0_EL1_EL3: u64 = 0xf << 12;
+const ID_AA64PFR0_EL1_SVE: u64 = 0xf << 32;
+const ID_AA64PFR1_EL1_SME: u64 = 0xf << 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IdRegisters {
+    pfr0: u64,
+    pfr1: u64,
+    dfr0: u64,
+    mmfr0: u64,
+    mmfr2: u64,
+}
+
+impl IdRegisters {
+    fn read(vcpu: &HvfVcpu) -> Result<Self, HvfError> {
+        Ok(Self {
+            pfr0: vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1)?,
+            pfr1: vcpu.sys_reg(abi::HvSysReg::ID_AA64PFR1_EL1)?,
+            dfr0: vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?,
+            mmfr0: vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1)?,
+            mmfr2: vcpu.sys_reg(abi::HvSysReg::ID_AA64MMFR2_EL1)?,
+        })
+    }
+
+    fn install(self, vcpu: &mut HvfVcpu) -> anyhow::Result<()> {
+        for (register, expected, name) in [
+            (abi::HvSysReg::ID_AA64PFR0_EL1, self.pfr0, "ID_AA64PFR0_EL1"),
+            (abi::HvSysReg::ID_AA64PFR1_EL1, self.pfr1, "ID_AA64PFR1_EL1"),
+            (abi::HvSysReg::ID_AA64DFR0_EL1, self.dfr0, "ID_AA64DFR0_EL1"),
+            (
+                abi::HvSysReg::ID_AA64MMFR0_EL1,
+                self.mmfr0,
+                "ID_AA64MMFR0_EL1",
+            ),
+            (
+                abi::HvSysReg::ID_AA64MMFR2_EL1,
+                self.mmfr2,
+                "ID_AA64MMFR2_EL1",
+            ),
+        ] {
+            vcpu.set_sys_reg(register, expected)
+                .with_context(|| format!("failed to set {name}"))?;
+            let actual = vcpu
+                .sys_reg(register)
+                .with_context(|| format!("failed to read back {name}"))?;
+            anyhow::ensure!(
+                actual == expected,
+                "{name} readback mismatch: expected {expected:#x}, got {actual:#x}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Derives the VM-wide virtual CPU model from HVF's host capability baseline.
+fn id_register_policy(host: IdRegisters) -> IdRegisters {
+    IdRegisters {
+        pfr0: (host.pfr0
+            & !(ID_AA64PFR0_EL1_GIC
+                | ID_AA64PFR0_EL1_EL2
+                | ID_AA64PFR0_EL1_EL3
+                | ID_AA64PFR0_EL1_SVE))
+            | ID_AA64PFR0_EL1_GIC_CPUIF
+            | ID_AA64PFR0_EL1_EL2_IMP,
+        pfr1: host.pfr1 & !ID_AA64PFR1_EL1_SME,
+        dfr0: host.dfr0 & !ID_AA64DFR0_EL1_PMUVER,
+        mmfr0: (host.mmfr0 & !ID_AA64MMFR0_EL1_PARANGE) | ID_AA64MMFR0_EL1_PARANGE_40BIT,
+        mmfr2: host.mmfr2 & !(ID_AA64MMFR2_EL1_CNP | ID_AA64MMFR2_EL1_NV),
+    }
+}
+
+#[cfg(test)]
+mod id_register_tests {
+    use super::*;
+
+    #[test]
+    fn policy_changes_only_virtualized_id_fields() {
+        let host = IdRegisters {
+            pfr0: u64::MAX,
+            pfr1: u64::MAX,
+            dfr0: u64::MAX,
+            mmfr0: u64::MAX,
+            mmfr2: u64::MAX,
+        };
+        let guest = id_register_policy(host);
+        let pfr0_mask =
+            ID_AA64PFR0_EL1_GIC | ID_AA64PFR0_EL1_EL2 | ID_AA64PFR0_EL1_EL3 | ID_AA64PFR0_EL1_SVE;
+
+        assert_eq!(guest.pfr0 & !pfr0_mask, host.pfr0 & !pfr0_mask);
+        assert_eq!(
+            guest.pfr0 & pfr0_mask,
+            ID_AA64PFR0_EL1_GIC_CPUIF | ID_AA64PFR0_EL1_EL2_IMP
+        );
+        assert_eq!(guest.pfr1, host.pfr1 & !ID_AA64PFR1_EL1_SME);
+        assert_eq!(guest.dfr0, host.dfr0 & !ID_AA64DFR0_EL1_PMUVER);
+        assert_eq!(
+            guest.mmfr0,
+            (host.mmfr0 & !ID_AA64MMFR0_EL1_PARANGE) | ID_AA64MMFR0_EL1_PARANGE_40BIT
+        );
+        assert_eq!(
+            guest.mmfr2,
+            host.mmfr2 & !(ID_AA64MMFR2_EL1_CNP | ID_AA64MMFR2_EL1_NV)
+        );
+    }
+
+    #[test]
+    fn policy_adds_required_virtual_features() {
+        let guest = id_register_policy(IdRegisters {
+            pfr0: 0,
+            pfr1: 0,
+            dfr0: 0,
+            mmfr0: 0,
+            mmfr2: 0,
+        });
+
+        assert_eq!(
+            guest.pfr0,
+            ID_AA64PFR0_EL1_GIC_CPUIF | ID_AA64PFR0_EL1_EL2_IMP
+        );
+        assert_eq!(guest.mmfr0, ID_AA64MMFR0_EL1_PARANGE_40BIT);
+    }
+}
 
 /// `PMCR_EL0.E` (bit 0) — cycle counter enable.
 const PMCR_EL0_E: u64 = 1 << 0;
@@ -600,6 +789,7 @@ const PMCR_EL0_E: u64 = 1 << 0;
 const PMCR_EL0_C: u64 = 1 << 2;
 /// `PMCR_EL0.LC` (bit 6) — 64-bit (long) cycle counter.
 const PMCR_EL0_LC: u64 = 1 << 6;
+const PMCNTEN_C: u32 = 1 << 31;
 
 impl BindProcessor for HvfProcessorBinder {
     type Processor<'a> = HvfProcessor<'a>;
@@ -611,27 +801,24 @@ impl BindProcessor for HvfProcessorBinder {
         let state = self.state.take().unwrap();
         let inner = &self.partition.vps[self.vp_index.index() as usize];
 
-        // Initialize configuration registers.
-        // Set 40 bit physical address width.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
-        // Enable GICv3 system registers.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, ID_AA64PFR0_EL1_GIC_CPUIF)?;
-        // Hide the PMU from the guest. Windows-on-ARM64 reads
-        // ID_AA64DFR0_EL1.PMUVer and, when it is non-zero, drives PMU system
-        // registers (PMCR_EL0, PMCCNTR_EL0, ...) that this backend does not
-        // model, which wedges early boot. Clear only PMUVer[11:8] via
-        // read-modify-write so DebugVer and the other mandatory debug ID fields
-        // are preserved.
-        let dfr0 = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
-        vcpu.set_sys_reg(
-            abi::HvSysReg::ID_AA64DFR0_EL1,
-            dfr0 & !ID_AA64DFR0_EL1_PMUVER,
-        )?;
+        let id_registers = {
+            let mut shared = self.partition.id_registers.lock();
+            match *shared {
+                Some(id_registers) => id_registers,
+                None => {
+                    let id_registers = id_register_policy(IdRegisters::read(&vcpu)?);
+                    *shared = Some(id_registers);
+                    id_registers
+                }
+            }
+        };
+        id_registers.install(&mut vcpu)?;
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
-        // Store the vcpu index in the partition.
-        inner.vcpu.store(vcpu.vcpu, Ordering::Relaxed);
+        // Record the live HVF vcpu id in the wake actor (enables the
+        // running-state `hv_vcpus_exit` wake).
+        inner.actor.set_vcpu(vcpu.vcpu);
 
         let mut vp = HvfProcessor {
             partition: &self.partition,
@@ -643,7 +830,9 @@ impl BindProcessor for HvfProcessorBinder {
             hv1: state.hv1,
             vmtime: state.vmtime,
             pmu: PmuState::default(),
-            crash_params: [0; 5],
+            crash_regs: Default::default(),
+            synthetic_vbar_el1: 0,
+            tlbi_control: 0,
         };
 
         // Set initial register state.
@@ -659,25 +848,10 @@ impl BindProcessor for HvfProcessorBinder {
     }
 }
 
-/// Minimal PMUv3 cycle-counter model for `virt_hvf`.
-///
-/// Windows-on-ARM64 programs the cycle counter during early HAL bring-up
-/// (PMCR_EL0/PMCNTENSET_EL0 with the cycle-counter bit) and then busy-waits on
-/// PMCCNTR_EL0 to calibrate its delay loops. The PMU is otherwise unmodeled, so
-/// without this the counter reads as a constant zero, the guest derives a bogus
-/// cycle frequency (or spins waiting for the counter to advance), and early boot
-/// wedges. Hiding `ID_AA64DFR0_EL1.PMUVer` is not sufficient on its own: this
-/// guest drives the cycle counter regardless.
-///
-/// We back PMCCNTR_EL0 with the VM's monotonic time so it advances at a steady
-/// rate; the guest then calibrates a stable frequency and its delays resolve in
-/// real time. Event counters are reported as absent (PMCR_EL0.N == 0); the other
-/// PMU registers are modeled as architectural RAZ/WI state so the accesses no
-/// longer fall through to the unknown-register path.
+/// Compatibility model for guests that access the PMU cycle counter directly.
 #[derive(Debug, Default, Inspect)]
 struct PmuState {
-    /// PMCR_EL0.E (bit 0) — whether the cycle counter is currently counting.
-    enabled: bool,
+    pmcr_enabled: bool,
     /// Logical PMCCNTR_EL0 value captured at the last re-base point.
     cycle_offset: u64,
     /// VM time (100ns units) captured at the last re-base point.
@@ -695,14 +869,15 @@ struct PmuState {
 }
 
 impl PmuState {
-    /// Cycles attributed per 100ns of VM time (≈3 GHz). The absolute rate is
-    /// immaterial because guests calibrate the cycle counter against the
-    /// architected timer; only a steady, monotonic advance matters.
+    /// Guests calibrate this steady synthetic rate against the architected timer.
     const CYCLES_PER_100NS: u64 = 300;
 
-    /// Current PMCCNTR_EL0 value at the given VM time.
+    fn counting(&self) -> bool {
+        self.pmcr_enabled && self.counter_enable & PMCNTEN_C != 0
+    }
+
     fn pmccntr(&self, now_100ns: u64) -> u64 {
-        if self.enabled {
+        if self.counting() {
             let elapsed = now_100ns.wrapping_sub(self.cycle_base_100ns);
             self.cycle_offset
                 .wrapping_add(elapsed.wrapping_mul(Self::CYCLES_PER_100NS))
@@ -711,27 +886,20 @@ impl PmuState {
         }
     }
 
-    /// Re-base the counter so that `pmccntr(now)` reads `value` going forward.
     fn rebase(&mut self, value: u64, now_100ns: u64) {
         self.cycle_offset = value;
         self.cycle_base_100ns = now_100ns;
     }
 
-    /// Handle a PMU system-register read. Returns `None` if `reg` is not a PMU
-    /// register this model owns (so the caller can fall through).
     fn read_sysreg(&self, reg: SystemReg, now_100ns: u64) -> Option<u64> {
         let value = match reg {
-            // The load-bearing register: must advance.
             SystemReg::PMCCNTR_EL0 => self.pmccntr(now_100ns),
-            // Report a 64-bit cycle counter (LC, bit 6) and no event counters
-            // (N == 0); reflect only the enable bit.
-            SystemReg::PMCR_EL0 => PMCR_EL0_LC | if self.enabled { PMCR_EL0_E } else { 0 },
+            SystemReg::PMCR_EL0 => PMCR_EL0_LC | if self.pmcr_enabled { PMCR_EL0_E } else { 0 },
             SystemReg::PMCNTENSET_EL0 | SystemReg::PMCNTENCLR_EL0 => self.counter_enable.into(),
             SystemReg::PMINTENSET_EL1 | SystemReg::PMINTENCLR_EL1 => self.int_enable.into(),
             SystemReg::PMUSERENR_EL0 => self.userenr.into(),
             SystemReg::PMCCFILTR_EL0 => self.ccfiltr.into(),
             SystemReg::PMSELR_EL0 => self.selr.into(),
-            // No counter ever overflows and no events are implemented.
             SystemReg::PMOVSSET_EL0 | SystemReg::PMOVSCLR_EL0 => 0,
             SystemReg::PMCEID0_EL0 | SystemReg::PMCEID1_EL0 => 0,
             _ => return None,
@@ -739,31 +907,31 @@ impl PmuState {
         Some(value)
     }
 
-    /// Handle a PMU system-register write. Returns `false` if `reg` is not a PMU
-    /// register this model owns (so the caller can fall through).
     fn write_sysreg(&mut self, reg: SystemReg, value: u64, now_100ns: u64) -> bool {
         match reg {
             SystemReg::PMCR_EL0 => {
-                // Snapshot the current count, then re-base, so toggling the
-                // enable bit never makes the counter jump.
                 let cur = self.pmccntr(now_100ns);
-                self.enabled = value & PMCR_EL0_E != 0;
+                self.pmcr_enabled = value & PMCR_EL0_E != 0;
                 self.rebase(cur, now_100ns);
-                // C (bit 2): reset the cycle counter to zero.
                 if value & PMCR_EL0_C != 0 {
                     self.rebase(0, now_100ns);
                 }
             }
             SystemReg::PMCCNTR_EL0 => self.rebase(value, now_100ns),
-            SystemReg::PMCNTENSET_EL0 => self.counter_enable |= value as u32,
-            SystemReg::PMCNTENCLR_EL0 => self.counter_enable &= !(value as u32),
+            SystemReg::PMCNTENSET_EL0 | SystemReg::PMCNTENCLR_EL0 => {
+                let cur = self.pmccntr(now_100ns);
+                if reg == SystemReg::PMCNTENSET_EL0 {
+                    self.counter_enable |= value as u32;
+                } else {
+                    self.counter_enable &= !(value as u32);
+                }
+                self.rebase(cur, now_100ns);
+            }
             SystemReg::PMINTENSET_EL1 => self.int_enable |= value as u32,
             SystemReg::PMINTENCLR_EL1 => self.int_enable &= !(value as u32),
             SystemReg::PMUSERENR_EL0 => self.userenr = value as u32,
             SystemReg::PMCCFILTR_EL0 => self.ccfiltr = value as u32,
             SystemReg::PMSELR_EL0 => self.selr = value as u32,
-            // Write-to-clear overflow status / unused selects: accept and ignore
-            // (no counters are modeled).
             SystemReg::PMOVSSET_EL0 | SystemReg::PMOVSCLR_EL0 => {}
             _ => return false,
         }
@@ -772,29 +940,38 @@ impl PmuState {
 }
 
 #[cfg(test)]
-mod tests {
+mod pmu_tests {
     use super::*;
 
     #[test]
-    fn pmu_cycle_counter_tracks_enabled_vm_time() {
+    fn cycle_counter_requires_both_enable_bits() {
         let mut pmu = PmuState::default();
 
-        assert_eq!(pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 10), Some(0));
         assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E, 10));
+        assert_eq!(pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 12), Some(0));
+
+        assert!(pmu.write_sysreg(SystemReg::PMCNTENSET_EL0, PMCNTEN_C.into(), 12));
         assert_eq!(
-            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 12),
+            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 14),
             Some(2 * PmuState::CYCLES_PER_100NS)
         );
 
-        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, 0, 12));
+        assert!(pmu.write_sysreg(SystemReg::PMCNTENCLR_EL0, PMCNTEN_C.into(), 14));
         assert_eq!(
             pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 20),
             Some(2 * PmuState::CYCLES_PER_100NS)
         );
+    }
 
-        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E | PMCR_EL0_C, 20));
+    #[test]
+    fn cycle_counter_reset_rebases_while_running() {
+        let mut pmu = PmuState::default();
+
+        assert!(pmu.write_sysreg(SystemReg::PMCNTENSET_EL0, PMCNTEN_C.into(), 10));
+        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E, 10));
+        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E | PMCR_EL0_C, 12));
         assert_eq!(
-            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 21),
+            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 13),
             Some(PmuState::CYCLES_PER_100NS)
         );
     }
@@ -809,15 +986,25 @@ mod tests {
     }
 }
 
-/// Reflects the host physical counter for guests that trap `CNTPCT_EL0` /
-/// `CNTVCT_EL0`.
-///
-/// Apple's hypervisor traps physical-counter reads; left unhandled the guest
-/// observes a counter frozen at zero, which breaks any guest that derives time
-/// from `CNTPCT_EL0` (e.g. Windows' HAL reads it during timer bring-up). The
-/// host counter advances at the same architected `CNTFRQ` rate the guest
-/// already observes (HVF passes the virtual counter through untrapped), so
-/// reflecting it yields a real, monotonic physical counter.
+/// Register 31 is XZR in trapped load/store and system-register encodings.
+fn reg_is_xzr(reg: u8) -> bool {
+    reg == 31
+}
+
+#[cfg(test)]
+mod xzr_tests {
+    use super::reg_is_xzr;
+
+    #[test]
+    fn only_reg_31_is_xzr() {
+        for reg in 0..=30u8 {
+            assert!(!reg_is_xzr(reg), "reg {reg} must be a GP register, not XZR");
+        }
+        assert!(reg_is_xzr(31), "reg 31 must decode as XZR");
+    }
+}
+
+/// Reflects the host counter for trapped physical and virtual counter reads.
 fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
     match reg {
         SystemReg::CNTPCT_EL0 | SystemReg::CNTVCT_EL0 => {
@@ -837,17 +1024,19 @@ fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
     }
 }
 
+/// Reads the counter frequency (`CNTFRQ_EL0`) in Hz — the tick rate shared by
+/// `CNTVCT_EL0` and the guest's virtual timer.
 fn read_cntfrq() -> u64 {
-    let frequency: u64;
-    // SAFETY: CNTFRQ_EL0 is unprivileged-readable and has no side effects.
+    let freq: u64;
+    // SAFETY: CNTFRQ_EL0 is unprivileged-readable on AArch64 with no side effects.
     unsafe {
         core::arch::asm!(
             "mrs {}, cntfrq_el0",
-            out(reg) frequency,
+            out(reg) freq,
             options(nomem, nostack, preserves_flags),
         );
     }
-    frequency
+    freq
 }
 
 #[derive(InspectMut)]
@@ -864,11 +1053,10 @@ pub struct HvfProcessor<'a> {
     wfi: bool,
     on: bool,
     pmu: PmuState,
-    /// Hyper-V guest-crash enlightenment parameters (`GuestCrashP0..P4`).
-    /// Sticky registers latched by `HvSetVpRegisters`; reported when the guest
-    /// writes `GuestCrashCtl` at `KeBugCheckEx` time.
     #[inspect(skip)]
-    crash_params: [u64; 5],
+    crash_regs: hypercall::GuestCrashRegisters,
+    synthetic_vbar_el1: u64,
+    tlbi_control: u64,
 }
 
 #[derive(Debug, Inspect)]
@@ -876,6 +1064,8 @@ struct HvfVcpu {
     vcpu: u64,
     #[inspect(skip)]
     exit: ExitPtr,
+    #[inspect(skip)]
+    valid: bool,
 }
 
 #[derive(Debug)]
@@ -900,7 +1090,17 @@ impl HvfVcpu {
         Ok(Self {
             vcpu,
             exit: ExitPtr(exit),
+            valid: true,
         })
+    }
+
+    fn destroy(&mut self) -> Result<(), HvfError> {
+        if self.valid {
+            // SAFETY: this vCPU belongs to the current thread.
+            unsafe { abi::hv_vcpu_destroy(self.vcpu) }.chk()?;
+            self.valid = false;
+        }
+        Ok(())
     }
 
     fn cpsr(&self) -> Cpsr64 {
@@ -988,15 +1188,86 @@ impl HvfVcpu {
 
 impl Drop for HvfVcpu {
     fn drop(&mut self) {
-        // SAFETY: no special requirements
-        unsafe { abi::hv_vcpu_destroy(self.vcpu) }
-            .chk()
-            .expect("vcpu destroy cannot fail");
+        self.destroy().expect("vcpu destroy cannot fail");
+    }
+}
+
+const MAX_VTIMER_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Converts a generic-timer compare value to a bounded host wait. `None` means
+/// the unsigned counter has already reached the compare value.
+fn vtimer_wait_duration(counter: u64, compare: u64, frequency: NonZeroU64) -> Option<Duration> {
+    if compare <= counter {
+        return None;
+    }
+
+    let ticks = compare - counter;
+    let frequency = frequency.get();
+    Some(
+        Duration::new(
+            ticks / frequency,
+            ((ticks % frequency) as u128 * 1_000_000_000 / frequency as u128) as u32,
+        )
+        .min(MAX_VTIMER_WAIT),
+    )
+}
+
+#[cfg(test)]
+mod vtimer_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_conversion_handles_expired_and_future_values() {
+        let frequency = NonZeroU64::new(10).unwrap();
+
+        assert_eq!(vtimer_wait_duration(10, 10, frequency), None);
+        assert_eq!(vtimer_wait_duration(11, 10, frequency), None);
+        assert_eq!(
+            vtimer_wait_duration(10, 25, frequency),
+            Some(Duration::new(1, 500_000_000))
+        );
+    }
+
+    #[test]
+    fn deadline_conversion_uses_unsigned_counter_ordering() {
+        let frequency = NonZeroU64::new(1).unwrap();
+
+        assert_eq!(
+            vtimer_wait_duration(1, u64::MAX, frequency),
+            Some(MAX_VTIMER_WAIT)
+        );
+        assert_eq!(vtimer_wait_duration(u64::MAX - 10, 9, frequency), None);
     }
 }
 
 impl HvfProcessor<'_> {
+    fn sync_context(&self) -> Result<(), HvfError> {
+        let current_vp = self.inner.vp_info.base.vp_index.index() as usize;
+        for (index, vp) in self.partition.vps.iter().enumerate() {
+            if index != current_vp {
+                vp.try_cancel_run()?;
+            }
+        }
+        Ok(())
+    }
+
     fn hypercall(&mut self, _dev: &impl CpuIo, smccc: bool) {
+        let control = hvdef::hypercall::Control::from(self.vcpu.gp(smccc as u8));
+        if let Some(call) = hvf_local_hypercall(control) {
+            let output = match call {
+                HvfLocalHypercall::Complete(output) => output,
+                HvfLocalHypercall::SyncContext => match self.sync_context() {
+                    Ok(()) => hvdef::hypercall::HypercallOutput::SUCCESS,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to synchronize guest contexts");
+                        hvdef::hypercall::HypercallOutput::from(hvdef::HvError::OperationFailed)
+                    }
+                },
+            };
+            self.vcpu.set_gp(0, output.into());
+            return;
+        }
+
         let guest_memory = &self.partition.guest_memory;
         let handler = HvfHypercallHandler::new(self);
         HvfHypercallHandler::DISPATCHER.dispatch(
@@ -1014,6 +1285,94 @@ impl HvfProcessor<'_> {
                         self.gicr.raise(vector)
                     })
             });
+    }
+
+    /// Computes the virtual-timer deadline while the vCPU is parked outside HVF.
+    fn vtimer_deadline(&self) -> anyhow::Result<Option<VmTime>> {
+        const ENABLE: u64 = 1 << 0;
+        const IMASK: u64 = 1 << 1;
+        const ISTATUS: u64 = 1 << 2;
+
+        let ctl = self
+            .vcpu
+            .sys_reg(abi::HvSysReg::CNTV_CTL_EL0)
+            .context("failed to read CNTV_CTL_EL0")?;
+        if ctl & ENABLE == 0 || ctl & IMASK != 0 {
+            return Ok(None);
+        }
+        let now = self.vmtime.now();
+        if ctl & ISTATUS != 0 {
+            return Ok(Some(now));
+        }
+
+        let cval = self
+            .vcpu
+            .sys_reg(abi::HvSysReg::CNTV_CVAL_EL0)
+            .context("failed to read CNTV_CVAL_EL0")?;
+
+        let mut offset = 0u64;
+        // SAFETY: `offset` is a valid out-param.
+        unsafe { abi::hv_vcpu_get_vtimer_offset(self.vcpu.vcpu, &mut offset) }
+            .chk()
+            .context("failed to read the virtual timer offset")?;
+        // SAFETY: no requirements.
+        let guest_now = unsafe { abi::mach_absolute_time() }.wrapping_sub(offset);
+
+        let freq = NonZeroU64::new(read_cntfrq()).context("CNTFRQ_EL0 reported zero")?;
+
+        Ok(Some(
+            vtimer_wait_duration(guest_now, cval, freq)
+                .map_or(now, |duration| now.wrapping_add(duration)),
+        ))
+    }
+
+    fn recreate_vcpu(&mut self) -> Result<(), Error> {
+        let id_registers = self
+            .partition
+            .id_registers
+            .lock()
+            .as_ref()
+            .copied()
+            .context("missing partition ID-register model")?;
+        let mpidr = self.inner.vp_info.mpidr;
+        let current_vcpu = &mut self.vcpu;
+        let vcpu = self.inner.actor.replace_vcpu(|| -> Result<_, Error> {
+            current_vcpu
+                .destroy()
+                .context("failed to destroy vCPU before recreation")?;
+
+            let mut vcpu = HvfVcpu::new()?;
+            id_registers.install(&mut vcpu)?;
+            vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, mpidr.into())?;
+            Ok((vcpu.vcpu, vcpu))
+        })?;
+        self.vcpu = vcpu;
+        Ok(())
+    }
+
+    fn set_reset_registers(&mut self, cpu_on: Option<CpuOnState>) -> Result<(), Error> {
+        let mut registers =
+            virt::aarch64::vp::Registers::at_reset(&self.partition.caps, &self.inner.vp_info);
+        if let Some(cpu_on) = cpu_on {
+            registers.pc = cpu_on.pc;
+            registers.x0 = cpu_on.x0;
+        }
+        let system_registers =
+            virt::aarch64::vp::SystemRegisters::at_reset(&self.partition.caps, &self.inner.vp_info);
+        let mut state = self.access_state(Vtl::Vtl0);
+        state.set_registers(&registers)?;
+        state.set_system_registers(&system_registers)?;
+        Ok(())
+    }
+
+    fn power_on(&mut self, cpu_on: CpuOnState) -> Result<(), Error> {
+        self.recreate_vcpu()?;
+        self.set_reset_registers(Some(cpu_on))?;
+        self.pmu = PmuState::default();
+        self.wfi = false;
+        self.on = true;
+        self.inner.power_state.store(VP_ON, Ordering::Release);
+        Ok(())
     }
 
     fn handle_smccc(&mut self, fc: FastCall) {
@@ -1068,24 +1427,52 @@ impl HvfProcessor<'_> {
                     u64::from(vp.vp_info.mpidr) & u64::from(MpidrEl1::AFFINITY_MASK) == target_cpu
                 }) {
                     let mut cpu_on = vp.cpu_on.lock();
-                    if cpu_on.is_some() {
-                        PsciError::ON_PENDING.0
-                    } else {
-                        // TODO check already on
-                        *cpu_on = Some(CpuOnState {
-                            pc: entry_point,
-                            x0: context_id,
-                        });
-                        drop(cpu_on);
-                        vp.wake();
-                        PsciError::SUCCESS.0
+                    match vp.power_state.compare_exchange(
+                        VP_OFF,
+                        VP_ON_PENDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            *cpu_on = Some(CpuOnState {
+                                pc: entry_point,
+                                x0: context_id,
+                            });
+                            drop(cpu_on);
+                            vp.notify();
+                            PsciError::SUCCESS.0
+                        }
+                        Err(VP_ON_PENDING) => PsciError::ON_PENDING.0,
+                        Err(VP_ON) => PsciError::ALREADY_ON.0,
+                        Err(_) => PsciError::INTERNAL_FAILURE.0,
                     }
                 } else {
                     PsciError::INVALID_PARAMETERS.0
                 }
             }
-            SmcCall::CPU_OFF => PsciError::DENIED.0,
-            SmcCall::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
+            SmcCall::CPU_OFF => {
+                self.on = false;
+                self.inner.power_state.store(VP_OFF, Ordering::Release);
+                PsciError::SUCCESS.0
+            }
+            SmcCall::AFFINITY_INFO => {
+                let target_cpu = self.vcpu.gp(1) & mask;
+                let lowest_affinity_level = self.vcpu.gp(2) & mask;
+                if lowest_affinity_level != 0 {
+                    PsciError::INVALID_PARAMETERS.0
+                } else if let Some(vp) = self.partition.vps.iter().find(|vp| {
+                    u64::from(vp.vp_info.mpidr) & u64::from(MpidrEl1::AFFINITY_MASK) == target_cpu
+                }) {
+                    match vp.power_state.load(Ordering::Acquire) {
+                        VP_OFF => PSCI_AFFINITY_OFF,
+                        VP_ON_PENDING => PSCI_AFFINITY_ON_PENDING,
+                        VP_ON => PSCI_AFFINITY_ON,
+                        _ => PsciError::INTERNAL_FAILURE.0,
+                    }
+                } else {
+                    PsciError::INVALID_PARAMETERS.0
+                }
+            }
             SmcCall::SYSTEM_RESET => {
                 return Err(VpHaltReason::Reset);
             }
@@ -1115,6 +1502,15 @@ impl HvfProcessor<'_> {
     }
 }
 
+impl Drop for HvfProcessor<'_> {
+    fn drop(&mut self) {
+        self.inner
+            .actor
+            .remove_vcpu(|| self.vcpu.destroy())
+            .expect("vcpu destroy cannot fail");
+    }
+}
+
 impl<'p> Processor for HvfProcessor<'p> {
     type StateAccess<'a>
         = vp_state::HvfVpStateAccess<'a, 'p>
@@ -1129,27 +1525,24 @@ impl<'p> Processor for HvfProcessor<'p> {
         Ok(())
     }
 
-    /// Resets per-VP emulated device state back to its post-boot baseline.
-    ///
-    /// Called on the VP's own thread while all VPs are stopped, after
-    /// [`virt::ResetPartition::reset`] has scrubbed the partition-level state.
-    /// The guest's boot registers are re-applied afterward by the firmware
-    /// reload (`set_initial_regs`), so this only clears device/interrupt state:
-    /// the per-VP redistributor, the synic (which also clears the shared synic
-    /// state referenced by the partition's `GlobalSynic`), queued synic
-    /// messages, the PMU model, any pending PSCI `CPU_ON` request, and the
-    /// WFI/online run flags (the BSP comes back online; secondaries park until
-    /// the guest powers them on again).
+    /// Resets per-VP emulated state while all VPs are stopped.
     fn reset(&mut self) -> Result<(), impl std::error::Error + Send + Sync + 'static> {
+        self.recreate_vcpu()?;
+        self.set_reset_registers(None)?;
         self.gicr.reset();
         self.hv1.reset();
         self.pmu = PmuState::default();
-        self.crash_params = [0; 5];
+        self.crash_regs.clear();
+        self.synthetic_vbar_el1 = 0;
+        self.tlbi_control = 0;
         self.inner.message_queues.clear();
         *self.inner.cpu_on.lock() = None;
         self.wfi = false;
         self.on = self.inner.vp_info.base.vp_index.is_bsp();
-        Ok::<(), Infallible>(())
+        self.inner
+            .power_state
+            .store(if self.on { VP_ON } else { VP_OFF }, Ordering::Release);
+        Ok::<(), Error>(())
     }
 
     async fn run_vp(
@@ -1158,7 +1551,6 @@ impl<'p> Processor for HvfProcessor<'p> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         let vp_index = self.inner.vp_info.base.vp_index;
-        let mut last_waker = None;
 
         loop {
             self.inner.needs_yield.maybe_yield().await;
@@ -1167,26 +1559,30 @@ impl<'p> Processor for HvfProcessor<'p> {
                 loop {
                     stop.check()?;
 
-                    if !last_waker
-                        .as_ref()
-                        .is_some_and(|waker| cx.waker().will_wake(waker))
-                    {
-                        last_waker = Some(cx.waker().clone());
-                        self.inner.waker.write().clone_from(&last_waker);
-                    }
+                    // Capture notifications before scanning persistent work.
+                    let scan = self.inner.actor.begin_scan();
 
                     if let Some(cpu_on) = self.inner.cpu_on.lock().take() {
                         if self.on {
-                            todo!("block this");
-                        } else {
-                            self.vcpu.set_gp(0, cpu_on.x0);
-                            self.vcpu.set_pc(cpu_on.pc);
-                            self.on = true;
+                            return Poll::Ready(Err(dev.fatal_error(
+                                anyhow::anyhow!("received PSCI CPU_ON for an online vCPU").into(),
+                            )));
                         }
+                        self.power_on(cpu_on)
+                            .map_err(|err| dev.fatal_error(err.into()))?;
                     }
 
                     if !self.on {
-                        break Poll::Pending;
+                        // Secondary vCPU not yet powered on: park until a
+                        // PSCI CPU_ON publishes a start request and notifies us.
+                        match self
+                            .inner
+                            .actor
+                            .try_park(scan, cx.waker(), || self.inner.cpu_on.lock().is_none())
+                        {
+                            vp_actor::ParkDecision::Parked => return Poll::Pending,
+                            vp_actor::ParkDecision::Rescan => continue,
+                        }
                     }
 
                     self.hv1
@@ -1227,17 +1623,31 @@ impl<'p> Processor for HvfProcessor<'p> {
                             )
                         }
                         .chk()
-                        .unwrap();
+                        .map_err(|err| dev.fatal_error(err.into()))?;
                         self.wfi = false;
                     }
 
                     if self.wfi {
-                        self.vmtime.set_timeout_if_before(
-                            self.vmtime.now().wrapping_add(Duration::from_millis(2)),
-                        );
-                        ready!(self.vmtime.poll_timeout(cx));
-                        self.gicr.raise(self.partition.virt_timer_ppi);
-                        continue;
+                        // HVF cannot activate the virtual timer while parked outside
+                        // `hv_vcpu_run`, so register its deadline with vmtime.
+                        if let Some(deadline) = self
+                            .vtimer_deadline()
+                            .map_err(|err| dev.fatal_error(err.into()))?
+                        {
+                            self.vmtime.set_timeout_if_before(deadline);
+                        }
+                        if self.vmtime.poll_timeout(cx).is_ready() {
+                            self.wfi = false;
+                            continue;
+                        }
+                        match self.inner.actor.try_park(scan, cx.waker(), || {
+                            !self.partition.gicd.irq_pending(&self.gicr)
+                        }) {
+                            vp_actor::ParkDecision::Parked => {
+                                return Poll::Pending;
+                            }
+                            vp_actor::ParkDecision::Rescan => continue,
+                        }
                     }
 
                     break Poll::Ready(Result::<_, VpHaltReason>::Ok(()));
@@ -1250,11 +1660,8 @@ impl<'p> Processor for HvfProcessor<'p> {
                 .is_pending_or_active(self.partition.virt_timer_ppi)
             {
                 // SAFETY: no requirements.
-                unsafe {
-                    abi::hv_vcpu_set_vtimer_mask(self.vcpu.vcpu, false)
-                        .chk()
-                        .unwrap();
-                }
+                unsafe { abi::hv_vcpu_set_vtimer_mask(self.vcpu.vcpu, false).chk() }
+                    .map_err(|err| dev.fatal_error(err.into()))?;
             }
 
             // SAFETY: we are not concurrently accessing `exit`.
@@ -1291,25 +1698,14 @@ impl<'p> Processor for HvfProcessor<'p> {
                             let len = 1 << iss.sas();
                             let sign_extend = iss.sse();
 
-                            // Per "AArch64 System Register Descriptions/D23.2 General system control registers"
-                            // the SRT field is defined as
-                            //
-                            // > The register number of the Wt/Xt/Rt operand of the faulting
-                            // > instruction.
-                            //
-                            // In the A64 ISA TRM, Wt/Xt/Rt is used to designate the register number where the SP
-                            // register is not used whereas the addition of `|SP` tells that the SP register might
-                            // be used. Hence, the SRT field uses `0b11111` to encode `xzr`.
-                            //
-                            // Writing to `xzr` has no arch-observable effects, reading returns the all-zero's bit
-                            // pattern.
+                            // SRT 31 encodes XZR, not SP.
                             let reg = iss.srt();
 
                             if iss.wnr() {
-                                let data = match reg {
-                                    0..=30 => self.vcpu.gp(reg),
-                                    31 => 0,
-                                    _ => unreachable!(),
+                                let data = if reg_is_xzr(reg) {
+                                    0
+                                } else {
+                                    self.vcpu.gp(reg)
                                 }
                                 .to_ne_bytes();
                                 if !self
@@ -1324,7 +1720,7 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     )
                                     .await;
                                 }
-                            } else if reg != 31 {
+                            } else if !reg_is_xzr(reg) {
                                 let mut data = [0; 8];
                                 if !self
                                     .partition
@@ -1363,26 +1759,44 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     value
                                 } else if let Some(value) = self.pmu.read_sysreg(reg, now) {
                                     value
+                                } else if reg == SystemReg::OSLSR_EL1 {
+                                    // ARMv8 mandates the OS Lock; its reset value is
+                                    // OSLM=0b10 (bits[3,0]) ⇒ 0x8, OSLK=0 (unlocked).
+                                    // Previously this fell through and returned 0
+                                    // (OSLM=0b00 = "OS Lock not implemented"), which
+                                    // is architecturally invalid. Report the lock as
+                                    // implemented-and-unlocked so the guest's debug
+                                    // init sees a sane register.
+                                    0x8
                                 } else {
                                     tracing::warn!(
                                         ?reg,
+                                        pc = self.vcpu.pc(),
                                         "returning zero for unknown system register"
                                     );
                                     0
                                 };
-                                self.vcpu.set_gp(iss.rt(), value);
+                                // Reads targeting XZR still perform register side effects.
+                                if !reg_is_xzr(iss.rt()) {
+                                    self.vcpu.set_gp(iss.rt(), value);
+                                }
                             } else {
-                                let value = self.vcpu.gp(iss.rt());
+                                let value = if reg_is_xzr(iss.rt()) {
+                                    0
+                                } else {
+                                    self.vcpu.gp(iss.rt())
+                                };
                                 let handled_by_gic = self.partition.gicd.write_sysreg(
                                     &mut self.gicr,
                                     reg,
                                     value,
-                                    |index| self.partition.vps[index].wake(),
+                                    |index| self.partition.vps[index].notify(),
                                 );
                                 if !handled_by_gic && !self.pmu.write_sysreg(reg, value, now) {
                                     tracing::warn!(
                                         ?reg,
                                         value,
+                                        pc = self.vcpu.pc(),
                                         "ignoring write to unknown system register"
                                     );
                                 }

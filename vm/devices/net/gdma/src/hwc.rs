@@ -65,9 +65,15 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+// `instance` must be 0. Different drivers interpret the device-list response
+// in two ways: one treats each entry as an opaque `{ ty, instance }` device id
+// and round-trips whatever instance we report; another reads the same 16-bit
+// field as a secondary client-instance index and silently discards any entry
+// whose value is non-zero. A non-zero value here would cause that second driver
+// to drop the basic-NIC client, so its child device is never enumerated.
 const BNIC_DEV_ID: GdmaDevId = GdmaDevId {
     ty: GdmaDevType::GDMA_DEVICE_MANA,
-    instance: 1,
+    instance: 0,
 };
 
 pub struct HwControl {

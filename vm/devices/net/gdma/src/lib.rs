@@ -41,6 +41,8 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use net_backend::Endpoint;
 use net_backend_resources::mac_address::MacAddress;
+use pci_core::capabilities::extended::PciExtendedCapability;
+use pci_core::capabilities::extended::sriov::SriovExtendedCapability;
 use pci_core::capabilities::msix::MsixEmulator;
 use pci_core::capabilities::pci_express::FlrHandler;
 use pci_core::capabilities::pci_express::PciExpressCapability;
@@ -119,11 +121,215 @@ fn build_pf_regs() -> [u8; PF_REGS_LEN] {
     regs
 }
 
+/// Length of the PF capability register block (see [`pf_cap`]).
+const PF_CAP_REGS_LEN: usize = 0x68;
+
+/// True-PF (`pf_caps`) BAR0 register map.
+///
+/// A privileged "true PF" client reads a different BAR0 register surface than a
+/// VF: a region-descriptor table at the base of BAR0, where each device
+/// sub-region is described by a `{ u64 base_offset, u32 size }` pair (a handful
+/// of regions share a single size field). The client validates that every
+/// advertised region resolves inside BAR0 (`base_offset + size <= bar_len`), so
+/// each descriptor must point within BAR0; regions the emulator does not
+/// implement advertise size 0, which is in-bounds and read as "absent".
+///
+/// This surface is mutually exclusive with the VF [`RegMap`] (and the
+/// `bm_hostmode` [`PF_REGS`] window), which is why it is only served when
+/// `pf_caps` is set.
+const PF_DESC: Range<usize> = 0..0x148;
+const PF_DESC_LEN: usize = PF_DESC.end - PF_DESC.start;
+
+/// Device version advertised in the true-PF descriptor table
+/// ([`pf_desc::VERSION`]): major 2, minor 0, micro 0. The high byte selects the
+/// emulated platform generation (2); a true-PF client accepts this and selects
+/// its matching generation behavior. (Generation 1 is intentionally not
+/// emulated.)
+const PF_DESC_VERSION: u32 = 2 << 24;
+
+/// Field offsets within the true-PF region-descriptor table ([`PF_DESC`]). Each
+/// region is a `{ u64 base_offset, u32 size }` pair unless noted; `*_OFF` is the
+/// base offset and `*_SZ` the size. The doorbell, capability, and SR-IOV regions
+/// are the only ones the emulator populates; the rest advertise size 0.
+mod pf_desc {
+    /// Version dword: micro (bits 15:0), minor (bits 23:16), major (bits 31:24).
+    pub const VERSION: usize = 0x00;
+    pub const CAP_ZONE_OFF: usize = 0x48;
+    pub const CAP_ZONE_SZ: usize = 0x50;
+    /// Status and control regions reuse [`CAP_ZONE_SZ`] as their length.
+    pub const STATUS_ZONE_OFF: usize = 0x58;
+    pub const CONTROL_ZONE_OFF: usize = 0x60;
+    pub const SEND_WQ_CTX_OFF: usize = 0x68;
+    pub const SEND_WQ_CTX_SZ: usize = 0x70;
+    pub const RECV_WQ_CTX_OFF: usize = 0x78;
+    pub const RECV_WQ_CTX_SZ: usize = 0x80;
+    pub const CQ_CTX_OFF: usize = 0x88;
+    pub const CQ_CTX_SZ: usize = 0x90;
+    pub const EQ_CTX_OFF: usize = 0x98;
+    pub const EQ_CTX_SZ: usize = 0xA0;
+    pub const DOORBELL_OFF: usize = 0xC8;
+    pub const DOORBELL_SZ: usize = 0xD0;
+    pub const CQ_MOD_CTX_OFF: usize = 0xD8;
+    pub const CQ_MOD_CTX_SZ: usize = 0xE0;
+    pub const SCHEDULER_OFF: usize = 0xE8;
+    pub const SCHEDULER_SZ: usize = 0xF0;
+    pub const XLATE_OFF: usize = 0xF8;
+    pub const XLATE_SZ: usize = 0x100;
+    pub const SRIOV_OFF: usize = 0x108;
+    pub const SRIOV_SZ: usize = 0x110;
+    pub const DEBUG_OFF: usize = 0x118;
+    pub const DEBUG_SZ: usize = 0x120;
+}
+
+/// Field offsets within the PF capability register zone ([`PF_CAP_ZONE`]).
+/// Each field occupies an aligned 8-byte slot and holds a `u32`.
+mod pf_cap {
+    pub const HW_CAPABILITIES: usize = 0x00;
+    pub const FEATURE_FLAGS: usize = 0x04;
+    pub const MAX_SEND_QUEUES: usize = 0x08;
+    pub const MAX_RECEIVE_QUEUES: usize = 0x10;
+    pub const MAX_COMPLETION_QUEUES: usize = 0x18;
+    pub const MAX_EVENT_QUEUES: usize = 0x20;
+    pub const MAX_CQ_MODERATION_CONTEXTS: usize = 0x28;
+    pub const NUM_VIRTUAL_FUNCTIONS: usize = 0x30;
+    pub const MAX_DOORBELL_PAGES: usize = 0x38;
+    pub const MAX_MODERATED_COMPLETION_QUEUES: usize = 0x40;
+    pub const MAX_TX_PAYLOAD_LEN: usize = 0x48;
+    pub const NUM_PHYSICAL_FUNCTIONS: usize = 0x50;
+    pub const MAX_MSIX_ENTRIES: usize = 0x58;
+    pub const PF_MAX_MSIX_ENTRIES: usize = 0x60;
+}
+
+const PF_CAP_NUM_PHYSICAL_FUNCTIONS: u32 = 1;
+const PF_CAP_NUM_VIRTUAL_FUNCTIONS: u32 = 0;
+const PF_CAP_MAX_DOORBELL_PAGES: u32 = 1;
+const PF_CAP_MAX_MSIX_ENTRIES: u32 = 64;
+const PF_CAP_MAX_TX_PAYLOAD_LEN: u32 = 1514;
+
+/// Build the PF capability register zone ([`PF_CAP_ZONE`]). The queue maxima
+/// are taken from the live queue allocation so the zone stays consistent with
+/// the `GDMA_QUERY_MAX_RESOURCES` response; the remaining limits are fixed.
+fn build_pf_cap_regs(queues: &Queues) -> [u8; PF_CAP_REGS_LEN] {
+    let mut regs = [0u8; PF_CAP_REGS_LEN];
+    let mut put = |off: usize, value: u32| {
+        regs[off..off + 4].copy_from_slice(&value.to_ne_bytes());
+    };
+    put(pf_cap::HW_CAPABILITIES, 0);
+    put(pf_cap::FEATURE_FLAGS, 0);
+    put(pf_cap::MAX_SEND_QUEUES, queues.max_sqs());
+    put(pf_cap::MAX_RECEIVE_QUEUES, queues.max_rqs());
+    put(pf_cap::MAX_COMPLETION_QUEUES, queues.max_cqs());
+    put(pf_cap::MAX_EVENT_QUEUES, queues.max_eqs());
+    put(pf_cap::MAX_CQ_MODERATION_CONTEXTS, 0);
+    put(pf_cap::NUM_VIRTUAL_FUNCTIONS, PF_CAP_NUM_VIRTUAL_FUNCTIONS);
+    put(pf_cap::MAX_DOORBELL_PAGES, PF_CAP_MAX_DOORBELL_PAGES);
+    put(pf_cap::MAX_MODERATED_COMPLETION_QUEUES, 0);
+    put(pf_cap::MAX_TX_PAYLOAD_LEN, PF_CAP_MAX_TX_PAYLOAD_LEN);
+    put(
+        pf_cap::NUM_PHYSICAL_FUNCTIONS,
+        PF_CAP_NUM_PHYSICAL_FUNCTIONS,
+    );
+    put(pf_cap::MAX_MSIX_ENTRIES, PF_CAP_MAX_MSIX_ENTRIES);
+    put(pf_cap::PF_MAX_MSIX_ENTRIES, PF_CAP_MAX_MSIX_ENTRIES);
+    regs
+}
+
+/// True-PF capability register zone, placed above the descriptor table
+/// ([`PF_DESC`]) and below [`DOORBELLS`]. Holds the resource-limit registers
+/// built by [`build_pf_cap_regs`]; the descriptor table's capability descriptor
+/// points a true-PF client here.
+const PF_CAP_ZONE: Range<usize> = 0x200..0x200 + PF_CAP_REGS_LEN;
+
+/// True-PF SR-IOV configuration register zone. A true-PF client reads the
+/// SR-IOV descriptor from [`PF_DESC`] to locate this zone, then reads the
+/// shared-memory descriptor within it ([`pf_sriov`]) to locate the SMC window.
+const PF_SRIOV_ZONE: Range<usize> = 0x300..0x380;
+const PF_SRIOV_ZONE_LEN: usize = PF_SRIOV_ZONE.end - PF_SRIOV_ZONE.start;
+
+/// Field offsets within the SR-IOV configuration zone ([`PF_SRIOV_ZONE`]),
+/// relative to the zone base. The shared-memory descriptor locates the SMC
+/// window the client uses to bring up the hardware channel.
+mod pf_sriov {
+    /// `u64` SMC window offset, relative to the SR-IOV zone base.
+    pub const SHARED_MEM_OFF: usize = 0x70;
+    /// `u32` SMC window size.
+    pub const SHARED_MEM_SZ: usize = 0x78;
+}
+
+/// True-PF SMC shared-memory window, pointed to by the SR-IOV zone's
+/// shared-memory descriptor. This is the [`Shmem`] surface the hardware-channel
+/// handshake runs over; in `pf_caps` mode `shmem_region` resolves here.
+const PF_SRIOV_SHMEM: Range<usize> = 0x380..0x380 + SHMEM_LEN;
+
+/// Build the true-PF region-descriptor table ([`PF_DESC`]). Advertises the
+/// device version and locates the capability, doorbell, and SR-IOV regions
+/// inside BAR0; every other region advertises size 0 ("absent"). Every
+/// advertised region satisfies `base_offset + size <= bar_len`, so a client's
+/// in-bounds check passes for all of them.
+fn build_pf_desc() -> [u8; PF_DESC_LEN] {
+    let mut d = [0u8; PF_DESC_LEN];
+    let put64 = |d: &mut [u8], off: usize, v: u64| {
+        d[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+    };
+    let put32 = |d: &mut [u8], off: usize, v: u32| {
+        d[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    };
+    // Version: the emulated platform generation.
+    put32(&mut d, pf_desc::VERSION, PF_DESC_VERSION);
+    // Capability register zone.
+    put64(&mut d, pf_desc::CAP_ZONE_OFF, PF_CAP_ZONE.start as u64);
+    put32(&mut d, pf_desc::CAP_ZONE_SZ, PF_CAP_ZONE.len() as u32);
+    // Status and control regions reuse the capability size; point them at the
+    // capability zone so the client's bounds check passes.
+    put64(&mut d, pf_desc::STATUS_ZONE_OFF, PF_CAP_ZONE.start as u64);
+    put64(&mut d, pf_desc::CONTROL_ZONE_OFF, PF_CAP_ZONE.start as u64);
+    // Doorbell pages.
+    put64(&mut d, pf_desc::DOORBELL_OFF, DOORBELLS.start as u64);
+    put32(&mut d, pf_desc::DOORBELL_SZ, DOORBELLS.len() as u32);
+    // SR-IOV configuration zone (contains the shared-memory descriptor).
+    put64(&mut d, pf_desc::SRIOV_OFF, PF_SRIOV_ZONE.start as u64);
+    put32(&mut d, pf_desc::SRIOV_SZ, PF_SRIOV_ZONE.len() as u32);
+    // The send/receive WQ, completion/event queue, CQ-moderation, scheduler,
+    // address-translation, and debug context regions are not implemented; they
+    // advertise base 0 and size 0 ("absent"), which trivially satisfies the
+    // client's in-bounds check. (The table is already zero-initialized; written
+    // here explicitly to document each region the true-PF surface declares.)
+    for (off, sz) in [
+        (pf_desc::SEND_WQ_CTX_OFF, pf_desc::SEND_WQ_CTX_SZ),
+        (pf_desc::RECV_WQ_CTX_OFF, pf_desc::RECV_WQ_CTX_SZ),
+        (pf_desc::CQ_CTX_OFF, pf_desc::CQ_CTX_SZ),
+        (pf_desc::EQ_CTX_OFF, pf_desc::EQ_CTX_SZ),
+        (pf_desc::CQ_MOD_CTX_OFF, pf_desc::CQ_MOD_CTX_SZ),
+        (pf_desc::SCHEDULER_OFF, pf_desc::SCHEDULER_SZ),
+        (pf_desc::XLATE_OFF, pf_desc::XLATE_SZ),
+        (pf_desc::DEBUG_OFF, pf_desc::DEBUG_SZ),
+    ] {
+        put64(&mut d, off, 0);
+        put32(&mut d, sz, 0);
+    }
+    d
+}
+
+/// Build the SR-IOV configuration zone ([`PF_SRIOV_ZONE`]). Carries the
+/// shared-memory descriptor (offset relative to the zone base, plus size) that
+/// directs a true-PF client to the SMC window ([`PF_SRIOV_SHMEM`]).
+fn build_pf_sriov_zone() -> [u8; PF_SRIOV_ZONE_LEN] {
+    let mut z = [0u8; PF_SRIOV_ZONE_LEN];
+    let shared_mem_off = (PF_SRIOV_SHMEM.start - PF_SRIOV_ZONE.start) as u64;
+    z[pf_sriov::SHARED_MEM_OFF..][..8].copy_from_slice(&shared_mem_off.to_ne_bytes());
+    z[pf_sriov::SHARED_MEM_SZ..][..4].copy_from_slice(&(SHMEM_LEN as u32).to_ne_bytes());
+    z
+}
+
 pub struct GdmaDevice {
     config: ConfigSpaceType0Emulator,
     msix: MsixEmulator,
     regmap: RegMap,
     shmem: Shmem,
+    /// BAR0 range of the SMC shared-memory window. Normally [`SHMEM`]; in
+    /// `pf_caps` mode it is relocated to [`PF_SRIOV_SHMEM`], the window the
+    /// true-PF SR-IOV shared-memory descriptor points at.
+    shmem_region: Range<usize>,
     destroying_hwc: bool,
     queues: Arc<Queues>,
     hwc: TaskControl<Devices, HwControl>,
@@ -141,6 +347,17 @@ pub struct GdmaDevice {
     /// as a bare-metal PF (`bm_hostmode`). `None` for a VF, keeping the VF
     /// register surface byte-identical.
     pf_regs: Option<[u8; PF_REGS_LEN]>,
+    /// The true-PF region-descriptor table, present only when `pf_caps` is set.
+    /// Served at the base of BAR0 ([`PF_DESC`]); it locates the capability,
+    /// doorbell, and SR-IOV regions for a true-PF client.
+    pf_desc: Option<[u8; PF_DESC_LEN]>,
+    /// The true-PF SR-IOV configuration zone, present only when `pf_caps` is
+    /// set. Served at [`PF_SRIOV_ZONE`]; carries the shared-memory descriptor.
+    pf_sriov_zone: Option<[u8; PF_SRIOV_ZONE_LEN]>,
+    /// The PF capability register window, present only when `pf_caps` is set.
+    /// Served at [`PF_CAP_ZONE`]. `None` keeps the BAR0 register surface
+    /// unchanged.
+    pf_cap_regs: Option<[u8; PF_CAP_REGS_LEN]>,
 }
 
 /// Bridges the synchronous [`FlrHandler::initiate_flr`] callback (invoked from
@@ -162,6 +379,8 @@ impl FlrHandler for GdmaFlrHandler {
 impl InspectMut for GdmaDevice {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
+            .field("bm_hostmode", self.pf_regs.is_some())
+            .field("pf_caps", self.pf_cap_regs.is_some())
             .field("config", &self.config)
             .field("queues", &self.queues)
             .merge(&mut self.hwc);
@@ -244,7 +463,22 @@ impl GdmaDevice {
         // the Linux PF driver never reads the VF offsets), so the in-tree
         // driver can still bring up the HW channel against a PF-mode device.
         let bm_hostmode = bnic_config.bm_hostmode;
+        let pf_caps = bnic_config.pf_caps;
+        // `bm_hostmode` and `pf_caps` are two distinct physical-function
+        // presentations and are never combined.
+        debug_assert!(
+            !(bm_hostmode && pf_caps),
+            "bm_hostmode and pf_caps are mutually exclusive"
+        );
         let pf_regs = bm_hostmode.then(build_pf_regs);
+        // In `pf_caps` mode the device serves the true-PF register surface: a
+        // region-descriptor table at the base of BAR0 (shadowing the VF map),
+        // a capability zone, and an SR-IOV zone whose shared-memory descriptor
+        // points at the relocated SMC window. The SMC handshake therefore runs
+        // over [`PF_SRIOV_SHMEM`] rather than [`SHMEM`].
+        let shmem_region = if pf_caps { PF_SRIOV_SHMEM } else { SHMEM };
+        let pf_desc = pf_caps.then(build_pf_desc);
+        let pf_sriov_zone = pf_caps.then(build_pf_sriov_zone);
 
         // Route a guest-initiated PCIe Function Level Reset to the device's
         // async reset. The handler only signals `flr_rx`; `poll_device` runs
@@ -258,7 +492,7 @@ impl GdmaDevice {
 
         let hardware_ids = HardwareIds {
             vendor_id: gdma_defs::VENDOR_ID,
-            device_id: if bm_hostmode {
+            device_id: if bm_hostmode || pf_caps {
                 gdma_defs::PF_DEVICE_ID
             } else {
                 gdma_defs::DEVICE_ID
@@ -276,13 +510,23 @@ impl GdmaDevice {
             Box::new(pci_express_capability) as _,
         ];
 
+        // A physical-function client (pf_caps) requires an SR-IOV extended
+        // capability to be present in config space before it will start. Expose
+        // one advertising zero virtual functions so the client starts without
+        // requesting any virtual-function infrastructure.
+        let extended_capabilities: Vec<Box<dyn PciExtendedCapability>> = if pf_caps {
+            vec![Box::new(SriovExtendedCapability::new()) as _]
+        } else {
+            Vec::new()
+        };
+
         let bar0_mem = mmio_registration.new_io_region("regs", 8192);
         let bar2_mem = mmio_registration.new_io_region("msix", msix.bar_len());
 
         let config = ConfigSpaceType0Emulator::new(
             hardware_ids,
             capabilities,
-            Vec::new(),
+            extended_capabilities,
             DeviceBars::new()
                 .bar0(8192, BarMemoryKind::Intercept(bar0_mem))
                 .bar4(msix.bar_len(), BarMemoryKind::Intercept(bar2_mem)),
@@ -297,18 +541,20 @@ impl GdmaDevice {
             vf_db_page_sz: DOORBELLS.len() as u16,
             reserved2: 0,
             reserved3: 0,
-            vf_gdma_sriov_shared_reg_start: SHMEM.start as u64,
-            vf_gdma_sriov_shared_sz: SHMEM.len() as u16,
+            vf_gdma_sriov_shared_reg_start: shmem_region.start as u64,
+            vf_gdma_sriov_shared_sz: shmem_region.len() as u16,
             reserved4: 0,
             reserved5: 0,
         };
 
         let queues = Arc::new(Queues::new(gm, driver_source.simple(), &msix));
+        let pf_cap_regs = pf_caps.then(|| build_pf_cap_regs(&queues));
 
         Self {
             config,
             msix,
             shmem: Shmem(FromZeros::new_zeroed()),
+            shmem_region,
             regmap,
             queues,
             destroying_hwc: false,
@@ -318,6 +564,9 @@ impl GdmaDevice {
             flr_rx,
             flr_draining: false,
             pf_regs,
+            pf_desc,
+            pf_sriov_zone,
+            pf_cap_regs,
         }
     }
 
@@ -445,6 +694,17 @@ impl GdmaDevice {
                 );
                 Ok(true)
             }
+            SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY => {
+                // A stateless readiness query the host-management client issues
+                // before establishing the HW channel: "is the device out of
+                // reset and ready to serve?". The device is always ready, so it
+                // acknowledges with success. `complete_smc` echoes the message
+                // type/version, marks the header a response, and hands shared-
+                // memory possession back to the guest. No payload, no state
+                // change -- so it succeeds regardless of HW-channel state.
+                tracing::trace!("host_mgmt_ready");
+                Ok(true)
+            }
             req => Err(SmcError::UnsupportedRequest(req)),
         }
     }
@@ -473,16 +733,38 @@ impl GdmaDevice {
 
     fn read_reg(&mut self, offset: usize, data: &mut [u8]) {
         let range = offset..offset + data.len();
-        if REGMAP.contains_range(&range) {
+        if let Some(desc) = self
+            .pf_desc
+            .as_ref()
+            .filter(|_| PF_DESC.contains_range(&range))
+        {
+            // True-PF region-descriptor table. It shadows the VF register map,
+            // so it is checked first and the VF map is served only in its
+            // absence.
+            data.copy_from_slice(&desc[offset - PF_DESC.start..][..data.len()]);
+        } else if self.shmem_region.contains_range(&range) {
+            let base = self.shmem_region.start;
+            self.read_shmem(offset - base, data);
+        } else if self.pf_desc.is_none() && REGMAP.contains_range(&range) {
             self.read_regmap(offset, data);
-        } else if SHMEM.contains_range(&range) {
-            self.read_shmem(offset - SHMEM.start, data);
         } else if let Some(pf) = self
             .pf_regs
             .as_ref()
             .filter(|_| PF_REGS.contains_range(&range))
         {
             data.copy_from_slice(&pf[offset - PF_REGS.start..][..data.len()]);
+        } else if let Some(caps) = self
+            .pf_cap_regs
+            .as_ref()
+            .filter(|_| PF_CAP_ZONE.contains_range(&range))
+        {
+            data.copy_from_slice(&caps[offset - PF_CAP_ZONE.start..][..data.len()]);
+        } else if let Some(sriov) = self
+            .pf_sriov_zone
+            .as_ref()
+            .filter(|_| PF_SRIOV_ZONE.contains_range(&range))
+        {
+            data.copy_from_slice(&sriov[offset - PF_SRIOV_ZONE.start..][..data.len()]);
         } else {
             tracing::warn!(offset, len = data.len(), "bad read");
             data.fill(!0);
@@ -491,8 +773,9 @@ impl GdmaDevice {
 
     fn write_reg(&mut self, offset: usize, data: &[u8]) {
         let range = offset..offset + data.len();
-        if SHMEM.contains_range(&range) {
-            self.write_shmem(offset - SHMEM.start, data);
+        if self.shmem_region.contains_range(&range) {
+            let base = self.shmem_region.start;
+            self.write_shmem(offset - base, data);
         } else if DOORBELLS.contains_range(&range) && data.len() == 8 {
             self.write_doorbell(
                 offset - DOORBELLS.start,

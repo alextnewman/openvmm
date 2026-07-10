@@ -107,6 +107,13 @@ async fn test_gdma(driver: DefaultDriver) {
         .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
         .unwrap();
 
+    // The MANA device must be reported at instance 0. Some drivers read this
+    // 16-bit field as a secondary client-instance index and drop any network
+    // client with a non-zero value, so a regression here would silently prevent
+    // the network child device from being enumerated -- even though drivers that
+    // treat it as an opaque device-id instance are indifferent to the value.
+    assert_eq!(dev_id.instance, 0);
+
     let device_props = gdma.register_device(dev_id).await.unwrap();
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     let _dev_config = bnic.query_dev_config().await.unwrap();
@@ -251,6 +258,12 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
         (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
     );
 
+    // bm_hostmode does not expose a PCI SR-IOV extended capability (that is
+    // specific to the pf_caps client); extended config space reads back empty.
+    let mut sriov_header = 0;
+    device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
+    assert_eq!(sriov_header, 0);
+
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
 
@@ -286,6 +299,187 @@ async fn test_gdma_bm_hostmode_pf(driver: DefaultDriver) {
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     let dev_config = bnic.query_dev_config().await.unwrap();
     assert_eq!(dev_config.bm_hostmode, 1);
+}
+
+/// With `pf_caps` set, the device presents the PF PCI id, an SR-IOV extended
+/// capability, and a true-PF BAR0 register surface: a region-descriptor table at
+/// the base of BAR0 that locates the capability, doorbell, and SR-IOV regions. A
+/// true-PF client validates that every advertised region resolves inside BAR0
+/// (`base_offset + size <= bar_len`) and follows the SR-IOV zone's shared-memory
+/// descriptor to the SMC window. This walks that structure: it asserts the
+/// version, that each populated region is in-bounds, that the SMC window is
+/// reachable and correctly sized, that the capability zone reports the queue
+/// maxima and fixed limits, and that unimplemented regions advertise size 0.
+///
+/// Unlike the VF tests, this does NOT bring up the HW channel through the
+/// in-tree (VF) `GdmaDriver`: the descriptor table shadows the VF register map,
+/// so the true-PF surface is validated structurally. HW-channel bring-up
+/// coverage lives in the VF (`test_gdma`) and `bm_hostmode` tests.
+#[async_test]
+async fn test_gdma_pf_caps_registers(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_registers");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let mut device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            pf_caps: true,
+            ..Default::default()
+        },
+    );
+
+    // (1) pf_caps presents the PF PCI id so a PF bus driver binds.
+    let mut vendor_device = 0;
+    device.pci_cfg_read(0, &mut vendor_device).unwrap();
+    assert_eq!(
+        vendor_device,
+        (gdma_defs::PF_DEVICE_ID as u32) << 16 | gdma_defs::VENDOR_ID as u32
+    );
+
+    // (1b) pf_caps exposes an SR-IOV extended capability advertising zero virtual
+    // functions, which a PF client requires before it will start.
+    let mut sriov_header = 0;
+    device.pci_cfg_read(0x100, &mut sriov_header).unwrap();
+    assert_eq!(sriov_header & 0xffff, 0x0010); // SR-IOV extended capability id
+    assert_eq!((sriov_header >> 16) & 0xf, 1); // capability version
+    let mut sriov_vfs = 0;
+    device.pci_cfg_read(0x10c, &mut sriov_vfs).unwrap();
+    assert_eq!(sriov_vfs, 0); // initial + total VFs both zero
+
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let mut regs = device.clone();
+    let bar0 = regs.map_bar(0).unwrap();
+
+    const BAR0_LEN: u64 = 8192;
+    // A region descriptor is a { u64 base_offset, u32 size } pair; the client
+    // requires base_offset + size <= bar_len for every advertised region.
+    let in_bounds = |off: u64, size: u64| off + size <= BAR0_LEN;
+    let region = |off_at: usize, sz_at: usize| {
+        let off = bar0.read_u64(off_at);
+        let size = bar0.read_u32(sz_at) as u64;
+        (off, size)
+    };
+
+    // (2) Version: the major version (high byte) must be a supported value.
+    let version = bar0.read_u32(0x00);
+    assert_eq!((version >> 24) & 0xff, 2); // major version (emulated generation)
+
+    // (3) The capability, doorbell, and SR-IOV regions resolve inside BAR0.
+    let (cap_off, cap_size) = region(0x48, 0x50);
+    assert!(in_bounds(cap_off, cap_size));
+    assert_eq!(cap_size, 0x68); // capability zone size
+    let (db_off, db_size) = region(0xC8, 0xD0);
+    assert!(in_bounds(db_off, db_size));
+    assert_eq!(db_off, 4096); // doorbell zone offset
+    assert_eq!(db_size, 4096); // doorbell zone size
+    let (sriov_off, sriov_size) = region(0x108, 0x110);
+    assert!(in_bounds(sriov_off, sriov_size));
+
+    // (4) The SMC window is reachable: the SR-IOV zone's shared-memory descriptor
+    // (relative to the zone base) resolves in-bounds and is sized for the header.
+    let shmem_rel = bar0.read_u64((sriov_off + 0x70) as usize);
+    let shmem_size = bar0.read_u32((sriov_off + 0x78) as usize) as u64;
+    let shmem_abs = sriov_off + shmem_rel;
+    assert!(in_bounds(shmem_abs, shmem_size));
+    assert_eq!(shmem_size, 32); // shared-memory window size
+
+    // (5) The capability zone reports the device's queue maxima (sourced from the
+    // live queue allocation) and fixed limits. Field offsets are relative to the
+    // discovered capability-zone base.
+    let cap = |field: u64| bar0.read_u32((cap_off + field) as usize);
+    assert_eq!(cap(0x00), 0); // hw_capabilities
+    assert_eq!(cap(0x04), 0); // feature_flags
+    assert_eq!(cap(0x08), 64); // max_send_queues
+    assert_eq!(cap(0x10), 64); // max_receive_queues
+    assert_eq!(cap(0x18), 128); // max_completion_queues
+    assert_eq!(cap(0x20), 64); // max_event_queues
+    assert_eq!(cap(0x28), 0); // max_cq_moderation_contexts
+    assert_eq!(cap(0x30), 0); // num_virtual_functions
+    assert_eq!(cap(0x38), 1); // max_doorbell_pages
+    assert_eq!(cap(0x40), 0); // max_moderated_completion_queues
+    assert_eq!(cap(0x48), 1514); // max_tx_payload_len
+    assert_eq!(cap(0x50), 1); // num_physical_functions
+    assert_eq!(cap(0x58), 64); // max_msix_entries
+    assert_eq!(cap(0x60), 64); // pf_max_msix_entries
+
+    // (6) Unimplemented regions advertise size 0 ("absent").
+    assert_eq!(bar0.read_u32(0x70), 0); // send wq context size
+    assert_eq!(bar0.read_u32(0xA0), 0); // event queue context size
+    assert_eq!(bar0.read_u32(0x100), 0); // address-translation context size
+}
+
+/// Before it establishes the HW channel, the host-management client polls the
+/// device for readiness over the shared-memory channel: it writes a single
+/// header word -- message type "host management ready", request direction --
+/// to the last word of the SMC aperture, takes possession, and waits for the
+/// device to answer. The device must acknowledge: echo the message type, mark
+/// the word a successful response, and hand possession back. A device that
+/// rejects this query as an unknown request strands the client before bring-up
+/// (the symptom that motivated handling it). This drives that handshake end to
+/// end over the relocated (`pf_caps`) shared-memory window.
+#[async_test]
+async fn test_gdma_pf_caps_host_mgmt_ready(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_caps_host_mgmt_ready");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new_with_config(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            pf_caps: true,
+            ..Default::default()
+        },
+    );
+
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let mut regs = device.clone();
+    let bar0 = regs.map_bar(0).unwrap();
+
+    // Discover the shared-memory window through the descriptor table: the
+    // SR-IOV region descriptor, then its shared-memory sub-descriptor.
+    let sriov_off = bar0.read_u64(0x108);
+    let shmem_rel = bar0.read_u64((sriov_off + 0x70) as usize);
+    let shmem_size = bar0.read_u32((sriov_off + 0x78) as usize) as u64;
+    let shmem_abs = (sriov_off + shmem_rel) as usize;
+    // The protocol header occupies the last word of the SMC aperture.
+    let header_off = shmem_abs + shmem_size as usize - 4;
+
+    // Issue the readiness query. Writing the header word is what hands the
+    // device possession and triggers it to service the request.
+    let request = SmcProtoHdr::new()
+        .with_msg_type(SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY.0)
+        .with_msg_version(gdma_defs::SMC_MSG_TYPE_HOST_MGMT_READY_VERSION);
+    assert!(!request.is_response()); // sanity: a request, not a response
+    bar0.write_u32(header_off, u32::from(request));
+
+    // The device must answer in place: same message type, marked a response,
+    // success status, with a version no newer than requested and possession
+    // handed back to the guest.
+    let response = SmcProtoHdr::from(bar0.read_u32(header_off));
+    assert_eq!(
+        response.msg_type(),
+        SmcMessageType::SMC_MSG_TYPE_HOST_MGMT_READY.0
+    );
+    assert!(response.is_response());
+    assert_eq!(
+        response.msg_version(),
+        gdma_defs::SMC_MSG_TYPE_HOST_MGMT_READY_VERSION
+    );
+    assert_eq!(response.status(), 0); // success
+    assert!(!response.owner_is_pf()); // possession returned to the guest
 }
 
 /// A vport must support more than one receive work-queue object so the guest

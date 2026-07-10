@@ -47,6 +47,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaDeviceHandle> for GdmaDeviceR
         input: ResolvePciDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let bm_hostmode = resource.bm_hostmode;
+        let pf_caps = resource.pf_caps;
         let vports = try_join_all(resource.vports.into_iter().map(async |vport| {
             let endpoint = resolver
                 .resolve(
@@ -73,6 +74,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaDeviceHandle> for GdmaDeviceR
             input.register_mmio,
             BnicConfig {
                 bm_hostmode,
+                pf_caps,
                 ..Default::default()
             },
         );

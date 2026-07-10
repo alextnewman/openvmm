@@ -118,12 +118,14 @@ open_enum! {
     pub enum SmcMessageType: u8 {
         SMC_MSG_TYPE_ESTABLISH_HWC = 1,
         SMC_MSG_TYPE_DESTROY_HWC = 2,
+        SMC_MSG_TYPE_HOST_MGMT_READY = 3,
         SMC_MSG_TYPE_REPORT_HWC_TIMEOUT = 4,
     }
 }
 
 pub const SMC_MSG_TYPE_ESTABLISH_HWC_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_DESTROY_HWC_VERSION: u8 = 0;
+pub const SMC_MSG_TYPE_HOST_MGMT_READY_VERSION: u8 = 0;
 pub const SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION: u8 = 1;
 
 #[repr(C)]

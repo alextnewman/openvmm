@@ -21,6 +21,9 @@ pub struct GdmaDeviceHandle {
     /// `1414:00b9`) reporting `bm_hostmode`, to exercise the Linux driver's
     /// bare-metal-host code paths instead of the SR-IOV VF paths.
     pub bm_hostmode: bool,
+    /// Expose the PF capability register block in BAR0, advertising the
+    /// device's resource limits to a physical-function driver.
+    pub pf_caps: bool,
 }
 
 impl ResourceId<PciDeviceHandleKind> for GdmaDeviceHandle {

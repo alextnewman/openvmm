@@ -11,6 +11,7 @@ pub use gicr::Redistributor;
 
 mod gicd {
     use super::Redistributor;
+    use super::gicr::PRIORITY_WORD_MASK;
     use super::gicr::SharedState;
     use aarch64defs::MpidrEl1;
     use aarch64defs::SystemReg;
@@ -380,7 +381,7 @@ mod gicd {
                     let n = (r.0 & 0x3ff) / 4;
                     if n >= 8 {
                         if let Some(priority) = self.state.lock().priority.get_mut(n as usize) {
-                            *priority = value;
+                            *priority = value & PRIORITY_WORD_MASK;
                         }
                     }
                 }
@@ -522,6 +523,34 @@ mod gicd {
             Some(v)
         }
 
+        fn read_subword(&self, address: GicdRegister, data: &mut [u8]) -> bool {
+            if !GicdRegister::IPRIORITYR.contains(&address.0) {
+                return false;
+            }
+            let word = GicdRegister(address.0 & !0x3);
+            let Some(value) = self.read32(word) else {
+                return false;
+            };
+            let bytes = value.to_ne_bytes();
+            let offset = (address.0 & 0x3) as usize;
+            data.copy_from_slice(&bytes[offset..offset + data.len()]);
+            true
+        }
+
+        fn write_subword(&self, address: GicdRegister, data: &[u8]) -> bool {
+            if !GicdRegister::IPRIORITYR.contains(&address.0) {
+                return false;
+            }
+            let word = GicdRegister(address.0 & !0x3);
+            let Some(value) = self.read32(word) else {
+                return false;
+            };
+            let mut bytes = value.to_ne_bytes();
+            let offset = (address.0 & 0x3) as usize;
+            bytes[offset..offset + data.len()].copy_from_slice(data);
+            self.write32(word, u32::from_ne_bytes(bytes))
+        }
+
         pub fn read(&self, address: u64, data: &mut [u8]) -> bool {
             if self.gicd_range.contains_addr(address) {
                 self.read_gicd(address - self.gicd_range.start(), data);
@@ -551,6 +580,7 @@ mod gicd {
             }
             let address = GicdRegister(address as u16);
             let handled = match data.len() {
+                1 | 2 => self.read_subword(address, data),
                 4 => {
                     if let Some(v) = self.read32(address) {
                         data.copy_from_slice(&v.to_ne_bytes());
@@ -602,6 +632,7 @@ mod gicd {
             }
             let address = GicdRegister(address as u16);
             let handled = match data.len() {
+                1 | 2 => self.write_subword(address, data),
                 4 => self.write32(address, u32::from_ne_bytes(data.try_into().unwrap())),
                 8 => self.write64(address, u64::from_ne_bytes(data.try_into().unwrap())),
                 _ => false,
@@ -672,7 +703,7 @@ mod gicd {
 
             let mut w = [0u8; 4];
             d.read(prio_off, &mut w);
-            assert_eq!(u32::from_ne_bytes(w), 0x4433_2211);
+            assert_eq!(u32::from_ne_bytes(w), 0x4030_2010);
 
             // The ICFGR word the buggy index collided with (cfg[8], GICD offset
             // 0xc00 + 0x20) must be untouched by a priority write.
@@ -680,6 +711,27 @@ mod gicd {
             let mut c = [0u8; 4];
             d.read(cfg_off, &mut c);
             assert_eq!(u32::from_ne_bytes(c), 0);
+        }
+
+        #[test]
+        fn gicd_ipriorityr_supports_subword_access() {
+            let d = dist();
+            let priority = GICD_BASE + GicdRegister::IPRIORITYR0.0 as u64 + 32;
+
+            d.write(priority, &[0x27]);
+            d.write(priority + 2, &[0x3f, 0x48]);
+
+            let mut word = [0u8; 4];
+            d.read(priority, &mut word);
+            assert_eq!(word, [0x20, 0, 0x38, 0x48]);
+
+            let mut byte = [0u8; 1];
+            d.read(priority, &mut byte);
+            assert_eq!(byte, [0x20]);
+
+            let mut halfword = [0u8; 2];
+            d.read(priority + 2, &mut halfword);
+            assert_eq!(halfword, [0x38, 0x48]);
         }
 
         #[test]
@@ -882,6 +934,12 @@ mod gicr {
     /// is a multiple of 8 (its low 3 bits are res0), so the 32 group priorities
     /// map onto the 32 bits of the word.
     pub(crate) const PREEMPT_SHIFT: u8 = 8 - PRIBITS;
+
+    /// Mask of implemented bits in each priority field.
+    pub(crate) const PRIORITY_MASK: u8 = u8::MAX << PREEMPT_SHIFT;
+
+    /// Four packed priority fields, for GICD/GICR priority register writes.
+    pub(crate) const PRIORITY_WORD_MASK: u32 = PRIORITY_MASK as u32 * 0x0101_0101;
 
     /// Architectural minimum value of ICC_BPR0_EL1 for this configuration
     /// (writes below it read back as it; it is also the reset value).
@@ -1199,7 +1257,7 @@ mod gicr {
                 GicrSgiRegister::ICFGR1 => self.mutable.lock().ppi_cfg = data,
                 r if GicrSgiRegister::IPRIORITYR.contains(&r.0) => {
                     let n = (r.0 & 0x1f) / 4;
-                    self.mutable.lock().priority[n as usize] = data;
+                    self.mutable.lock().priority[n as usize] = data & PRIORITY_WORD_MASK;
                 }
                 _ => return false,
             }
@@ -1326,7 +1384,7 @@ mod gicr {
         pub(crate) fn write_cpuif(&mut self, reg: SystemReg, value: u64) -> bool {
             let mut state = self.shared.mutable.lock();
             match reg {
-                SystemReg::ICC_PMR_EL1 => state.icc_pmr = value as u8,
+                SystemReg::ICC_PMR_EL1 => state.icc_pmr = value as u8 & PRIORITY_MASK,
                 SystemReg::ICC_BPR0_EL1 => state.icc_bpr0 = ((value & 0x7) as u8).max(MIN_BPR0),
                 SystemReg::ICC_BPR1_EL1 => state.icc_bpr1 = ((value & 0x7) as u8).max(MIN_BPR1),
                 SystemReg::ICC_IGRPEN0_EL1 => state.icc_grpen0 = value & 1 != 0,
@@ -1526,7 +1584,7 @@ mod gicr {
             let (_redist, shared) = Redistributor::new(0, 0, true);
 
             // intid 20 (the vtimer PPI) sits at IPRIORITYR0 + 0x14.
-            shared.write(SGI + IPRIORITYR0 + 0x14, &[0x20]);
+            shared.write(SGI + IPRIORITYR0 + 0x14, &[0x27]);
 
             // Reads back at byte, halfword, and word granularity.
             let mut b = [0u8; 1];
@@ -1583,6 +1641,11 @@ mod gicr {
             // Writable registers read back what was written.
             assert!(redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xf0));
             assert_eq!(redist.read_cpuif(SystemReg::ICC_PMR_EL1), Some(0xf0));
+            assert!(redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xff));
+            assert_eq!(
+                redist.read_cpuif(SystemReg::ICC_PMR_EL1),
+                Some(super::PRIORITY_MASK.into())
+            );
             assert!(redist.write_cpuif(SystemReg::ICC_BPR1_EL1, 0x3));
             assert_eq!(redist.read_cpuif(SystemReg::ICC_BPR1_EL1), Some(0x3));
             assert!(redist.write_cpuif(SystemReg::ICC_IGRPEN1_EL1, 0x1));

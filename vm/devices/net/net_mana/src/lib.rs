@@ -16,6 +16,7 @@ use gdma_defs::GDMA_EQE_COMPLETION;
 use gdma_defs::Sge;
 use gdma_defs::WqeHeader;
 use gdma_defs::bnic::CQE_RX_COALESCED_4;
+use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::CQE_RX_OKAY;
 use gdma_defs::bnic::CQE_TX_GDMA_ERR;
 use gdma_defs::bnic::CQE_TX_INVALID_OOB;
@@ -674,6 +675,7 @@ struct QueueStats {
     rx_packets: Counter,
     rx_vlan_packets: Counter,
     rx_errors: Counter,
+    rx_fence: Counter,
 
     interrupts: Counter,
 
@@ -1095,6 +1097,17 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                             break;
                         }
                     }
+                }
+                CQE_RX_OBJECT_FENCE => {
+                    // A receive fence is a bare ordering barrier: it carries no
+                    // packet and consumes no posted receive buffer. On real
+                    // hardware the Linux driver completes its `fence_event` and
+                    // returns immediately. Signal it via a counter (so callers
+                    // can observe that the fence landed) and continue draining;
+                    // crucially, do NOT pop `posted_rx`, advance the receive
+                    // queue, or replenish the rq -- doing so would consume a
+                    // buffer the fence never claimed and corrupt rq accounting.
+                    self.stats.rx_fence.increment();
                 }
                 ty => {
                     let rx = self.posted_rx.pop_front().unwrap();

@@ -847,6 +847,8 @@ mod tests {
     #[derive(InspectMut)]
     pub struct SerialIoMock {
         data: Vec<u8>,
+        #[inspect(skip)]
+        write_error: Option<ErrorKind>,
     }
 
     impl SerialIo for SerialIoMock {
@@ -886,6 +888,9 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if let Some(error) = self.write_error.take() {
+                return Poll::Ready(Err(error.into()));
+            }
             let buf = &buf[..buf.len().min(FIFO_SIZE)];
             self.data.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
@@ -902,7 +907,17 @@ mod tests {
 
     impl SerialIoMock {
         pub fn new() -> Self {
-            Self { data: Vec::new() }
+            Self {
+                data: Vec::new(),
+                write_error: None,
+            }
+        }
+
+        fn with_write_error(error: ErrorKind) -> Self {
+            Self {
+                data: Vec::new(),
+                write_error: Some(error),
+            }
         }
     }
 
@@ -1252,6 +1267,28 @@ mod tests {
 
         serial.poll_device(&mut Context::from_waker(Waker::noop()));
 
+        assert!(serial.state.tx_buffer.is_empty());
+        assert_ne!(read(&mut serial, Register::UARTMIS) & UARTINT_TX, 0);
+    }
+
+    #[test]
+    fn tx_interrupt_asserts_after_broken_pipe_drain() {
+        let serial_io = SerialIoMock::with_write_error(ErrorKind::BrokenPipe);
+        let mut serial = SerialPl011::new(
+            "com1".to_string(),
+            PL011_SERIAL0_BASE,
+            LineInterrupt::detached(),
+            Box::new(serial_io),
+        )
+        .unwrap();
+
+        write(&mut serial, Register::UARTIMSC, UARTINT_TX);
+        write(&mut serial, Register::UARTICR, 0x7ff);
+        write(&mut serial, Register::UARTDR, b'x'.into());
+
+        serial.poll_device(&mut Context::from_waker(Waker::noop()));
+
+        assert!(!serial.state.connected);
         assert!(serial.state.tx_buffer.is_empty());
         assert_ne!(read(&mut serial, Register::UARTMIS) & UARTINT_TX, 0);
     }

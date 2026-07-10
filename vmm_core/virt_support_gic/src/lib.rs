@@ -266,6 +266,7 @@ mod gicd {
             match reg {
                 SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
                 SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
+                SystemReg::ICC_DIR_EL1 => self.dir(gicr, value as u32),
                 SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
                 SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
                 _ => return gicr.write_cpuif(reg, value),
@@ -306,20 +307,28 @@ mod gicd {
         }
 
         fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
-            // Special INTIDs (>= 1020) have no active state.
             if intid >= 1020 {
                 return;
             }
-            if intid < 32 {
-                // SGI/PPI: priority-drop + deactivate both happen on the redist.
-                gicr.eoi(group1, intid);
-                return;
-            }
-            // SPI routing is a delivery-time input. EOI drops priority on the
-            // executing PE and deactivates the distributor state by INTID.
             gicr.pop_priority(group1);
             tracing::trace!(intid, "gic eoi");
-            if let Some(v) = self.state.lock().active.get_mut(intid as usize / 32) {
+            if !gicr.eoimode() {
+                self.deactivate_intid(gicr, intid);
+            }
+        }
+
+        fn dir(&self, gicr: &mut Redistributor, intid: u32) {
+            if intid >= 1020 || !gicr.eoimode() {
+                return;
+            }
+            tracing::trace!(intid, "gic dir");
+            self.deactivate_intid(gicr, intid);
+        }
+
+        fn deactivate_intid(&self, gicr: &mut Redistributor, intid: u32) {
+            if intid < 32 {
+                gicr.deactivate(intid);
+            } else if let Some(v) = self.state.lock().active.get_mut(intid as usize / 32) {
                 *v &= !(1 << (intid & 31));
             }
         }
@@ -771,6 +780,75 @@ mod gicd {
             assert_eq!(d.set_pending(40, true), Some(0));
             assert_eq!(d.ack(&mut redists[0], true), 40);
             assert_eq!(d.ack(&mut redists[1], true), 1023);
+        }
+
+        #[test]
+        fn eoimode_split_completion_for_sgi() {
+            let (d, mut redists) = dist_with_redists(1);
+            let redist = &mut redists[0];
+            redist.write_cpuif(SystemReg::ICC_CTLR_EL1, 1 << 1);
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_EOIR1_EL1, 1, |_| {}));
+            assert_eq!(
+                redist.read_cpuif(SystemReg::ICC_RPR_EL1),
+                Some(u64::from(super::super::gicr::IDLE_PRIORITY))
+            );
+
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1023);
+            assert!(d.write_sysreg(redist, SystemReg::ICC_DIR_EL1, 1, |_| {}));
+            assert_eq!(d.ack(redist, true), 1);
+        }
+
+        #[test]
+        fn eoimode_split_completion_for_spi() {
+            let (d, mut redists) = dist_with_redists(1);
+            let redist = &mut redists[0];
+            redist.write_cpuif(SystemReg::ICC_CTLR_EL1, 1 << 1);
+            provision_spi(&d, 40, 0x40);
+            route_spi(&d, 40, 0);
+            d.set_pending(40, true);
+            assert_eq!(d.ack(redist, true), 40);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_EOIR1_EL1, 40, |_| {}));
+            assert_eq!(d.set_pending(40, true), Some(0));
+            assert_eq!(d.ack(redist, true), 1023);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_DIR_EL1, 40, |_| {}));
+            assert_eq!(d.ack(redist, true), 40);
+        }
+
+        #[test]
+        fn dir_is_ignored_when_eoimode_is_clear() {
+            let (d, mut redists) = dist_with_redists(1);
+            let redist = &mut redists[0];
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_DIR_EL1, 1, |_| {}));
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1023);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_EOIR1_EL1, 1, |_| {}));
+            assert_eq!(d.ack(redist, true), 1);
+        }
+
+        #[test]
+        fn special_intids_do_not_drop_or_deactivate() {
+            let (d, mut redists) = dist_with_redists(1);
+            let redist = &mut redists[0];
+            redist.write_cpuif(SystemReg::ICC_CTLR_EL1, 1 << 1);
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1);
+
+            assert!(d.write_sysreg(redist, SystemReg::ICC_EOIR1_EL1, 1023, |_| {}));
+            assert_eq!(redist.read_cpuif(SystemReg::ICC_RPR_EL1), Some(0));
+            assert!(d.write_sysreg(redist, SystemReg::ICC_DIR_EL1, 1023, |_| {}));
+
+            redist.raise(1);
+            assert_eq!(d.ack(redist, true), 1023);
         }
     }
 }
@@ -1395,6 +1473,10 @@ mod gicr {
             self.shared.mutable.lock().active &= !(1 << intid);
         }
 
+        pub(crate) fn eoimode(&self) -> bool {
+            self.shared.mutable.lock().icc_eoimode
+        }
+
         #[cfg(test)]
         pub(crate) fn irq_pending(&self) -> bool {
             match self.best_candidate(true) {
@@ -1418,6 +1500,7 @@ mod gicr {
             Some(intid)
         }
 
+        #[cfg(test)]
         pub(crate) fn eoi(&mut self, group1: bool, intid: u32) {
             assert!(intid < 32);
             tracing::trace!(intid, "eoi");

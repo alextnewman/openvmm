@@ -342,6 +342,8 @@ pub const GDMA_STANDARD_HEADER_TYPE: u32 = 0;
 
 pub const GDMA_MESSAGE_V1: u16 = 1;
 
+pub const GDMA_MESSAGE_V2: u16 = 2;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes, PartialEq, Eq)]
 pub struct GdmaDevId {

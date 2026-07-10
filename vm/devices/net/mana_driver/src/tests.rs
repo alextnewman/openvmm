@@ -56,6 +56,7 @@ use gdma_defs::bnic::ManaRegisterFilterReq;
 use gdma_defs::bnic::ManaRegisterFilterResp;
 use gdma_defs::bnic::ManaRegisterHwVportReq;
 use gdma_defs::bnic::ManaRegisterHwVportResp;
+use gdma_defs::bnic::STATISTICS_FLAGS_ALL;
 use gdma_defs::bnic::Tristate;
 use gdma_defs::bnic::bnic_status;
 use inspect::InspectMut;
@@ -1164,15 +1165,11 @@ async fn test_adapter_link_speed_default(driver: DefaultDriver) {
     );
 }
 
-/// The emulated device must advertise the "MANA Direct" capability in
-/// `MANA_QUERY_DEV_CONFIG` so that a Windows MANA VF driver binds the guest
-/// TCP/IP stack directly to the VF instead of treating it as the accelerated
-/// member of a synthetic/VF failover pair. OpenVMM never pairs a synthetic NIC
-/// with the emulated VF, so without this the Windows guest configures the
-/// datapath but never transmits.
+/// Capability bits must describe implemented behavior rather than the feature
+/// set of an unrelated production device.
 #[async_test]
-async fn test_gdma_advertises_mana_direct(driver: DefaultDriver) {
-    let mem = DeviceTestMemory::new(128, false, "test_gdma_advertises_mana_direct");
+async fn test_gdma_advertises_implemented_capabilities(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_advertises_implemented_capabilities");
     let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
     let device = gdma::GdmaDevice::new(
         &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
@@ -1207,12 +1204,64 @@ async fn test_gdma_advertises_mana_direct(driver: DefaultDriver) {
     let mut bnic = BnicDriver::new(&mut gdma, dev_id);
     let dev_config = bnic.query_dev_config().await.unwrap();
 
-    assert!(
-        dev_config.cap_mana_direct(),
-        "device must advertise MANA Direct (pf_cap_flags1 = {:#x})",
-        u64::from(dev_config.pf_cap_flags1)
+    let flags = dev_config.pf_cap_flags1;
+    assert_eq!(flags.query_link_status(), 1);
+    assert_eq!(flags.mana_direct(), 1);
+    assert_eq!(flags.ethertype_enforcement(), 0);
+    assert_eq!(flags.query_filter_state(), 0);
+    assert_eq!(flags.async_doorbell_fix(), 0);
+    assert_eq!(u64::from(flags), 0x11);
+}
+
+/// Statistics queries succeed without claiming counters the emulator does not
+/// maintain. A zero reported mask distinguishes this from invented zero-valued
+/// statistics.
+#[async_test]
+async fn test_gdma_reports_only_available_statistics(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_reports_only_available_statistics");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
     );
-    assert_eq!(dev_config.pf_cap_flags1.mana_direct(), 1);
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let buffer = device
+        .dma_client()
+        .allocate_dma_buffer(6 * PAGE_SIZE)
+        .unwrap();
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    let stats = bnic.query_stats(STATISTICS_FLAGS_ALL).await.unwrap();
+    assert_eq!(stats.reported_statistics, 0);
+    assert_eq!(stats.hc_in_octets, 0);
+    assert_eq!(stats.hc_out_octets, 0);
+    assert_eq!(stats.out_errors_gdma, 0);
+
+    let phy_stats = bnic.query_phy_stats(u64::MAX).await.unwrap();
+    assert_eq!(phy_stats.reported_statistics, 0);
+    assert_eq!(phy_stats.rx_pkt_drop_phy, 0);
+    assert_eq!(phy_stats.tx_pkt_drop_phy, 0);
+    assert_eq!(phy_stats.pkt_tc_phy, [0; 16]);
+    assert_eq!(phy_stats.byte_tc_phy, [0; 16]);
+    assert_eq!(phy_stats.pause_tc_phy, [0; 16]);
 }
 
 /// Configures the emulated GDMA device with a specific non-zero link speed

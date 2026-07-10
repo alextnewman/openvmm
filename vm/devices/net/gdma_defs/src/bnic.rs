@@ -22,6 +22,7 @@ open_enum! {
         MANA_CONFIG_VPORT_RX = 0x20007,
         MANA_QUERY_VPORT_CONFIG = 0x20008,
         MANA_QUERY_LINK_CONFIG = 0x2000A,
+        MANA_QUERY_PHY_STAT = 0x2000C,
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
@@ -81,14 +82,18 @@ pub const MANA_DEFAULT_LINK_SPEED_MBPS: u32 = 200_000;
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct BasicNicDriverFlags {
+    /// Operational link state and speed can be queried.
     #[bits(1)]
     pub query_link_status: u8,
+    /// Per-vport EtherType policy is enforced.
     #[bits(1)]
     pub ethertype_enforcement: u8,
+    /// VTL2 filter ownership can be queried.
     #[bits(1)]
     pub query_filter_state: u8,
+    /// The asynchronous doorbell compatibility behavior is implemented.
     #[bits(1)]
-    reserved3: u8,
+    pub async_doorbell_fix: u8,
     /// The device supports "MANA Direct": the VF presents networking straight to
     /// the guest OS network stack, with no paired synthetic NIC to fail over to.
     /// When set, the Windows MANA VF driver stack binds the guest TCP/IP stack
@@ -626,6 +631,7 @@ pub const STATISTICS_FLAGS_HC_OUT_MCAST_PACKETS: u64 = 0x0000000000400000;
 pub const STATISTICS_FLAGS_HC_OUT_MCAST_OCTETS: u64 = 0x0000000000800000;
 pub const STATISTICS_FLAGS_HC_OUT_BCAST_PACKETS: u64 = 0x0000000001000000;
 pub const STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS: u64 = 0x0000000002000000;
+pub const STATISTICS_FLAGS_OUT_ERRORS_GDMA_ERROR: u64 = 0x0000000004000000;
 
 pub const STATISTICS_FLAGS_ALL: u64 = STATISTICS_FLAGS_IN_DISCARDS_NO_WQE
     | STATISTICS_FLAGS_IN_ERRORS_RX_VPORT_DISABLED
@@ -652,7 +658,8 @@ pub const STATISTICS_FLAGS_ALL: u64 = STATISTICS_FLAGS_IN_DISCARDS_NO_WQE
     | STATISTICS_FLAGS_HC_OUT_MCAST_PACKETS
     | STATISTICS_FLAGS_HC_OUT_MCAST_OCTETS
     | STATISTICS_FLAGS_HC_OUT_BCAST_PACKETS
-    | STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS;
+    | STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS
+    | STATISTICS_FLAGS_OUT_ERRORS_GDMA_ERROR;
 
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -694,4 +701,22 @@ pub struct ManaQueryStatisticsResponse {
     pub hc_out_multicast_octets: u64,
     pub hc_out_broadcast_pkts: u64,
     pub hc_out_broadcast_octets: u64,
+    pub out_errors_gdma: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsRequest {
+    pub requested_statistics: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsResponse {
+    pub reported_statistics: u64,
+    pub rx_pkt_drop_phy: u64,
+    pub tx_pkt_drop_phy: u64,
+    pub pkt_tc_phy: [u64; 16],
+    pub byte_tc_phy: [u64; 16],
+    pub pause_tc_phy: [u64; 16],
 }

@@ -11,6 +11,10 @@ use self::bnic_defs::ManaCommandCode;
 use self::bnic_defs::ManaCqeHeader;
 use self::bnic_defs::ManaQueryLinkConfigReq;
 use self::bnic_defs::ManaQueryLinkConfigResp;
+use self::bnic_defs::ManaQueryPhyStatisticsRequest;
+use self::bnic_defs::ManaQueryPhyStatisticsResponse;
+use self::bnic_defs::ManaQueryStatisticsRequest;
+use self::bnic_defs::ManaQueryStatisticsResponse;
 use self::bnic_defs::ManaQueryVportCfgReq;
 use self::bnic_defs::ManaRxcompOob;
 use self::bnic_defs::ManaRxcompOobFlags;
@@ -803,16 +807,11 @@ impl BasicNic {
                     .context("reading query dev config request")?;
 
                 let resp = ManaQueryDeviceCfgResp {
-                    // Advertise MANA Direct: the emulated VF is presented as a
-                    // standalone directly-assigned NIC with no paired synthetic
-                    // (failover) partner. Without this the Windows MANA VF driver
-                    // stack enumerates the VF as the accelerated member of a
-                    // synthetic/VF failover pair and binds TCP/IP to the (absent)
-                    // synthetic NIC instead of the VF, so the guest brings the
-                    // datapath fully up yet never transmits. Linux ignores this
-                    // bit (it binds its VF unconditionally), so setting it is
-                    // safe for both guests.
-                    pf_cap_flags1: BasicNicDriverFlags::new().with_mana_direct(1),
+                    // Link queries and MANA Direct are the two capability-backed
+                    // behaviors implemented by this device.
+                    pf_cap_flags1: BasicNicDriverFlags::new()
+                        .with_query_link_status(1)
+                        .with_mana_direct(1),
                     pf_cap_flags2: 0,
                     pf_cap_flags3: 0,
                     pf_cap_flags4: 0,
@@ -828,6 +827,21 @@ impl BasicNic {
                 let resp_bytes = resp.as_bytes();
                 let write_len = guest_resp_size.min(resp_bytes.len());
                 write.write(&resp_bytes[..write_len])?;
+            }
+            ManaCommandCode::MANA_QUERY_STATS => {
+                let _req: ManaQueryStatisticsRequest =
+                    read.read_plain().context("reading query stats request")?;
+                let resp: ManaQueryStatisticsResponse = FromZeros::new_zeroed();
+                let resp_bytes = resp.as_bytes();
+                write.write(&resp_bytes[..guest_resp_size.min(resp_bytes.len())])?;
+            }
+            ManaCommandCode::MANA_QUERY_PHY_STAT => {
+                let _req: ManaQueryPhyStatisticsRequest = read
+                    .read_plain()
+                    .context("reading query phy stats request")?;
+                let resp: ManaQueryPhyStatisticsResponse = FromZeros::new_zeroed();
+                let resp_bytes = resp.as_bytes();
+                write.write(&resp_bytes[..guest_resp_size.min(resp_bytes.len())])?;
             }
             ManaCommandCode::MANA_CONFIG_VPORT_TX => {
                 let req: ManaConfigVportReq = read

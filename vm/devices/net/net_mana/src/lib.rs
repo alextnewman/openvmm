@@ -1680,18 +1680,19 @@ struct ContiguousBufferManager {
 #[error("out of bounce buffer memory")]
 struct OutOfMemory;
 
+fn contiguous_buffer_len(page_limit: u32) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        page_limit.is_power_of_two(),
+        "page_limit must be a power of two, {page_limit} is not."
+    );
+    PAGE_SIZE32
+        .checked_mul(page_limit)
+        .with_context(|| format!("{page_limit} will overflow the len field"))
+}
+
 impl ContiguousBufferManager {
     pub fn new(dma_client: Arc<dyn DmaClient>, page_limit: u32) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            page_limit.is_power_of_two(),
-            anyhow::anyhow!("page_limit must be a power of two, {page_limit} is not.")
-        );
-        anyhow::ensure!(
-            PAGE_SIZE64 * Into::<u64>::into(page_limit) <= Into::<u64>::into(u32::MAX),
-            anyhow::anyhow!("{page_limit} will overflow the len field")
-        );
-
-        let len = PAGE_SIZE32 * page_limit;
+        let len = contiguous_buffer_len(page_limit)?;
         let mem = dma_client.allocate_dma_buffer(len as usize)?;
         Ok(Self {
             len,
@@ -1729,29 +1730,17 @@ impl Inspect for ContiguousBufferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Result, anyhow, ensure};
-    use user_driver_emulated_mock::DeviceTestMemory;
 
     #[test]
-    fn page_counts_powers_of_two_only() -> Result<()> {
+    fn page_limit_validation() {
         for i in 1..35 {
-            let dtm = DeviceTestMemory::new(Into::<u64>::into(i) * 2, false, "test");
-            match ContiguousBufferManager::new(dtm.dma_client(), i) {
-                Ok(_) => {
-                    ensure!(
-                        i.is_power_of_two(),
-                        anyhow!("The CBM should only work for powers of 2")
-                    );
-                }
-                Err(_) => {
-                    ensure!(
-                        !i.is_power_of_two(),
-                        anyhow!("Powers of 2 should get CBMs, failed for {i} pages.")
-                    );
-                }
+            let result = contiguous_buffer_len(i);
+            if i.is_power_of_two() {
+                assert_eq!(result.unwrap(), PAGE_SIZE32 * i);
+            } else {
+                assert!(result.is_err());
             }
         }
-
-        Ok(())
+        assert!(contiguous_buffer_len(1 << 20).is_err());
     }
 }

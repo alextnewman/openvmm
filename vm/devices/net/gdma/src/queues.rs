@@ -358,7 +358,10 @@ impl Queues {
 
     pub fn free_wq(&self, is_send: bool, id: u32) -> Result<(), QueueNotFound> {
         let wqs = if is_send { &self.sqs } else { &self.rqs };
-        wqs.get(id as usize - ID_OFFSET)
+        let index = (id as usize)
+            .checked_sub(ID_OFFSET)
+            .ok_or(QueueNotFound(id))?;
+        wqs.get(index)
             .and_then(|q| q.lock().take())
             .ok_or(QueueNotFound(id))?;
         Ok(())
@@ -378,11 +381,24 @@ impl Queues {
         Err(QueueAllocError::NoMoreQueues)
     }
 
-    pub fn free_cq(&self, cq_id: u32) -> Result<(), QueueNotFound> {
-        self.cqs
-            .get(cq_id as usize - ID_OFFSET)
-            .and_then(|q| q.lock().take())
+    pub fn free_wq_cq(&self, is_send: bool, wq_id: u32, cq_id: u32) -> Result<(), QueueNotFound> {
+        let wqs = if is_send { &self.sqs } else { &self.rqs };
+        let wq_index = (wq_id as usize)
+            .checked_sub(ID_OFFSET)
+            .ok_or(QueueNotFound(wq_id))?;
+        let cq_index = (cq_id as usize)
+            .checked_sub(ID_OFFSET)
             .ok_or(QueueNotFound(cq_id))?;
+        let mut wq = wqs.get(wq_index).ok_or(QueueNotFound(wq_id))?.lock();
+        let mut cq = self.cqs.get(cq_index).ok_or(QueueNotFound(cq_id))?.lock();
+        if wq.is_none() {
+            return Err(QueueNotFound(wq_id));
+        }
+        if cq.is_none() {
+            return Err(QueueNotFound(cq_id));
+        }
+        *wq = None;
+        *cq = None;
         Ok(())
     }
 
@@ -411,8 +427,11 @@ impl Queues {
     }
 
     pub fn free_eq(&self, eq_id: u32) -> Result<(), QueueNotFound> {
+        let index = (eq_id as usize)
+            .checked_sub(ID_OFFSET)
+            .ok_or(QueueNotFound(eq_id))?;
         self.eqs
-            .get(eq_id as usize - ID_OFFSET)
+            .get(index)
             .and_then(|q| q.lock().take())
             .ok_or(QueueNotFound(eq_id))?;
         Ok(())

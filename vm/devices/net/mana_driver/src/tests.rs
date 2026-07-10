@@ -235,6 +235,12 @@ async fn test_gdma(driver: DefaultDriver) {
     .await
     .unwrap();
     arena.destroy(&mut gdma).await;
+
+    // Guest-provided queue IDs below the GDMA allocation range are invalid,
+    // not indices into the queue arrays.
+    gdma.disable_eq(dev_id, 0)
+        .await
+        .expect_err("queue zero must be rejected");
 }
 
 /// A MANA vport does not implicitly report its link as up: the device signals

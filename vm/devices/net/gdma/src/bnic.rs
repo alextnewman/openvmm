@@ -46,7 +46,6 @@ use crate::rss::MANA_HASH_KEY_SIZE;
 use crate::rss::compute_rx_hash;
 use anyhow::Context;
 use anyhow::anyhow;
-use futures::FutureExt;
 use gdma_defs::GDMA_MESSAGE_V2;
 use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaQueueType;
@@ -378,9 +377,29 @@ struct RegisteredFilter {
     vport: usize,
 }
 
+struct EndpointState {
+    endpoint: Box<dyn Endpoint>,
+}
+
+impl AsyncRun<Option<mesh::OneshotSender<()>>> for EndpointState {
+    async fn run(
+        &mut self,
+        stop: &mut StopTask<'_>,
+        armed: &mut Option<mesh::OneshotSender<()>>,
+    ) -> Result<(), task_control::Cancelled> {
+        if let Some(armed) = armed.take() {
+            armed.send(());
+        }
+        let _ = stop.until_stopped(std::future::pending::<()>()).await;
+        self.endpoint.stop().await;
+        Ok(())
+    }
+}
+
 struct Vport {
     mac_address: MacAddress,
-    endpoint: Box<dyn Endpoint>,
+    endpoint: TaskControl<EndpointState, Option<mesh::OneshotSender<()>>>,
+    max_backend_queues: u16,
     /// One datapath task per active queue pair. Empty when the receive path is
     /// disabled.
     tasks: Vec<TaskControl<TxRxState, TxRxTask>>,
@@ -402,23 +421,50 @@ struct Vport {
 
 impl InspectMut for Vport {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
-        req.respond()
-            .field("mac_address", self.mac_address)
-            .field_mut("endpoint", self.endpoint.as_mut())
+        let mut resp = req.respond();
+        resp.field("mac_address", self.mac_address)
             .field("tx_wqs", self.queue_cfg.tx.len())
             .field("rx_wqs", self.queue_cfg.rx.len())
             .fields_mut("queues", self.tasks.iter_mut().enumerate());
+        if self.endpoint.is_running() {
+            resp.field("endpoint_active", true);
+        } else {
+            resp.field_mut("endpoint", self.endpoint.task_mut().endpoint.as_mut());
+        }
     }
 }
 
 impl Vport {
+    fn endpoint_mut(&mut self) -> &mut dyn Endpoint {
+        self.endpoint.task_mut().endpoint.as_mut()
+    }
+
+    fn backend_queue_limit(&mut self) -> u16 {
+        if !self.endpoint.is_running() {
+            self.max_backend_queues = self.endpoint_mut().multiqueue_support().max_queues;
+        }
+        self.max_backend_queues
+    }
+
+    async fn stop_endpoint(&mut self) {
+        if self.endpoint.is_running() {
+            self.endpoint.stop().await;
+            self.endpoint.remove();
+        }
+    }
+
+    fn poll_stop_endpoint(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if self.endpoint.is_running() {
+            std::task::ready!(self.endpoint.poll_stop(cx));
+            self.endpoint.remove();
+        }
+        Poll::Ready(())
+    }
+
     /// Stops and tears down every datapath task, then stops the backend
     /// endpoint. The backend's queues are owned by the tasks, so the tasks must
     /// be dropped before the endpoint is stopped.
     async fn stop_datapath(&mut self) {
-        if self.tasks.is_empty() {
-            return;
-        }
         for mut task in self.tasks.drain(..) {
             if task.is_running() {
                 task.stop().await;
@@ -430,7 +476,7 @@ impl Vport {
         for rx in &mut self.queue_cfg.rx {
             rx.fence_tx = None;
         }
-        self.endpoint.stop().await;
+        self.stop_endpoint().await;
     }
 
     /// Like [`Vport::stop_datapath`], but returns each datapath task's
@@ -461,7 +507,7 @@ impl Vport {
         for rx in &mut self.queue_cfg.rx {
             rx.fence_tx = None;
         }
-        self.endpoint.stop().await;
+        self.stop_endpoint().await;
         carried
     }
 
@@ -484,12 +530,7 @@ impl Vport {
         for rx in &mut self.queue_cfg.rx {
             rx.fence_tx = None;
         }
-        // The backend queues are released (tasks dropped above), so stop the
-        // endpoint. The emulated backends this device is built against stop
-        // promptly (for example `NullEndpoint::stop` is a no-op), so the
-        // residual stop completes without parking the poller.
-        self.endpoint.stop().now_or_never();
-        Poll::Ready(())
+        self.poll_stop_endpoint(cx)
     }
 }
 
@@ -528,7 +569,7 @@ async fn start_vport_datapath(
     // queues and funnel the guest's queue pairs onto them, rather than asking
     // the backend for more queues than it supports (which single-queue backends
     // assert against).
-    let backend_queues = (vport.endpoint.multiqueue_support().max_queues as usize).clamp(1, n);
+    let backend_queues = (vport.backend_queue_limit() as usize).clamp(1, n);
 
     let cqe_coalescing = vport.cqe_coalescing.clone();
 
@@ -591,15 +632,21 @@ async fn start_vport_datapath(
     });
 
     let mut queues = vec![];
-    vport
-        .endpoint
+    let get_queues_result = vport
+        .endpoint_mut()
         .get_queues(configs, rss_cfg.as_ref(), &mut queues)
-        .await?;
-    anyhow::ensure!(
-        queues.len() == backend_queues,
-        "backend returned {} queues, expected {backend_queues}",
-        queues.len()
-    );
+        .await;
+    if let Err(err) = get_queues_result {
+        drop(queues);
+        vport.endpoint_mut().stop().await;
+        return Err(err);
+    }
+    if queues.len() != backend_queues {
+        let actual = queues.len();
+        drop(queues);
+        vport.endpoint_mut().stop().await;
+        anyhow::bail!("backend returned {actual} queues, expected {backend_queues}");
+    }
 
     for (j, epqueue) in queues.into_iter().enumerate() {
         // Funnel every guest send queue that maps to this backend queue
@@ -680,6 +727,15 @@ async fn start_vport_datapath(
         task.start();
         vport.tasks.push(task);
     }
+    let (armed_tx, armed_rx) = mesh::oneshot();
+    vport
+        .endpoint
+        .insert(&state.queues.driver, "gdma-bnic-endpoint", Some(armed_tx));
+    if !vport.endpoint.start() {
+        vport.endpoint.remove();
+        anyhow::bail!("endpoint shutdown task failed to start");
+    }
+    armed_rx.await.context("arming endpoint shutdown task")?;
     Ok(())
 }
 
@@ -725,9 +781,11 @@ impl BasicNic {
                      endpoint,
                  }| {
                     assert!(endpoint.is_ordered());
+                    let max_backend_queues = endpoint.multiqueue_support().max_queues;
                     Vport {
                         mac_address,
-                        endpoint,
+                        endpoint: TaskControl::new(EndpointState { endpoint }),
+                        max_backend_queues,
                         tasks: Vec::new(),
                         queue_cfg: QueueCfg::default(),
                         serial_no: 0,
@@ -884,27 +942,34 @@ impl BasicNic {
                     )
                     .into());
                 }
+                anyhow::ensure!(
+                    req.wq_gdma_region != req.cq_gdma_region,
+                    "work and completion queues require distinct dma regions"
+                );
 
                 let wq_region = state.get_dma_region(req.wq_gdma_region, req.wq_size)?;
                 let cq_region = state.get_dma_region(req.cq_gdma_region, req.cq_size)?;
+                let wq_obj = self.next_wq_obj;
+                if wq_obj == u64::MAX {
+                    anyhow::bail!("work-queue object handles exhausted");
+                }
+                let next_wq_obj = wq_obj + 1;
 
                 let wq_id = state
                     .queues
                     .alloc_wq(is_send, wq_region.clone())
                     .context("failed to allocate wq")?;
 
-                let cq_id = state
-                    .queues
-                    .alloc_cq(cq_region.clone(), req.cq_parent_qid)
-                    .context("failed to allocate cq")?;
-
-                // Allocate a distinct, opaque handle for this work-queue object.
-                // The guest uses it to address individual queues (notably in the
-                // RSS indirection table) and to destroy them, so it must be
-                // unique across all of a vport's queues rather than aliasing the
-                // vport index.
-                let wq_obj = self.next_wq_obj;
-                self.next_wq_obj += 1;
+                let cq_id = match state.queues.alloc_cq(cq_region.clone(), req.cq_parent_qid) {
+                    Ok(cq_id) => cq_id,
+                    Err(err) => {
+                        state
+                            .queues
+                            .free_wq(is_send, wq_id)
+                            .context("rolling back wq allocation")?;
+                        return Err(err).context("failed to allocate cq");
+                    }
+                };
 
                 let resp = ManaCreateWqobjResp {
                     wq_id,
@@ -912,6 +977,36 @@ impl BasicNic {
                     wq_obj,
                 };
 
+                if let Err(err) = write.write(resp.as_bytes()) {
+                    state
+                        .queues
+                        .free_wq_cq(is_send, wq_id, cq_id)
+                        .context("rolling back queue allocation")?;
+                    return Err(err).context("writing create wq response");
+                }
+
+                // Take ownership of the DMA regions.
+                if let Err(err) = state.remove_dma_region(req.wq_gdma_region) {
+                    state
+                        .queues
+                        .free_wq_cq(is_send, wq_id, cq_id)
+                        .context("rolling back queue allocation")?;
+                    return Err(err).context("taking ownership of wq dma region");
+                }
+                if let Err(err) = state.remove_dma_region(req.cq_gdma_region) {
+                    state
+                        .queues
+                        .free_wq_cq(is_send, wq_id, cq_id)
+                        .context("rolling back queue allocation")?;
+                    return Err(err).context("taking ownership of cq dma region");
+                }
+
+                // Allocate a distinct, opaque handle for this work-queue object.
+                // The guest uses it to address individual queues (notably in the
+                // RSS indirection table) and to destroy them, so it must be
+                // unique across all of a vport's queues rather than aliasing the
+                // vport index.
+                self.next_wq_obj = next_wq_obj;
                 let vport = &mut self.vports[vport_idx];
                 let list = if is_send {
                     &mut vport.queue_cfg.tx
@@ -924,12 +1019,6 @@ impl BasicNic {
                     cq_id,
                     fence_tx: None,
                 });
-
-                write.write(resp.as_bytes())?;
-
-                // Take ownership of the DMA regions.
-                state.remove_dma_region(req.wq_gdma_region).unwrap();
-                state.remove_dma_region(req.cq_gdma_region).unwrap();
             }
             ManaCommandCode::MANA_DESTROY_WQ_OBJ => {
                 let req: ManaDestroyWqobjReq = read
@@ -949,47 +1038,45 @@ impl BasicNic {
 
                 // Look the object up by its handle across every vport, since the
                 // handle is no longer the vport index.
-                let mut removed = None;
-                for vport in &mut self.vports {
-                    let pos = {
+                let found = self
+                    .vports
+                    .iter()
+                    .enumerate()
+                    .find_map(|(vport_idx, vport)| {
                         let list = if is_send {
                             &vport.queue_cfg.tx
                         } else {
                             &vport.queue_cfg.rx
                         };
-                        list.iter().position(|w| w.wq_obj == req.wq_obj_handle)
-                    };
-                    if let Some(pos) = pos {
-                        // The driver tears a queue down while its datapath is
-                        // still live: on RSS reconfiguration and on vport
-                        // teardown it fences the RQ and destroys the WQ object
-                        // without first driving CONFIG_VPORT_RX(rx_enable=FALSE)
-                        // to disable the vport. Refusing the destroy in that
-                        // window ("queue still in use") leaks a stale WqObject
-                        // into queue_cfg: the next datapath rebuild binds its
-                        // task to that stale entry (queue_cfg.rx[0]), reads an
-                        // already-drained ring, and delivers zero-SGE receives
-                        // that the backend then drops -- silently wedging RX.
-                        // Quiesce the datapath here instead so the object can be
-                        // removed cleanly; the guest's subsequent CREATE_WQ_OBJ
-                        // + CONFIG_VPORT_RX rebuilds a fresh queue.
-                        if vport.tasks.iter().any(|t| t.has_state()) {
-                            vport.stop_datapath().await;
-                        }
-                        let list = if is_send {
-                            &mut vport.queue_cfg.tx
-                        } else {
-                            &mut vport.queue_cfg.rx
-                        };
-                        removed = Some(list.remove(pos));
-                        break;
-                    }
-                }
-                let wq = removed
+                        list.iter()
+                            .position(|w| w.wq_obj == req.wq_obj_handle)
+                            .map(|pos| (vport_idx, pos, list[pos].wq_id, list[pos].cq_id))
+                    });
+                let (vport_idx, pos, wq_id, cq_id) = found
                     .context("specified queue does not exist")
                     .bnic_status(bnic_status::INVALID_WQ_HANDLE)?;
-                state.queues.free_wq(is_send, wq.wq_id).unwrap();
-                state.queues.free_cq(wq.cq_id).unwrap();
+                let vport = &mut self.vports[vport_idx];
+
+                // The driver tears a queue down while its datapath is still
+                // live: on RSS reconfiguration and on vport teardown it fences
+                // the RQ and destroys the WQ object without first disabling the
+                // vport. Quiesce the datapath so a later rebuild cannot bind to
+                // a stale queue entry.
+                if vport.tasks.iter().any(|t| t.has_state()) {
+                    vport.stop_datapath().await;
+                }
+                state
+                    .queues
+                    .free_wq_cq(is_send, wq_id, cq_id)
+                    .context("freeing work and completion queues")?;
+                {
+                    let list = if is_send {
+                        &mut vport.queue_cfg.tx
+                    } else {
+                        &mut vport.queue_cfg.rx
+                    };
+                    list.remove(pos);
+                }
             }
             ManaCommandCode::MANA_FENCE_RQ => {
                 let req: ManaFenceRqReq = read
@@ -1251,7 +1338,8 @@ impl BasicNic {
                 // Advertise as many queues as the backend can service, capped to
                 // a sane maximum. The guest uses this to decide how many receive
                 // queues to create and steer across.
-                let max_queues = (vport.endpoint.multiqueue_support().max_queues)
+                let max_queues = vport
+                    .backend_queue_limit()
                     .clamp(1, MANA_MAX_QUEUES_PER_VPORT) as u32;
 
                 let resp = ManaQueryVportCfgResp {

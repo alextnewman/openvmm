@@ -619,12 +619,22 @@ impl HwControl {
                     .context("failed to allocate queue")?;
 
                 let resp = GdmaCreateQueueResp { queue_index: eq_id };
-                write
-                    .write(resp.as_bytes())
-                    .context("writing queue response")?;
+                if let Err(err) = write.write(resp.as_bytes()) {
+                    self.state
+                        .queues
+                        .free_eq(eq_id)
+                        .context("rolling back eq allocation")?;
+                    return Err(err).context("writing queue response");
+                }
 
                 // Take ownership of the DMA region.
-                self.state.remove_dma_region(req.gdma_region).unwrap();
+                if let Err(err) = self.state.remove_dma_region(req.gdma_region) {
+                    self.state
+                        .queues
+                        .free_eq(eq_id)
+                        .context("rolling back eq allocation")?;
+                    return Err(err).context("taking ownership of eq dma region");
+                }
                 size_of_val(&resp)
             }
             GdmaRequestType::GDMA_DISABLE_QUEUE => {

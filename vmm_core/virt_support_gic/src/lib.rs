@@ -1677,6 +1677,8 @@ mod gicr {
             assert_eq!(ctlr.id_bits(), 0);
             assert!(ctlr.cbpr());
             assert!(ctlr.eoi_mode());
+            let feature_bits: u64 = IccCtlrEl1::new().with_rss(true).with_ext_range(true).into();
+            assert_eq!(feature_bits, 3 << 18);
 
             // A non-CPU-interface register is not claimed here.
             assert!(!redist.write_cpuif(SystemReg::ICC_IAR1_EL1, 0));

@@ -19,6 +19,7 @@ use aarch64defs::ExceptionClass;
 use aarch64defs::IssDataAbort;
 use aarch64defs::IssSystem;
 use aarch64defs::MpidrEl1;
+use aarch64defs::SystemReg;
 use aarch64defs::Vendor;
 use aarch64defs::smccc::FastCall;
 use aarch64defs::smccc::PsciError;
@@ -251,7 +252,7 @@ impl virt::Partition for HvfPartition {
     fn supports_reset(
         &self,
     ) -> Option<&dyn virt::ResetPartition<Error = <Self as virt::Hv1>::Error>> {
-        None
+        Some(self)
     }
 
     fn caps(&self) -> &Aarch64PartitionCapabilities {
@@ -278,6 +279,21 @@ impl virt::Partition for HvfPartition {
         if vp.needs_yield.request_yield() {
             vp.cancel_run();
         }
+    }
+}
+
+impl virt::ResetPartition for HvfPartition {
+    type Error = Error;
+
+    /// Resets VM-wide emulated device state to its initial values. Per-VP state
+    /// (per-VP synic, redistributor, PMU, run flags) is scrubbed separately by
+    /// [`HvfProcessor::reset`] on each VP thread, and the guest's boot registers
+    /// are re-applied afterward by the firmware reload (`set_initial_regs`), so
+    /// this only needs to clear partition-level device/interrupt state.
+    fn reset(&self) -> Result<(), Self::Error> {
+        self.inner.gicd.reset();
+        self.inner.hv1.guest_os_id.store(0, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -570,6 +586,21 @@ struct VpInitState {
     gicr_range: Range<u64>,
 }
 
+/// `ID_AA64PFR0_EL1.GIC` field (bits [27:24]); the value `0b0001` advertises the
+/// GICv3/v4 system-register CPU interface (ICC_* sysregs) to the guest.
+const ID_AA64PFR0_EL1_GIC_CPUIF: u64 = 1 << 24;
+
+/// `ID_AA64DFR0_EL1.PMUVer` field (bits [11:8]); cleared to hide the PMU from the
+/// guest (see the PMU rationale in `bind`).
+const ID_AA64DFR0_EL1_PMUVER: u64 = 0xf << 8;
+
+/// `PMCR_EL0.E` (bit 0) — cycle counter enable.
+const PMCR_EL0_E: u64 = 1 << 0;
+/// `PMCR_EL0.C` (bit 2) — cycle counter reset (write-1 action).
+const PMCR_EL0_C: u64 = 1 << 2;
+/// `PMCR_EL0.LC` (bit 6) — 64-bit (long) cycle counter.
+const PMCR_EL0_LC: u64 = 1 << 6;
+
 impl BindProcessor for HvfProcessorBinder {
     type Processor<'a> = HvfProcessor<'a>;
     type Error = Error;
@@ -584,7 +615,18 @@ impl BindProcessor for HvfProcessorBinder {
         // Set 40 bit physical address width.
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
         // Enable GICv3 system registers.
-        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, 1 << 24)?;
+        vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, ID_AA64PFR0_EL1_GIC_CPUIF)?;
+        // Hide the PMU from the guest. Windows-on-ARM64 reads
+        // ID_AA64DFR0_EL1.PMUVer and, when it is non-zero, drives PMU system
+        // registers (PMCR_EL0, PMCCNTR_EL0, ...) that this backend does not
+        // model, which wedges early boot. Clear only PMUVer[11:8] via
+        // read-modify-write so DebugVer and the other mandatory debug ID fields
+        // are preserved.
+        let dfr0 = vcpu.sys_reg(abi::HvSysReg::ID_AA64DFR0_EL1)?;
+        vcpu.set_sys_reg(
+            abi::HvSysReg::ID_AA64DFR0_EL1,
+            dfr0 & !ID_AA64DFR0_EL1_PMUVER,
+        )?;
         // Set the MPIDR.
         vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
@@ -600,6 +642,8 @@ impl BindProcessor for HvfProcessorBinder {
             gicr: state.gicr,
             hv1: state.hv1,
             vmtime: state.vmtime,
+            pmu: PmuState::default(),
+            crash_params: [0; 5],
         };
 
         // Set initial register state.
@@ -615,6 +659,197 @@ impl BindProcessor for HvfProcessorBinder {
     }
 }
 
+/// Minimal PMUv3 cycle-counter model for `virt_hvf`.
+///
+/// Windows-on-ARM64 programs the cycle counter during early HAL bring-up
+/// (PMCR_EL0/PMCNTENSET_EL0 with the cycle-counter bit) and then busy-waits on
+/// PMCCNTR_EL0 to calibrate its delay loops. The PMU is otherwise unmodeled, so
+/// without this the counter reads as a constant zero, the guest derives a bogus
+/// cycle frequency (or spins waiting for the counter to advance), and early boot
+/// wedges. Hiding `ID_AA64DFR0_EL1.PMUVer` is not sufficient on its own: this
+/// guest drives the cycle counter regardless.
+///
+/// We back PMCCNTR_EL0 with the VM's monotonic time so it advances at a steady
+/// rate; the guest then calibrates a stable frequency and its delays resolve in
+/// real time. Event counters are reported as absent (PMCR_EL0.N == 0); the other
+/// PMU registers are modeled as architectural RAZ/WI state so the accesses no
+/// longer fall through to the unknown-register path.
+#[derive(Debug, Default, Inspect)]
+struct PmuState {
+    /// PMCR_EL0.E (bit 0) — whether the cycle counter is currently counting.
+    enabled: bool,
+    /// Logical PMCCNTR_EL0 value captured at the last re-base point.
+    cycle_offset: u64,
+    /// VM time (100ns units) captured at the last re-base point.
+    cycle_base_100ns: u64,
+    /// PMCNTENSET_EL0/PMCNTENCLR_EL0 (cycle-counter bit 31 + event bits).
+    counter_enable: u32,
+    /// PMINTENSET_EL1/PMINTENCLR_EL1.
+    int_enable: u32,
+    /// PMUSERENR_EL0 (EL0 access controls).
+    userenr: u32,
+    /// PMCCFILTR_EL0.
+    ccfiltr: u32,
+    /// PMSELR_EL0 counter selector.
+    selr: u32,
+}
+
+impl PmuState {
+    /// Cycles attributed per 100ns of VM time (≈3 GHz). The absolute rate is
+    /// immaterial because guests calibrate the cycle counter against the
+    /// architected timer; only a steady, monotonic advance matters.
+    const CYCLES_PER_100NS: u64 = 300;
+
+    /// Current PMCCNTR_EL0 value at the given VM time.
+    fn pmccntr(&self, now_100ns: u64) -> u64 {
+        if self.enabled {
+            let elapsed = now_100ns.wrapping_sub(self.cycle_base_100ns);
+            self.cycle_offset
+                .wrapping_add(elapsed.wrapping_mul(Self::CYCLES_PER_100NS))
+        } else {
+            self.cycle_offset
+        }
+    }
+
+    /// Re-base the counter so that `pmccntr(now)` reads `value` going forward.
+    fn rebase(&mut self, value: u64, now_100ns: u64) {
+        self.cycle_offset = value;
+        self.cycle_base_100ns = now_100ns;
+    }
+
+    /// Handle a PMU system-register read. Returns `None` if `reg` is not a PMU
+    /// register this model owns (so the caller can fall through).
+    fn read_sysreg(&self, reg: SystemReg, now_100ns: u64) -> Option<u64> {
+        let value = match reg {
+            // The load-bearing register: must advance.
+            SystemReg::PMCCNTR_EL0 => self.pmccntr(now_100ns),
+            // Report a 64-bit cycle counter (LC, bit 6) and no event counters
+            // (N == 0); reflect only the enable bit.
+            SystemReg::PMCR_EL0 => PMCR_EL0_LC | if self.enabled { PMCR_EL0_E } else { 0 },
+            SystemReg::PMCNTENSET_EL0 | SystemReg::PMCNTENCLR_EL0 => self.counter_enable.into(),
+            SystemReg::PMINTENSET_EL1 | SystemReg::PMINTENCLR_EL1 => self.int_enable.into(),
+            SystemReg::PMUSERENR_EL0 => self.userenr.into(),
+            SystemReg::PMCCFILTR_EL0 => self.ccfiltr.into(),
+            SystemReg::PMSELR_EL0 => self.selr.into(),
+            // No counter ever overflows and no events are implemented.
+            SystemReg::PMOVSSET_EL0 | SystemReg::PMOVSCLR_EL0 => 0,
+            SystemReg::PMCEID0_EL0 | SystemReg::PMCEID1_EL0 => 0,
+            _ => return None,
+        };
+        Some(value)
+    }
+
+    /// Handle a PMU system-register write. Returns `false` if `reg` is not a PMU
+    /// register this model owns (so the caller can fall through).
+    fn write_sysreg(&mut self, reg: SystemReg, value: u64, now_100ns: u64) -> bool {
+        match reg {
+            SystemReg::PMCR_EL0 => {
+                // Snapshot the current count, then re-base, so toggling the
+                // enable bit never makes the counter jump.
+                let cur = self.pmccntr(now_100ns);
+                self.enabled = value & PMCR_EL0_E != 0;
+                self.rebase(cur, now_100ns);
+                // C (bit 2): reset the cycle counter to zero.
+                if value & PMCR_EL0_C != 0 {
+                    self.rebase(0, now_100ns);
+                }
+            }
+            SystemReg::PMCCNTR_EL0 => self.rebase(value, now_100ns),
+            SystemReg::PMCNTENSET_EL0 => self.counter_enable |= value as u32,
+            SystemReg::PMCNTENCLR_EL0 => self.counter_enable &= !(value as u32),
+            SystemReg::PMINTENSET_EL1 => self.int_enable |= value as u32,
+            SystemReg::PMINTENCLR_EL1 => self.int_enable &= !(value as u32),
+            SystemReg::PMUSERENR_EL0 => self.userenr = value as u32,
+            SystemReg::PMCCFILTR_EL0 => self.ccfiltr = value as u32,
+            SystemReg::PMSELR_EL0 => self.selr = value as u32,
+            // Write-to-clear overflow status / unused selects: accept and ignore
+            // (no counters are modeled).
+            SystemReg::PMOVSSET_EL0 | SystemReg::PMOVSCLR_EL0 => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pmu_cycle_counter_tracks_enabled_vm_time() {
+        let mut pmu = PmuState::default();
+
+        assert_eq!(pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 10), Some(0));
+        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E, 10));
+        assert_eq!(
+            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 12),
+            Some(2 * PmuState::CYCLES_PER_100NS)
+        );
+
+        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, 0, 12));
+        assert_eq!(
+            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 20),
+            Some(2 * PmuState::CYCLES_PER_100NS)
+        );
+
+        assert!(pmu.write_sysreg(SystemReg::PMCR_EL0, PMCR_EL0_E | PMCR_EL0_C, 20));
+        assert_eq!(
+            pmu.read_sysreg(SystemReg::PMCCNTR_EL0, 21),
+            Some(PmuState::CYCLES_PER_100NS)
+        );
+    }
+
+    #[test]
+    fn pmu_reports_no_event_counters() {
+        let pmu = PmuState::default();
+
+        assert_eq!(pmu.read_sysreg(SystemReg::PMCEID0_EL0, 0), Some(0));
+        assert_eq!(pmu.read_sysreg(SystemReg::PMCEID1_EL0, 0), Some(0));
+        assert_eq!(pmu.read_sysreg(SystemReg::PMCR_EL0, 0), Some(PMCR_EL0_LC));
+    }
+}
+
+/// Reflects the host physical counter for guests that trap `CNTPCT_EL0` /
+/// `CNTVCT_EL0`.
+///
+/// Apple's hypervisor traps physical-counter reads; left unhandled the guest
+/// observes a counter frozen at zero, which breaks any guest that derives time
+/// from `CNTPCT_EL0` (e.g. Windows' HAL reads it during timer bring-up). The
+/// host counter advances at the same architected `CNTFRQ` rate the guest
+/// already observes (HVF passes the virtual counter through untrapped), so
+/// reflecting it yields a real, monotonic physical counter.
+fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
+    match reg {
+        SystemReg::CNTPCT_EL0 | SystemReg::CNTVCT_EL0 => {
+            let count: u64;
+            // SAFETY: CNTVCT_EL0 is unprivileged-readable on AArch64 and has no
+            // side effects.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {}, cntvct_el0",
+                    out(reg) count,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            Some(count)
+        }
+        _ => None,
+    }
+}
+
+fn read_cntfrq() -> u64 {
+    let frequency: u64;
+    // SAFETY: CNTFRQ_EL0 is unprivileged-readable and has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntfrq_el0",
+            out(reg) frequency,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    frequency
+}
+
 #[derive(InspectMut)]
 pub struct HvfProcessor<'a> {
     #[inspect(skip)]
@@ -628,6 +863,12 @@ pub struct HvfProcessor<'a> {
     vcpu: HvfVcpu,
     wfi: bool,
     on: bool,
+    pmu: PmuState,
+    /// Hyper-V guest-crash enlightenment parameters (`GuestCrashP0..P4`).
+    /// Sticky registers latched by `HvSetVpRegisters`; reported when the guest
+    /// writes `GuestCrashCtl` at `KeBugCheckEx` time.
+    #[inspect(skip)]
+    crash_params: [u64; 5],
 }
 
 #[derive(Debug, Inspect)]
@@ -845,7 +1086,9 @@ impl HvfProcessor<'_> {
             }
             SmcCall::CPU_OFF => PsciError::DENIED.0,
             SmcCall::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
-            SmcCall::SYSTEM_RESET => return Err(VpHaltReason::Reset),
+            SmcCall::SYSTEM_RESET => {
+                return Err(VpHaltReason::Reset);
+            }
             SmcCall::SYSTEM_OFF => return Err(VpHaltReason::PowerOff),
             SmcCall::MIGRATE_INFO_TYPE => PsciError::NOT_SUPPORTED.0,
             call => {
@@ -886,6 +1129,29 @@ impl<'p> Processor for HvfProcessor<'p> {
         Ok(())
     }
 
+    /// Resets per-VP emulated device state back to its post-boot baseline.
+    ///
+    /// Called on the VP's own thread while all VPs are stopped, after
+    /// [`virt::ResetPartition::reset`] has scrubbed the partition-level state.
+    /// The guest's boot registers are re-applied afterward by the firmware
+    /// reload (`set_initial_regs`), so this only clears device/interrupt state:
+    /// the per-VP redistributor, the synic (which also clears the shared synic
+    /// state referenced by the partition's `GlobalSynic`), queued synic
+    /// messages, the PMU model, any pending PSCI `CPU_ON` request, and the
+    /// WFI/online run flags (the BSP comes back online; secondaries park until
+    /// the guest powers them on again).
+    fn reset(&mut self) -> Result<(), impl std::error::Error + Send + Sync + 'static> {
+        self.gicr.reset();
+        self.hv1.reset();
+        self.pmu = PmuState::default();
+        self.crash_params = [0; 5];
+        self.inner.message_queues.clear();
+        *self.inner.cpu_on.lock() = None;
+        self.wfi = false;
+        self.on = self.inner.vp_info.base.vp_index.is_bsp();
+        Ok::<(), Infallible>(())
+    }
+
     async fn run_vp(
         &mut self,
         stop: StopVp<'_>,
@@ -893,6 +1159,7 @@ impl<'p> Processor for HvfProcessor<'p> {
     ) -> Result<Infallible, VpHaltReason> {
         let vp_index = self.inner.vp_info.base.vp_index;
         let mut last_waker = None;
+
         loop {
             self.inner.needs_yield.maybe_yield().await;
 
@@ -912,7 +1179,6 @@ impl<'p> Processor for HvfProcessor<'p> {
                         if self.on {
                             todo!("block this");
                         } else {
-                            tracing::debug!(x0 = cpu_on.x0, pc = cpu_on.pc, "cpu on");
                             self.vcpu.set_gp(0, cpu_on.x0);
                             self.vcpu.set_pc(cpu_on.pc);
                             self.on = true;
@@ -1087,27 +1353,33 @@ impl<'p> Processor for HvfProcessor<'p> {
                         ExceptionClass::SYSTEM => {
                             let iss = IssSystem::from(exception.syndrome.iss());
                             let reg = iss.system_reg();
+                            let now = self.vmtime.now().as_100ns();
                             if iss.direction() {
-                                let value = self
-                                    .partition
-                                    .gicd
-                                    .read_sysreg(&mut self.gicr, reg)
-                                    .unwrap_or_else(|| {
-                                        tracing::warn!(
-                                            ?reg,
-                                            "returning zero for unknown system register"
-                                        );
-                                        0
-                                    });
+                                let value = if let Some(value) =
+                                    self.partition.gicd.read_sysreg(&mut self.gicr, reg)
+                                {
+                                    value
+                                } else if let Some(value) = read_counter_sysreg(reg) {
+                                    value
+                                } else if let Some(value) = self.pmu.read_sysreg(reg, now) {
+                                    value
+                                } else {
+                                    tracing::warn!(
+                                        ?reg,
+                                        "returning zero for unknown system register"
+                                    );
+                                    0
+                                };
                                 self.vcpu.set_gp(iss.rt(), value);
                             } else {
                                 let value = self.vcpu.gp(iss.rt());
-                                if !self.partition.gicd.write_sysreg(
+                                let handled_by_gic = self.partition.gicd.write_sysreg(
                                     &mut self.gicr,
                                     reg,
                                     value,
                                     |index| self.partition.vps[index].wake(),
-                                ) {
+                                );
+                                if !handled_by_gic && !self.pmu.write_sysreg(reg, value, now) {
                                     tracing::warn!(
                                         ?reg,
                                         value,

@@ -853,6 +853,43 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         dev_id: GdmaDevId,
         req: Req,
     ) -> anyhow::Result<(Resp, u32)> {
+        // A virtual function advertises a request size that matches the work
+        // request it posts.
+        let advertised_req_size = (size_of::<GdmaReqHdr>() + size_of_val(&req)) as u32;
+        self.request_version_advertising(
+            req_msg_type,
+            req_msg_version,
+            resp_msg_type,
+            resp_msg_version,
+            dev_id,
+            req,
+            advertised_req_size,
+        )
+        .await
+    }
+
+    /// Like [`Self::request_version`], but advertises `advertised_req_size` in
+    /// the request header's `msg_size` field independently of how many bytes the
+    /// work request actually carries. The work request always carries the full
+    /// `GdmaReqHdr` + `req`. A physical function exploits this split: it
+    /// advertises only the fixed base size of a variable-length request (for
+    /// example a `GDMA_CREATE_DMA_REGION` without its page-array trailer) and
+    /// relies on the device reading the true length from the work request's
+    /// out-of-band length. The device must therefore not treat `msg_size` as the
+    /// read bound. Exposed within the crate so tests can reproduce that split.
+    pub(crate) async fn request_version_advertising<
+        Req: IntoBytes + Immutable + KnownLayout,
+        Resp: IntoBytes + FromBytes + Immutable + KnownLayout,
+    >(
+        &mut self,
+        req_msg_type: u32,
+        req_msg_version: u16,
+        resp_msg_type: u32,
+        resp_msg_version: u16,
+        dev_id: GdmaDevId,
+        req: Req,
+        advertised_req_size: u32,
+    ) -> anyhow::Result<(Resp, u32)> {
         if self.reset_request_pending.is_some() {
             anyhow::bail!("HWC reset request pending");
         }
@@ -864,7 +901,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             msg_type: req_msg_type,
             msg_version: req_msg_version,
             hwc_msg_id: 0,
-            msg_size: (size_of::<GdmaReqHdr>() + size_of_val(&req)) as u32,
+            msg_size: advertised_req_size,
         };
         let expected_resp_hdr = GdmaMsgHdr {
             msg_type: resp_msg_type,

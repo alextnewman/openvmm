@@ -253,11 +253,17 @@ impl HwControl {
                 .read_plain()
                 .context("reading request message header")?;
 
-            if hdr.req.msg_size as u64 > PAGE_SIZE64 {
-                anyhow::bail!(
-                    "request message size {} exceeds page size {PAGE_SIZE64}",
-                    hdr.req.msg_size
-                );
+            // The authoritative request length is the work request's posted data
+            // length (its out-of-band length), not the header's self-reported
+            // `msg_size`. A physical function sets `msg_size` to the request's
+            // fixed base size and conveys the true length -- including a
+            // variable-length trailer such as a DMA region page array -- via the
+            // work-request length; bounding the read by `msg_size` would truncate
+            // that trailer. A virtual function posts the work request at exactly
+            // `msg_size` bytes, so the two are equivalent for it.
+            let req_len = MemoryRead::len(&read);
+            if req_len as u64 > PAGE_SIZE64 {
+                anyhow::bail!("request message length {req_len} exceeds page size {PAGE_SIZE64}");
             }
             if hdr.resp.msg_size as u64 > PAGE_SIZE64 {
                 anyhow::bail!(
@@ -266,7 +272,7 @@ impl HwControl {
                 );
             }
 
-            let mut read = MemoryRead::limit(read, hdr.req.msg_size as usize);
+            let mut read = MemoryRead::limit(read, req_len);
             read.skip(size_of_val(&hdr))
                 .context("message size too small")?;
 
@@ -279,8 +285,19 @@ impl HwControl {
             let r = match hdr.req.msg_type >> 16 {
                 0 => self.handle_req(&hdr, read, write),
                 _ => {
-                    // Device specific.
-                    if hdr.dev_id == BNIC_DEV_ID && self.bnic_enabled {
+                    // Device-specific (BNIC/MANA) command. The MANA client is
+                    // provisioned by the host as part of hardware-channel
+                    // bring-up: completing HWC setup delivers an init EQE that
+                    // carries the client's pdid and resource limits, after which
+                    // the client is addressable. `GDMA_REGISTER_DEVICE` is an
+                    // optional, redundant confirmation -- some drivers send it
+                    // (the in-tree mana_driver and the Linux driver) and others
+                    // skip it, issuing MANA commands directly after HWC init (the
+                    // Windows VF driver, and a physical function). Requiring an
+                    // explicit register here would wrongly reject the latter.
+                    // Reaching this dispatch means the HWC is live, so accept any
+                    // command addressed to the MANA client.
+                    if hdr.dev_id == BNIC_DEV_ID {
                         devices
                             .bnic
                             .handle_req(&mut self.state, &hdr, read, write)

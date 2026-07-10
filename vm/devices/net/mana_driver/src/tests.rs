@@ -16,6 +16,7 @@ use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use chipset_device::pci::PciConfigSpace;
 use chipset_device::poll_device::PollDevice;
 use gdma::VportConfig;
+use gdma_defs::GDMA_MESSAGE_V1;
 use gdma_defs::GDMA_PAGE_TYPE_4K;
 use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaCreateDmaRegionReq;
@@ -35,11 +36,20 @@ use gdma_defs::bnic::CQE_RX_OBJECT_FENCE;
 use gdma_defs::bnic::MANA_DEFAULT_LINK_SPEED_MBPS;
 use gdma_defs::bnic::ManaCfgRxSteerReq;
 use gdma_defs::bnic::ManaCommandCode;
+use gdma_defs::bnic::ManaConfigVportReq;
+use gdma_defs::bnic::ManaConfigVportResp;
 use gdma_defs::bnic::ManaCqeHeader;
 use gdma_defs::bnic::ManaCreateWqobjReq;
+use gdma_defs::bnic::ManaDeregisterFilterReq;
+use gdma_defs::bnic::ManaDeregisterHwVportReq;
 use gdma_defs::bnic::ManaFenceRqReq;
+use gdma_defs::bnic::ManaQueryFilterCapResponse;
 use gdma_defs::bnic::ManaQueryLinkConfigReq;
 use gdma_defs::bnic::ManaQueryLinkConfigResp;
+use gdma_defs::bnic::ManaRegisterFilterReq;
+use gdma_defs::bnic::ManaRegisterFilterResp;
+use gdma_defs::bnic::ManaRegisterHwVportReq;
+use gdma_defs::bnic::ManaRegisterHwVportResp;
 use gdma_defs::bnic::Tristate;
 use gdma_defs::bnic::bnic_status;
 use inspect::InspectMut;
@@ -218,6 +228,56 @@ async fn test_gdma(driver: DefaultDriver) {
     .await
     .unwrap();
     arena.destroy(&mut gdma).await;
+}
+
+/// A virtual-function driver may issue MANA device commands as soon as the
+/// hardware channel is up, without first sending `GDMA_REGISTER_DEVICE`. The
+/// MANA client is provisioned by the HWC init handshake -- the init EQE carries
+/// its pdid and resource limits -- so it is addressable immediately. The
+/// Windows VF driver relies on this ordering: it queries the device
+/// configuration directly after HWC bring-up. (The in-tree driver and the Linux
+/// driver instead send a redundant `GDMA_REGISTER_DEVICE` first, as `test_gdma`
+/// exercises; both orderings must work.) Regression test for a VF start failure
+/// where the device rejected the un-preceded `MANA_QUERY_DEV_CONFIG` as an
+/// "unknown device".
+#[async_test]
+async fn test_gdma_mana_command_without_register(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_mana_command_without_register");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    // Deliberately skip `gdma.register_device(dev_id)` and issue a MANA command
+    // directly, exactly as the Windows VF driver does after HWC init. This must
+    // succeed: the client is already provisioned by the HWC bring-up.
+    let mut bnic = BnicDriver::new(&mut gdma, dev_id);
+    bnic.query_dev_config().await.unwrap();
 }
 
 /// In bare-metal-host mode the device presents itself as a physical function
@@ -1408,6 +1468,120 @@ async fn test_gdma_dma_region_add_pages(driver: DefaultDriver) {
 
     arena.destroy(&mut gdma).await;
 }
+
+/// A physical function frames `GDMA_CREATE_DMA_REGION` by setting the request
+/// header's `msg_size` to the request's fixed base size (header plus fixed
+/// fields, no page-array trailer) while the work request still carries the full
+/// page array, conveying the true length through the work-request length. The
+/// device must read the page list using the work-request length, not the
+/// header's `msg_size`: bounding the read by `msg_size` truncates the page array
+/// and the create fails ("out of range") even though every page is present. A
+/// virtual function always sizes the work request to exactly `msg_size`, so the
+/// undersized-header path is reachable only from a physical function -- this test
+/// reproduces it with `request_version_advertising`.
+#[async_test]
+async fn test_gdma_create_dma_region_underreported_size(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_create_dma_region_underreported_size");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    let device_props = gdma.register_device(dev_id).await.unwrap();
+
+    // A two-page region whose entire page list rides in the CREATE message, so
+    // the region finalizes immediately (page_addr_list_len == page_count).
+    let region_buffer = Arc::new(
+        gdma.device()
+            .dma_client()
+            .allocate_dma_buffer(2 * PAGE_SIZE)
+            .unwrap(),
+    );
+    let pfns = region_buffer.pfns();
+    assert_eq!(pfns.len(), 2);
+
+    #[repr(C)]
+    #[derive(IntoBytes, Immutable, KnownLayout)]
+    struct CreateReq {
+        req: GdmaCreateDmaRegionReq,
+        pages: [u64; 2],
+    }
+    let create = CreateReq {
+        req: GdmaCreateDmaRegionReq {
+            length: (2 * PAGE_SIZE) as u64,
+            offset_in_page: 0,
+            gdma_page_type: GDMA_PAGE_TYPE_4K,
+            page_count: 2,
+            page_addr_list_len: 2,
+        },
+        pages: [pfns[0] * PAGE_SIZE64, pfns[1] * PAGE_SIZE64],
+    };
+
+    // Advertise only the fixed base size (header + `GdmaCreateDmaRegionReq`, no
+    // page array) even though the work request carries the full page list --
+    // exactly how a physical function frames this command.
+    let advertised_base_size =
+        (size_of::<GdmaReqHdr>() + size_of::<GdmaCreateDmaRegionReq>()) as u32;
+    let (resp, _): (GdmaCreateDmaRegionResp, u32) = gdma
+        .request_version_advertising(
+            GdmaRequestType::GDMA_CREATE_DMA_REGION.0,
+            GDMA_MESSAGE_V1,
+            GdmaRequestType::GDMA_CREATE_DMA_REGION.0,
+            GDMA_MESSAGE_V1,
+            dev_id,
+            create,
+            advertised_base_size,
+        )
+        .await
+        .unwrap();
+    let gdma_region = resp.gdma_region;
+
+    // The region must be fully assembled despite the undersized header. Binding
+    // it to a two-page EQ exercises the device's region lookup, which rejects an
+    // incomplete page list or a length that does not match the queue size.
+    let mut arena = ResourceArena::new();
+    arena.push(crate::resources::Resource::DmaRegion {
+        dev_id,
+        gdma_region,
+    });
+    gdma.create_eq(
+        &mut arena,
+        dev_id,
+        gdma_region,
+        (2 * PAGE_SIZE) as u32,
+        device_props.pdid,
+        device_props.db_id,
+        0,
+    )
+    .await
+    .unwrap();
+
+    arena.destroy(&mut gdma).await;
+}
+
 /// The driver splits a DMA region whose page list does not fit in one HW
 /// channel message into a `GDMA_CREATE_DMA_REGION` plus follow-up
 /// `GDMA_DMA_REGION_ADD_PAGES` messages, and the device reassembles them into a
@@ -1885,7 +2059,6 @@ async fn test_gdma_rss_v2_indir_offset(driver: DefaultDriver) {
          reading it contiguous with the fixed struct mis-resolves every handle"
     );
     arena.destroy(&mut gdma).await;
-    arena.destroy(&mut gdma).await;
 }
 
 /// Walks the PCI capability list and returns the configuration-space offset of
@@ -2192,6 +2365,344 @@ async fn test_gdma_unsupported_command_status(driver: DefaultDriver) {
         "an unimplemented command must report GDMA_STATUS_CMD_UNSUPPORTED ({GDMA_STATUS_CMD_UNSUPPORTED:#x}); \
          driver error was: {err:#}",
     );
+}
+
+fn register_hw_vport_req() -> ManaRegisterHwVportReq {
+    ManaRegisterHwVportReq {
+        attached_gfid: 1,
+        is_pf_default_vport: 1,
+        reserved1: 0,
+        allow_all_ether_types: 1,
+        reserved2: [0; 3],
+    }
+}
+
+fn register_filter_req(vport: u64) -> ManaRegisterFilterReq {
+    ManaRegisterFilterReq {
+        vport,
+        mac_addr: [1, 2, 3, 4, 5, 6],
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        reserved4: 0,
+        reserved5: 0,
+        reserved6: 0,
+        reserved7: 0,
+        reserved8: 0,
+    }
+}
+
+/// PF filter capacity must agree with the GDMA queue resources the device
+/// exposes through the core protocol.
+#[async_test]
+async fn test_gdma_query_filter_cap(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_query_filter_cap");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let resp: ManaQueryFilterCapResponse = gdma
+        .request(ManaCommandCode::MANA_QUERY_FILTER_CAP.0, dev_id, ())
+        .await
+        .expect("query filter cap must succeed");
+    let max_resources = gdma.query_max_resources().await.unwrap();
+
+    assert_eq!(resp.max_num_filters, 1);
+    assert_eq!(resp.max_num_rx_objects, max_resources.max_rq.min(64));
+}
+
+/// PF handles are live resources: they can be registered, used, released, and
+/// registered again. The one-filter limit must be enforced rather than merely
+/// advertised.
+#[async_test]
+async fn test_gdma_pf_resource_lifecycle(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_resource_lifecycle");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dma_client = device.dma_client();
+    let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let vport: ManaRegisterHwVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_HW_PORT.0,
+            dev_id,
+            register_hw_vport_req(),
+        )
+        .await
+        .expect("registering the hardware vport must succeed");
+    assert_eq!(vport.hw_vport_handle, 0);
+
+    let cfg: ManaConfigVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_CONFIG_VPORT_TX.0,
+            dev_id,
+            ManaConfigVportReq {
+                vport: vport.hw_vport_handle,
+                pdid: 0,
+                doorbell_pageid: 0,
+            },
+        )
+        .await
+        .expect("the registered handle must resolve through shared vport commands");
+    assert_eq!(cfg.short_form_allowed, 1);
+
+    let filter: ManaRegisterFilterResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(vport.hw_vport_handle),
+        )
+        .await
+        .expect("registering the filter must succeed");
+    gdma.request::<_, ()>(
+        ManaCommandCode::MANA_DEREGISTER_FILTER.0,
+        dev_id,
+        ManaDeregisterFilterReq {
+            filter_handle: filter.filter_handle,
+        },
+    )
+    .await
+    .expect("deregistering the filter must succeed");
+    gdma.request::<_, ()>(
+        ManaCommandCode::MANA_DEREGISTER_HW_PORT.0,
+        dev_id,
+        ManaDeregisterHwVportReq {
+            hw_vport_handle: vport.hw_vport_handle,
+        },
+    )
+    .await
+    .expect("deregistering the hardware vport must succeed");
+
+    let vport2: ManaRegisterHwVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_HW_PORT.0,
+            dev_id,
+            register_hw_vport_req(),
+        )
+        .await
+        .expect("the released hardware vport capacity must be reusable");
+    let filter2: ManaRegisterFilterResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(vport2.hw_vport_handle),
+        )
+        .await
+        .expect("the released filter capacity must be reusable");
+    assert_ne!(filter.filter_handle, filter2.filter_handle);
+
+    let err = gdma
+        .request::<_, ()>(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(vport2.hw_vport_handle),
+        )
+        .await
+        .expect_err("a second live filter must exceed the advertised capacity");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed with {:#x}",
+            bnic_status::NOT_SET_BY_HANDLER
+        )),
+        "filter-capacity exhaustion must fail with the generic BNIC status: {err:#}",
+    );
+}
+
+/// A filter may only reference a hardware vport returned by
+/// `MANA_REGISTER_HW_PORT`.
+#[async_test]
+async fn test_gdma_pf_filter_rejects_invalid_vport(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_pf_filter_rejects_invalid_vport");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let buffer = device
+        .dma_client()
+        .allocate_dma_buffer(6 * PAGE_SIZE)
+        .unwrap();
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+
+    let err = gdma
+        .request::<_, ()>(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(99),
+        )
+        .await
+        .expect_err("an unknown hardware-vport handle must be rejected");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed with {:#x}",
+            bnic_status::INVALID_VPORT_HANDLE
+        )),
+        "an unknown hardware-vport handle must report INVALID_VPORT_HANDLE: {err:#}",
+    );
+}
+
+/// Device reset drops PF registrations and restarts opaque handle allocation,
+/// matching a freshly constructed function.
+#[async_test]
+async fn test_gdma_reset_clears_pf_resources(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "test_gdma_reset_clears_pf_resources");
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(NullEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+    let device_again = device.clone();
+    let dma_client = device.dma_client();
+    let buffer0 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+    let buffer1 = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
+
+    let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer0))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let vport: ManaRegisterHwVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_HW_PORT.0,
+            dev_id,
+            register_hw_vport_req(),
+        )
+        .await
+        .unwrap();
+    let filter: ManaRegisterFilterResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(vport.hw_vport_handle),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filter.filter_handle, 1);
+
+    abandon_channel(gdma).await;
+    reset_emulated_gdma(&device_inner).await;
+
+    let mut gdma = GdmaDriver::new(&driver, device_again, 1, Some(buffer1))
+        .await
+        .unwrap();
+    gdma.test_eq().await.unwrap();
+    gdma.verify_vf_driver_version().await.unwrap();
+    let dev_id = gdma
+        .list_devices()
+        .await
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|dev_id| dev_id.ty == GdmaDevType::GDMA_DEVICE_MANA)
+        .unwrap();
+    gdma.register_device(dev_id).await.unwrap();
+
+    let vport: ManaRegisterHwVportResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_HW_PORT.0,
+            dev_id,
+            register_hw_vport_req(),
+        )
+        .await
+        .expect("reset must release the hardware-vport registration");
+    let filter: ManaRegisterFilterResp = gdma
+        .request(
+            ManaCommandCode::MANA_REGISTER_FILTER.0,
+            dev_id,
+            register_filter_req(vport.hw_vport_handle),
+        )
+        .await
+        .expect("reset must release the receive-filter registration");
+    assert_eq!(vport.hw_vport_handle, 0);
+    assert_eq!(filter.filter_handle, 1);
 }
 
 /// `MANA_QUERY_LINK_CONFIG` (0x2000A) reports the adapter's link speed. ethtool

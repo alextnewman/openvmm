@@ -25,9 +25,15 @@ use crate::bnic::bnic_defs::ManaConfigVportReq;
 use crate::bnic::bnic_defs::ManaConfigVportResp;
 use crate::bnic::bnic_defs::ManaCreateWqobjReq;
 use crate::bnic::bnic_defs::ManaCreateWqobjResp;
+use crate::bnic::bnic_defs::ManaDeregisterFilterReq;
+use crate::bnic::bnic_defs::ManaDeregisterHwVportReq;
 use crate::bnic::bnic_defs::ManaQueryDeviceCfgReq;
 use crate::bnic::bnic_defs::ManaQueryDeviceCfgResp;
 use crate::bnic::bnic_defs::ManaQueryVportCfgResp;
+use crate::bnic::bnic_defs::ManaRegisterFilterReq;
+use crate::bnic::bnic_defs::ManaRegisterFilterResp;
+use crate::bnic::bnic_defs::ManaRegisterHwVportReq;
+use crate::bnic::bnic_defs::ManaRegisterHwVportResp;
 use crate::bnic::bnic_defs::ManaTxOob;
 use crate::hwc::HwState;
 use crate::queues::Queues;
@@ -150,6 +156,9 @@ const MANA_INDIRECTION_TABLE_SIZE: u32 = 128;
 /// effective count is additionally clamped to what the backend endpoint
 /// supports.
 const MANA_MAX_QUEUES_PER_VPORT: u16 = 16;
+
+const MANA_MAX_FILTERS: u32 = 1;
+const MANA_MAX_RX_OBJECTS: u32 = 64;
 
 /// RX CQE coalescing window, in nanoseconds, reported to the driver in the
 /// `GDMA_MESSAGE_V2` `MANA_CONFIG_VPORT_RX` response. The hardware programs a
@@ -296,13 +305,24 @@ pub struct BasicNic {
     /// handle so the guest can reference individual RX queues (e.g. in the RSS
     /// indirection table) and destroy them independently.
     next_wq_obj: u64,
+    registered_hw_vports: Vec<bool>,
+    filters: Vec<RegisteredFilter>,
+    next_filter_handle: u64,
 }
 
 impl InspectMut for BasicNic {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+        let registered_hw_vports = self.registered_hw_vports.iter().filter(|&&v| v).count();
         req.respond()
+            .field("registered_hw_vports", registered_hw_vports)
+            .field("registered_filters", self.filters.len())
             .fields_mut("vports", self.vports.iter_mut().enumerate());
     }
+}
+
+struct RegisteredFilter {
+    handle: u64,
+    vport: usize,
 }
 
 struct Vport {
@@ -531,7 +551,7 @@ impl BasicNic {
     pub fn new(vports: Vec<VportConfig>, config: BnicConfig) -> Self {
         assert!(!vports.is_empty());
 
-        let vports = vports
+        let vports: Vec<Vport> = vports
             .into_iter()
             .map(
                 |VportConfig {
@@ -552,10 +572,20 @@ impl BasicNic {
             .collect();
 
         Self {
+            registered_hw_vports: vec![false; vports.len()],
             vports,
             config,
             next_wq_obj: 1,
+            filters: Vec::new(),
+            next_filter_handle: 1,
         }
+    }
+
+    fn reset_resources(&mut self) {
+        self.next_wq_obj = 1;
+        self.registered_hw_vports.fill(false);
+        self.filters.clear();
+        self.next_filter_handle = 1;
     }
 
     /// Tears down every vport's datapath, returning the NIC to its initial
@@ -568,6 +598,7 @@ impl BasicNic {
             vport.queue_cfg = QueueCfg::default();
             vport.serial_no = 0;
         }
+        self.reset_resources();
     }
 
     /// Poll-driven equivalent of [`BasicNic::shutdown`], used to tear down every
@@ -581,6 +612,7 @@ impl BasicNic {
             vport.queue_cfg = QueueCfg::default();
             vport.serial_no = 0;
         }
+        self.reset_resources();
         Poll::Ready(())
     }
 
@@ -895,6 +927,99 @@ impl BasicNic {
                 let resp = gdma_defs::bnic::ManaQueryFilterStateResponse {
                     direction_to_vtl0: 0,
                     reserved: [0; 7],
+                };
+
+                write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_REGISTER_HW_PORT => {
+                let _req: ManaRegisterHwVportReq = read
+                    .read_plain()
+                    .context("reading register hw vport request")?;
+                let vport = self
+                    .registered_hw_vports
+                    .iter()
+                    .position(|registered| !registered)
+                    .context("no hardware vport capacity available")?;
+                self.registered_hw_vports[vport] = true;
+
+                let resp = ManaRegisterHwVportResp {
+                    hw_vport_handle: vport as u64,
+                };
+                write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_DEREGISTER_HW_PORT => {
+                let req: ManaDeregisterHwVportReq = read
+                    .read_plain()
+                    .context("reading deregister hw vport request")?;
+                let vport_index =
+                    usize::try_from(req.hw_vport_handle).context("invalid vport handle")?;
+                let registered = self
+                    .registered_hw_vports
+                    .get(vport_index)
+                    .copied()
+                    .filter(|registered| *registered)
+                    .context("invalid vport handle")
+                    .bnic_status(bnic_status::INVALID_VPORT_HANDLE)?;
+                debug_assert!(registered);
+                if self
+                    .filters
+                    .iter()
+                    .any(|filter| filter.vport == vport_index)
+                {
+                    anyhow::bail!("hardware vport still has a registered filter");
+                }
+                let vport = &self.vports[vport_index];
+                if !vport.tasks.is_empty()
+                    || !vport.queue_cfg.tx.is_empty()
+                    || !vport.queue_cfg.rx.is_empty()
+                {
+                    anyhow::bail!("hardware vport still has active queues");
+                }
+                self.registered_hw_vports[vport_index] = false;
+            }
+            ManaCommandCode::MANA_REGISTER_FILTER => {
+                let req: ManaRegisterFilterReq = read
+                    .read_plain()
+                    .context("reading register filter request")?;
+                let vport = usize::try_from(req.vport).context("invalid vport handle")?;
+                self.registered_hw_vports
+                    .get(vport)
+                    .copied()
+                    .filter(|registered| *registered)
+                    .context("invalid vport handle")
+                    .bnic_status(bnic_status::INVALID_VPORT_HANDLE)?;
+                if self.filters.len() >= MANA_MAX_FILTERS as usize {
+                    anyhow::bail!("receive filter capacity exhausted");
+                }
+                let filter_handle = self.next_filter_handle;
+                if filter_handle == u64::MAX {
+                    anyhow::bail!("receive filter handles exhausted");
+                }
+                self.next_filter_handle = filter_handle
+                    .checked_add(1)
+                    .context("receive filter handles exhausted")?;
+                self.filters.push(RegisteredFilter {
+                    handle: filter_handle,
+                    vport,
+                });
+                let resp = ManaRegisterFilterResp { filter_handle };
+                write.write(resp.as_bytes())?;
+            }
+            ManaCommandCode::MANA_DEREGISTER_FILTER => {
+                let req: ManaDeregisterFilterReq = read
+                    .read_plain()
+                    .context("reading deregister filter request")?;
+                let filter = self
+                    .filters
+                    .iter()
+                    .position(|filter| filter.handle == req.filter_handle)
+                    .context("invalid filter handle")?;
+                self.filters.remove(filter);
+            }
+            ManaCommandCode::MANA_QUERY_FILTER_CAP => {
+                let resp = gdma_defs::bnic::ManaQueryFilterCapResponse {
+                    max_num_filters: MANA_MAX_FILTERS,
+                    max_num_rx_objects: state.queues.max_rqs().min(MANA_MAX_RX_OBJECTS),
                 };
 
                 write.write(resp.as_bytes())?;

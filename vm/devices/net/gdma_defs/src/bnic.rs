@@ -25,6 +25,12 @@ open_enum! {
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
+        // Privileged commands issued by a physical function.
+        MANA_REGISTER_FILTER = 0x28000,
+        MANA_DEREGISTER_FILTER = 0x28001,
+        MANA_REGISTER_HW_PORT = 0x28003,
+        MANA_DEREGISTER_HW_PORT = 0x28004,
+        MANA_QUERY_FILTER_CAP = 0x28007,
     }
 }
 
@@ -233,6 +239,69 @@ pub struct ManaQueryFilterStateReq {
 pub struct ManaQueryFilterStateResponse {
     pub direction_to_vtl0: u8,
     pub reserved: [u8; 7],
+}
+
+/// Response to [`ManaCommandCode::MANA_QUERY_FILTER_CAP`]. An 8-byte body that
+/// follows the 32-byte GDMA response header for a 40-byte total (the request is
+/// header-only). Reports the device's receive-filter and receive-object
+/// capacity to a privileged physical-function client.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryFilterCapResponse {
+    pub max_num_filters: u32,
+    pub max_num_rx_objects: u32,
+}
+
+/// Prefix shared by the Linux and Windows
+/// [`ManaCommandCode::MANA_REGISTER_HW_PORT`] requests. Windows appends
+/// additional policy and MAC fields, which older devices may ignore.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterHwVportReq {
+    pub attached_gfid: u16,
+    pub is_pf_default_vport: u8,
+    pub reserved1: u8,
+    pub allow_all_ether_types: u8,
+    pub reserved2: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterHwVportResp {
+    pub hw_vport_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaDeregisterHwVportReq {
+    pub hw_vport_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterFilterReq {
+    pub vport: u64,
+    pub mac_addr: [u8; 6],
+    pub reserved1: u8,
+    pub reserved2: u8,
+    pub reserved3: u8,
+    pub reserved4: u8,
+    pub reserved5: u16,
+    pub reserved6: u32,
+    pub reserved7: u32,
+    pub reserved8: u32,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterFilterResp {
+    pub filter_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaDeregisterFilterReq {
+    pub filter_handle: u64,
 }
 
 #[repr(C)]

@@ -49,7 +49,6 @@ use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
 use std::future::pending;
 use std::io;
-#[cfg(unix)]
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
@@ -420,9 +419,21 @@ pub(crate) async fn run_repl(
     let (inspect_completion_engine_send, inspect_completion_engine_recv) = mesh::channel();
 
     let mut console_in = console_in;
+    let interactive_stdio = io::stdin().is_terminal();
+    let headless_repl_guard = (!interactive_stdio).then(|| {
+        (
+            console_command_send.clone(),
+            inspect_completion_engine_send.clone(),
+        )
+    });
     thread::Builder::new()
         .name("stdio-thread".to_string())
         .spawn(move || {
+            if !interactive_stdio {
+                tracing::info!("standard input is not a terminal; interactive REPL disabled");
+                return;
+            }
+
             // install panic hook to restore cooked terminal (linux)
             #[cfg(unix)]
             if io::stderr().is_terminal() {
@@ -1479,6 +1490,7 @@ pub(crate) async fn run_repl(
         }
     };
 
+    drop(headless_repl_guard);
     Ok(exit_request)
 }
 

@@ -348,6 +348,7 @@ impl net_backend::Endpoint for ConsommeEndpoint {
             udp: true,
             tso: true,
             uso: true,
+            encapsulation: false,
         }
     }
 }

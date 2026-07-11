@@ -535,8 +535,12 @@ impl Queues {
     }
 
     pub fn poll_sq(&self, sq_id: u32, cx: &mut Context<'_>) -> Poll<Wqe> {
+        self.poll_sq_with_offset(sq_id, cx).map(|(_, wqe)| wqe)
+    }
+
+    pub fn poll_sq_with_offset(&self, sq_id: u32, cx: &mut Context<'_>) -> Poll<(u32, Wqe)> {
         if let Some(mut sq) = self.sq(sq_id) {
-            sq.poll_wqe(&self.gm, cx).map(|x| x.1)
+            sq.poll_wqe(&self.gm, cx)
         } else {
             Poll::Pending
         }

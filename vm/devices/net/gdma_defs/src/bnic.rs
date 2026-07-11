@@ -21,10 +21,47 @@ open_enum! {
         MANA_FENCE_RQ = 0x20006,
         MANA_CONFIG_VPORT_RX = 0x20007,
         MANA_QUERY_VPORT_CONFIG = 0x20008,
+        MANA_QUERY_LINK_CONFIG = 0x2000A,
+        MANA_QUERY_PHY_STAT = 0x2000C,
         MANA_VTL2_ASSIGN_SERIAL_NUMBER = 0x27801,
         MANA_VTL2_MOVE_FILTER = 0x27802,
         MANA_VTL2_QUERY_FILTER_STATE = 0x27803,
+        // Privileged commands issued by a physical function.
+        MANA_REGISTER_FILTER = 0x28000,
+        MANA_DEREGISTER_FILTER = 0x28001,
+        MANA_REGISTER_HW_PORT = 0x28003,
+        MANA_DEREGISTER_HW_PORT = 0x28004,
+        MANA_QUERY_FILTER_CAP = 0x28007,
     }
+}
+
+/// BNIC command response status codes (`_BNIC_COMMAND_STATUS`), reported in the
+/// GDMA response header [`GdmaRespHdr::status`](super::GdmaRespHdr) for BNIC
+/// client messages. The device returns a distinct code per negative path; only
+/// the subset the emulator can produce is enumerated here.
+pub mod bnic_status {
+    /// The command completed successfully.
+    pub const SUCCESS: u32 = 0;
+    /// A receive-object fence operation failed: the work-queue-object handle was
+    /// valid but the fence itself could not be issued. Note this is *not* the
+    /// code for an unknown handle (that is [`INVALID_WQ_HANDLE`]); a handler
+    /// reaches this only after a successful handle lookup.
+    pub const FENCE_RQ_FAILED: u32 = 5;
+    /// The referenced vport handle does not exist (handle-addressed commands).
+    pub const INVALID_VPORT_HANDLE: u32 = 11;
+    /// The referenced vport index is out of range (index-addressed commands,
+    /// e.g. query vport configuration).
+    pub const INVALID_VPORT_INDEX: u32 = 28;
+    /// The referenced work-queue-object handle does not exist.
+    pub const INVALID_WQ_HANDLE: u32 = 29;
+    /// The work-queue type in the request is not valid for this command.
+    pub const INVALID_WQ_TYPE: u32 = 30;
+    /// A handler returned failure without setting a specific status. The device
+    /// pre-initializes every response to this code, so it is the generic BNIC
+    /// failure value.
+    pub const NOT_SET_BY_HANDLER: u32 = 31;
+    /// The queue type in the request is not supported by this command.
+    pub const UNSUPPORTED_QUEUE_TYPE: u32 = 36;
 }
 
 pub const MANA_QUERY_DEV_CONFIG_REQUEST_V1: u16 = 1;
@@ -36,16 +73,38 @@ pub const MANA_VTL2_ASSIGN_SERIAL_NUMBER_RESPONSE_V1: u16 = 1;
 pub const MANA_VTL2_QUERY_FILTER_STATE_REQUEST_V1: u16 = 1;
 pub const MANA_VTL2_QUERY_FILTER_STATE_RESPONSE_V1: u16 = 1;
 
+/// The device's nominal link speed in Mbps (200 Gbps), reported when no specific
+/// adapter link speed has been configured. Used both as the `link_speed_bps()`
+/// fallback and by the emulated `MANA_QUERY_LINK_CONFIG` handler so the two
+/// link-speed surfaces agree and the guest never observes an unknown/zero speed.
+pub const MANA_DEFAULT_LINK_SPEED_MBPS: u32 = 200_000;
+
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct BasicNicDriverFlags {
+    /// Operational link state and speed can be queried.
     #[bits(1)]
     pub query_link_status: u8,
+    /// Per-vport EtherType policy is enforced.
     #[bits(1)]
     pub ethertype_enforcement: u8,
+    /// VTL2 filter ownership can be queried.
     #[bits(1)]
     pub query_filter_state: u8,
-    #[bits(61)]
+    /// The asynchronous doorbell compatibility behavior is implemented.
+    #[bits(1)]
+    pub async_doorbell_fix: u8,
+    /// The device supports "MANA Direct": the VF presents networking straight to
+    /// the guest OS network stack, with no paired synthetic NIC to fail over to.
+    /// When set, the Windows MANA VF driver stack binds the guest TCP/IP stack
+    /// directly to the VF. When clear, it treats the VF as the accelerated
+    /// member of a synthetic/VF failover pair and does not bind TCP/IP to the VF
+    /// itself, so the guest configures the datapath but never transmits through
+    /// it. OpenVMM never pairs a synthetic NIC with the emulated MANA VF, so this
+    /// must be advertised for a Windows guest to bind and transmit.
+    #[bits(1)]
+    pub mana_direct: u8,
+    #[bits(59)]
     reserved: u64,
 }
 
@@ -73,7 +132,11 @@ pub struct ManaQueryDeviceCfgResp {
     pub pf_cap_flags4: u64,
 
     pub max_num_vports: u16,
-    pub reserved: u16,
+    /// Set by a PF in bare-metal-host mode; valid only in
+    /// [`crate::GDMA_MESSAGE_V3`] and later responses (the byte was reserved in
+    /// earlier versions).
+    pub bm_hostmode: u8,
+    pub reserved: u8,
     pub max_num_eqs: u32,
 
     pub adapter_mtu: u16,
@@ -89,6 +152,7 @@ impl std::fmt::Debug for ManaQueryDeviceCfgResp {
             .field("pf_cap_flags3", &self.pf_cap_flags3)
             .field("pf_cap_flags4", &self.pf_cap_flags4)
             .field("max_num_vports", &self.max_num_vports)
+            .field("bm_hostmode", &self.bm_hostmode)
             .field("reserved", &self.reserved)
             .field("max_num_eqs", &self.max_num_eqs)
             .field("adapter_mtu", &self.adapter_mtu)
@@ -108,6 +172,11 @@ impl ManaQueryDeviceCfgResp {
     pub fn cap_filter_state_query(&self) -> bool {
         self.pf_cap_flags1.query_filter_state() != 0
     }
+    /// Returns whether the device advertises MANA Direct (VF presents networking
+    /// directly to the guest OS, with no synthetic failover partner).
+    pub fn cap_mana_direct(&self) -> bool {
+        self.pf_cap_flags1.mana_direct() != 0
+    }
     /// Returns the adapter link speed in bits per second.
     /// Falls back to a default of 200 Gbps when the hardware does not report
     /// a link speed (OVL2 or lower responses return 0).
@@ -115,7 +184,7 @@ impl ManaQueryDeviceCfgResp {
         if self.adapter_link_speed_mbps > 0 {
             self.adapter_link_speed_mbps as u64 * 1000 * 1000
         } else {
-            200 * 1000 * 1000 * 1000
+            MANA_DEFAULT_LINK_SPEED_MBPS as u64 * 1000 * 1000
         }
     }
 }
@@ -137,6 +206,28 @@ pub struct ManaQueryVportCfgResp {
     pub mac_addr: [u8; 6],
     pub reserved2: [u8; 2],
     pub vport: u64,
+}
+
+/// `MANA_QUERY_LINK_CONFIG` request: the driver asks the device for the link
+/// speed of a vport (surfaced through ethtool and used to seed the QoS shaper).
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryLinkConfigReq {
+    pub vport: u64,
+}
+
+/// `MANA_QUERY_LINK_CONFIG` response. `link_speed_mbps` is the operational link
+/// speed; `qos_speed_mbps` is the rate the QoS shaper is clamped to when
+/// `qos_unconfigured` is 0 (otherwise no clamp is in effect). Layout mirrors
+/// `struct mana_query_link_config_resp` in the Linux MANA driver's `mana.h`.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryLinkConfigResp {
+    pub qos_speed_mbps: u32,
+    pub qos_unconfigured: u8,
+    pub reserved1: [u8; 3],
+    pub link_speed_mbps: u32,
+    pub reserved2: [u8; 4],
 }
 
 /* Move Filter invoked from VTL2 to move filter from VTL2 to VTL0 and back*/
@@ -170,6 +261,69 @@ pub struct ManaQueryFilterStateReq {
 pub struct ManaQueryFilterStateResponse {
     pub direction_to_vtl0: u8,
     pub reserved: [u8; 7],
+}
+
+/// Response to [`ManaCommandCode::MANA_QUERY_FILTER_CAP`]. An 8-byte body that
+/// follows the 32-byte GDMA response header for a 40-byte total (the request is
+/// header-only). Reports the device's receive-filter and receive-object
+/// capacity to a privileged physical-function client.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryFilterCapResponse {
+    pub max_num_filters: u32,
+    pub max_num_rx_objects: u32,
+}
+
+/// Prefix shared by the Linux and Windows
+/// [`ManaCommandCode::MANA_REGISTER_HW_PORT`] requests. Windows appends
+/// additional policy and MAC fields, which older devices may ignore.
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterHwVportReq {
+    pub attached_gfid: u16,
+    pub is_pf_default_vport: u8,
+    pub reserved1: u8,
+    pub allow_all_ether_types: u8,
+    pub reserved2: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterHwVportResp {
+    pub hw_vport_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaDeregisterHwVportReq {
+    pub hw_vport_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterFilterReq {
+    pub vport: u64,
+    pub mac_addr: [u8; 6],
+    pub reserved1: u8,
+    pub reserved2: u8,
+    pub reserved3: u8,
+    pub reserved4: u8,
+    pub reserved5: u16,
+    pub reserved6: u32,
+    pub reserved7: u32,
+    pub reserved8: u32,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaRegisterFilterResp {
+    pub filter_handle: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaDeregisterFilterReq {
+    pub filter_handle: u64,
 }
 
 #[repr(C)]
@@ -238,6 +392,22 @@ pub struct ManaCfgRxSteerReq {
     pub reserved: u8,
     pub default_rxobj: u64,
     pub hashkey: [u8; 40],
+    // A `GDMA_MESSAGE_V2` request (`mana_cfg_rx_steer_req_v2`) inserts
+    // `cqe_coalescing_enable: u8` followed by `reserved2: [u8; 7]` here, before
+    // the variable-length indirection table. The fixed struct stays at the V1
+    // layout; the table is located via `indir_tab_offset`, which accounts for
+    // the extra 8 bytes.
+}
+
+/// `GDMA_MESSAGE_V2` response body for `MANA_CONFIG_VPORT_RX`
+/// (`mana_cfg_rx_steer_resp`). Follows the `GdmaRespHdr` and reports the RX CQE
+/// coalescing window the device honors when the driver opts in via
+/// `cqe_coalescing_enable`.
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaCfgRxSteerResp {
+    pub cqe_coalescing_timeout_ns: u32,
+    pub reserved1: u32,
 }
 
 #[repr(transparent)]
@@ -291,6 +461,11 @@ pub const CQE_TX_GDMA_ERR: u8 = 42;
 
 pub const MANA_CQE_COMPLETION: u8 = 1;
 
+/// Number of per-packet info entries in a receive completion OOB. A
+/// `CQE_RX_COALESCED_4` carries up to this many packets, each described by one
+/// `ManaRxcompPerpktInfo`; a zero `pkt_len` terminates the batch.
+pub const MANA_RXCOMP_OOB_NUM_PPI: usize = 4;
+
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct ManaTxCompOob {
@@ -310,7 +485,7 @@ pub struct ManaTxCompOobOffsets {
 }
 
 #[repr(C)]
-#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct ManaRxcompPerpktInfo {
     pub pkt_len: u16,
     pub reserved1: u16,
@@ -323,7 +498,7 @@ pub struct ManaRxcompPerpktInfo {
 pub struct ManaRxcompOob {
     pub cqe_hdr: ManaCqeHeader,
     pub flags: ManaRxcompOobFlags,
-    pub ppi: [ManaRxcompPerpktInfo; 4],
+    pub ppi: [ManaRxcompPerpktInfo; MANA_RXCOMP_OOB_NUM_PPI],
     pub rx_wqe_offset: u32,
 }
 
@@ -346,6 +521,31 @@ pub struct ManaRxcompOobFlags {
     pub rx_udp_csum_fail: bool,
     pub reserved2: bool,
 }
+
+// Receive-side RSS hash-type codes reported in
+// [`ManaRxcompOobFlags::rx_hashtype`]. A value of zero means the device did not
+// compute a hash for the packet. These are the device's own hash-type codes:
+// they match the Linux MANA driver's `NDIS_HASH_*` values (`BIT(0)`..`BIT(8)`
+// in `include/net/mana/mana.h`), which the driver reads directly out of the
+// receive completion OOB and classifies via `MANA_HASH_L3` / `MANA_HASH_L4`.
+/// RSS hash computed over the IPv4 source and destination addresses.
+pub const MANA_HASH_IPV4: u16 = 1 << 0;
+/// RSS hash computed over the IPv4 4-tuple (addresses + TCP ports).
+pub const MANA_HASH_TCP_IPV4: u16 = 1 << 1;
+/// RSS hash computed over the IPv4 4-tuple (addresses + UDP ports).
+pub const MANA_HASH_UDP_IPV4: u16 = 1 << 2;
+/// RSS hash computed over the IPv6 source and destination addresses.
+pub const MANA_HASH_IPV6: u16 = 1 << 3;
+/// RSS hash computed over the IPv6 4-tuple (addresses + TCP ports).
+pub const MANA_HASH_TCP_IPV6: u16 = 1 << 4;
+/// RSS hash computed over the IPv6 4-tuple (addresses + UDP ports).
+pub const MANA_HASH_UDP_IPV6: u16 = 1 << 5;
+/// RSS hash computed over the IPv6 addresses including extension headers.
+pub const MANA_HASH_IPV6_EX: u16 = 1 << 6;
+/// RSS hash computed over the IPv6 TCP 4-tuple including extension headers.
+pub const MANA_HASH_TCP_IPV6_EX: u16 = 1 << 7;
+/// RSS hash computed over the IPv6 UDP 4-tuple including extension headers.
+pub const MANA_HASH_UDP_IPV6_EX: u16 = 1 << 8;
 
 #[bitfield(u64)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -431,6 +631,7 @@ pub const STATISTICS_FLAGS_HC_OUT_MCAST_PACKETS: u64 = 0x0000000000400000;
 pub const STATISTICS_FLAGS_HC_OUT_MCAST_OCTETS: u64 = 0x0000000000800000;
 pub const STATISTICS_FLAGS_HC_OUT_BCAST_PACKETS: u64 = 0x0000000001000000;
 pub const STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS: u64 = 0x0000000002000000;
+pub const STATISTICS_FLAGS_OUT_ERRORS_GDMA_ERROR: u64 = 0x0000000004000000;
 
 pub const STATISTICS_FLAGS_ALL: u64 = STATISTICS_FLAGS_IN_DISCARDS_NO_WQE
     | STATISTICS_FLAGS_IN_ERRORS_RX_VPORT_DISABLED
@@ -457,7 +658,8 @@ pub const STATISTICS_FLAGS_ALL: u64 = STATISTICS_FLAGS_IN_DISCARDS_NO_WQE
     | STATISTICS_FLAGS_HC_OUT_MCAST_PACKETS
     | STATISTICS_FLAGS_HC_OUT_MCAST_OCTETS
     | STATISTICS_FLAGS_HC_OUT_BCAST_PACKETS
-    | STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS;
+    | STATISTICS_FLAGS_HC_OUT_BCAST_OCTETS
+    | STATISTICS_FLAGS_OUT_ERRORS_GDMA_ERROR;
 
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -499,4 +701,22 @@ pub struct ManaQueryStatisticsResponse {
     pub hc_out_multicast_octets: u64,
     pub hc_out_broadcast_pkts: u64,
     pub hc_out_broadcast_octets: u64,
+    pub out_errors_gdma: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsRequest {
+    pub requested_statistics: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct ManaQueryPhyStatisticsResponse {
+    pub reported_statistics: u64,
+    pub rx_pkt_drop_phy: u64,
+    pub tx_pkt_drop_phy: u64,
+    pub pkt_tc_phy: [u64; 16],
+    pub byte_tc_phy: [u64; 16],
+    pub pause_tc_phy: [u64; 16],
 }

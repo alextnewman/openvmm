@@ -42,6 +42,7 @@ use gdma_defs::GdmaCreateQueueResp;
 use gdma_defs::GdmaDestroyDmaRegionReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDisableQueueReq;
+use gdma_defs::GdmaDmaRegionAddPagesReq;
 #[cfg(test)]
 use gdma_defs::GdmaGenerateResetEventReq;
 use gdma_defs::GdmaGenerateTestEventReq;
@@ -852,6 +853,43 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         dev_id: GdmaDevId,
         req: Req,
     ) -> anyhow::Result<(Resp, u32)> {
+        // A virtual function advertises a request size that matches the work
+        // request it posts.
+        let advertised_req_size = (size_of::<GdmaReqHdr>() + size_of_val(&req)) as u32;
+        self.request_version_advertising(
+            req_msg_type,
+            req_msg_version,
+            resp_msg_type,
+            resp_msg_version,
+            dev_id,
+            req,
+            advertised_req_size,
+        )
+        .await
+    }
+
+    /// Like [`Self::request_version`], but advertises `advertised_req_size` in
+    /// the request header's `msg_size` field independently of how many bytes the
+    /// work request actually carries. The work request always carries the full
+    /// `GdmaReqHdr` + `req`. A physical function exploits this split: it
+    /// advertises only the fixed base size of a variable-length request (for
+    /// example a `GDMA_CREATE_DMA_REGION` without its page-array trailer) and
+    /// relies on the device reading the true length from the work request's
+    /// out-of-band length. The device must therefore not treat `msg_size` as the
+    /// read bound. Exposed within the crate so tests can reproduce that split.
+    pub(crate) async fn request_version_advertising<
+        Req: IntoBytes + Immutable + KnownLayout,
+        Resp: IntoBytes + FromBytes + Immutable + KnownLayout,
+    >(
+        &mut self,
+        req_msg_type: u32,
+        req_msg_version: u16,
+        resp_msg_type: u32,
+        resp_msg_version: u16,
+        dev_id: GdmaDevId,
+        req: Req,
+        advertised_req_size: u32,
+    ) -> anyhow::Result<(Resp, u32)> {
         if self.reset_request_pending.is_some() {
             anyhow::bail!("HWC reset request pending");
         }
@@ -863,7 +901,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             msg_type: req_msg_type,
             msg_version: req_msg_version,
             hwc_msg_id: 0,
-            msg_size: (size_of::<GdmaReqHdr>() + size_of_val(&req)) as u32,
+            msg_size: advertised_req_size,
         };
         let expected_resp_hdr = GdmaMsgHdr {
             msg_type: resp_msg_type,
@@ -1463,37 +1501,70 @@ impl<T: DeviceBacking> GdmaDriver<T> {
         dev_id: GdmaDevId,
         mem: MemoryBlock,
     ) -> anyhow::Result<u64> {
+        // The HW channel request budget bounds how many page addresses fit in a
+        // single message. Send the first chunk in GDMA_CREATE_DMA_REGION and any
+        // remainder in follow-up GDMA_DMA_REGION_ADD_PAGES messages; the device
+        // assembles them into one region. A region that fits in one message
+        // (<= PAGES_PER_MSG pages) is described by a lone CREATE, exactly as
+        // before.
+        const PAGES_PER_MSG: usize = 16;
+
+        let length = mem.len() as u64;
+        let offset_in_page = mem.offset_in_page();
+        let page_addrs: Vec<u64> = mem.pfns().iter().map(|&pfn| pfn * PAGE_SIZE64).collect();
+        let total = page_addrs.len();
+        let mut chunks = page_addrs.chunks(PAGES_PER_MSG);
+        let first = chunks.next().context("region has no pages")?;
+
         #[repr(C)]
         #[derive(IntoBytes, Immutable, KnownLayout)]
-        struct Req {
+        struct CreateReq {
             req: GdmaCreateDmaRegionReq,
-            pages: [u64; 16],
+            pages: [u64; PAGES_PER_MSG],
         }
-        let pages = mem.pfns();
-        let mut req = Req {
+        let mut create = CreateReq {
             req: GdmaCreateDmaRegionReq {
-                length: mem.len() as u64,
-                offset_in_page: mem.offset_in_page(),
+                length,
+                offset_in_page,
                 gdma_page_type: GDMA_PAGE_TYPE_4K,
-                page_count: pages.len() as u32,
-                page_addr_list_len: pages.len() as u32,
+                page_count: total as u32,
+                page_addr_list_len: first.len() as u32,
             },
-            pages: [0; 16],
+            pages: [0; PAGES_PER_MSG],
         };
-        for (d, &s) in req.pages[..pages.len()].iter_mut().zip(pages) {
-            *d = s * PAGE_SIZE64;
-        }
+        create.pages[..first.len()].copy_from_slice(first);
         let resp: GdmaCreateDmaRegionResp = self
-            .request(GdmaRequestType::GDMA_CREATE_DMA_REGION.0, dev_id, req)
+            .request(GdmaRequestType::GDMA_CREATE_DMA_REGION.0, dev_id, create)
             .await?;
 
+        // Register the region for teardown before sending the remaining pages so
+        // a failure mid-stream still cleans up what the device created.
         arena.push(Resource::MemoryBlock(ManuallyDrop::new(mem)));
         arena.push(Resource::DmaRegion {
             dev_id,
             gdma_region: resp.gdma_region,
         });
 
-        // TODO: AddPages for larger region
+        #[repr(C)]
+        #[derive(IntoBytes, Immutable, KnownLayout)]
+        struct AddPagesReq {
+            req: GdmaDmaRegionAddPagesReq,
+            pages: [u64; PAGES_PER_MSG],
+        }
+        for chunk in chunks {
+            let mut add = AddPagesReq {
+                req: GdmaDmaRegionAddPagesReq {
+                    gdma_region: resp.gdma_region,
+                    page_addr_list_len: chunk.len() as u32,
+                    reserved: 0,
+                },
+                pages: [0; PAGES_PER_MSG],
+            };
+            add.pages[..chunk.len()].copy_from_slice(chunk);
+            self.request::<_, ()>(GdmaRequestType::GDMA_DMA_REGION_ADD_PAGES.0, dev_id, add)
+                .await?;
+        }
+
         Ok(resp.gdma_region)
     }
 

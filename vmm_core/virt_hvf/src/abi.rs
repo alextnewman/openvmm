@@ -99,9 +99,10 @@ unsafe extern "C" {
         ty: HvInterruptType,
         pending: bool,
     ) -> HvfResult;
-    #[expect(dead_code)]
-    pub fn hv_vcpu_get_vtimer_mask(vcpu: u64, vtimer_is_masked: *mut bool) -> HvfResult;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, vtimer_is_masked: bool) -> HvfResult;
+    /// Reads the offset used by `CNTVCT_EL0 = mach_absolute_time() - offset`.
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: u64, vtimer_offset: *mut u64) -> HvfResult;
+    pub fn mach_absolute_time() -> u64;
 }
 
 open_enum! {

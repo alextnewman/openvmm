@@ -9187,6 +9187,7 @@ dependencies = [
  "memory_range",
  "open_enum",
  "parking_lot",
+ "pci_core",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",

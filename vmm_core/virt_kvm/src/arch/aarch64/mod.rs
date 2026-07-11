@@ -20,7 +20,6 @@ use crate::gsi::KvmIrqFdState;
 use crate::gsi::MsiRouteBuilder;
 use aarch64defs::SystemReg;
 use aarch64defs::Vendor;
-use aarch64defs::gic::GicV2mRegister;
 use bitfield_struct::bitfield;
 use core::panic;
 use hvdef::Vtl;
@@ -995,11 +994,7 @@ impl MsiRouteBuilder for KvmGicV2mRouteBuilder {
             GicMsiController::V2m(v2m) => v2m,
             _ => panic!("partition does not expose a GICv2m MSI frame"),
         };
-        let setspi_addr = v2m.frame_base + GicV2mRegister::SETSPI_NS.0 as u64;
-        if address != setspi_addr {
-            return None;
-        }
-        if !(v2m.spi_base..v2m.spi_base + v2m.spi_count).contains(&data) {
+        if !virt::aarch64::gic_v2m::is_valid_msi(v2m, address, data) {
             return None;
         }
         // KVM expects the data to be the GIC SPI number, not the interrupt ID.

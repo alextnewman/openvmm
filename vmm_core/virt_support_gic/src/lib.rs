@@ -426,7 +426,7 @@ mod gicd {
                 GicdRegister::TYPER => GicdTyper::new()
                     .with_it_lines_number((self.max_spi_intid / 32) as u8)
                     .with_id_bits(5)
-                    // Match the Hyper-V GIC interface expected by ARM64 guests.
+                    // Hyper-V accepts SETSPI_NSR while keeping MBIS clear.
                     .with_security_extn(true)
                     .into(),
                 GicdRegister::IIDR => 0,
@@ -684,7 +684,7 @@ mod gicd {
         }
 
         #[test]
-        fn gicd_typer_reports_configured_intids() {
+        fn gicd_typer_reports_configured_intids_and_keeps_mbis_clear() {
             let d = dist();
             let mut value = [0; 4];
 
@@ -692,6 +692,7 @@ mod gicd {
 
             let typer = GicdTyper::from(u32::from_ne_bytes(value));
             assert_eq!(typer.it_lines_number(), 30);
+            assert!(!typer.mbis());
         }
 
         #[test]

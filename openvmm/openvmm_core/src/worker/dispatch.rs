@@ -536,9 +536,12 @@ fn build_aarch64_topology(
     use openvmm_defs::config::GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
     use vm_topology::processor::aarch64::GicItsInfo;
+    use vm_topology::processor::aarch64::GicMbiInfo;
     use vm_topology::processor::aarch64::GicMsiController;
     use vm_topology::processor::aarch64::GicV2mInfo;
 
+    // FreeBSD's Hyper-V ACPI path allocates distributor-backed MSIs from SPI 64.
+    const HYPERV_GIC_MBI_SPI_BASE: u32 = 64;
     const DEFAULT_GIC_V2M_SPI_COUNT: u32 = 64;
 
     let arch = match &config.arch {
@@ -643,8 +646,16 @@ fn build_aarch64_topology(
 
     // Build the GIC MSI controller from resolved SPIs.
     let gic_msi = if let Some(count) = v2m_spi_count {
+        // FreeBSD's Hyper-V path derives the MBI limit from GICD_TYPER, so this
+        // range must extend through the final SPI advertised by the GIC.
+        let mbi = (!is_gicv2 && gic_nr_irqs > HYPERV_GIC_MBI_SPI_BASE).then_some(GicMbiInfo {
+            base: gic_distributor_base,
+            spi_base: HYPERV_GIC_MBI_SPI_BASE,
+            spi_count: gic_nr_irqs - HYPERV_GIC_MBI_SPI_BASE,
+        });
         GicMsiController::V2m(GicV2mInfo {
             frame_base: openvmm_defs::config::DEFAULT_GIC_V2M_MSI_FRAME_BASE,
+            mbi,
             spi_base: spi_layout
                 .v2m_spi_base
                 .expect("v2m base must be allocated when v2m_spi_count is Some"),

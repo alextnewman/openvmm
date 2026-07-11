@@ -4,6 +4,8 @@
 use self::bnic_defs::CQE_RX_OBJECT_FENCE;
 use self::bnic_defs::CQE_RX_TRUNCATED;
 use self::bnic_defs::CQE_TX_GDMA_ERR;
+use self::bnic_defs::CQE_TX_HDR_PROCESSING_ERROR;
+use self::bnic_defs::CQE_TX_INVALID_OOB;
 use self::bnic_defs::CQE_TX_OKAY;
 use self::bnic_defs::MANA_CQE_COMPLETION;
 use self::bnic_defs::MANA_LONG_PKT_FMT;
@@ -50,6 +52,8 @@ use gdma_defs::GDMA_MESSAGE_V2;
 use gdma_defs::GDMA_STATUS_CMD_UNSUPPORTED;
 use gdma_defs::GdmaQueueType;
 use gdma_defs::GdmaReqHdr;
+use gdma_defs::Sge;
+use gdma_defs::WQE_ALIGNMENT;
 use gdma_defs::Wqe;
 use gdma_defs::access::WqeAccess;
 use gdma_defs::bnic as bnic_defs;
@@ -75,12 +79,17 @@ use net_backend::RxBufferSegment;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
 use net_backend::RxMetadata;
+use net_backend::TxCompletion;
+use net_backend::TxCompletionStatus;
+use net_backend::TxEncapsulationMetadata;
 use net_backend::TxId;
 use net_backend::TxMetadata;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use net_backend_resources::mac_address::MacAddress;
 use slab::Slab;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -400,6 +409,7 @@ struct Vport {
     mac_address: MacAddress,
     endpoint: TaskControl<EndpointState, Option<mesh::OneshotSender<()>>>,
     max_backend_queues: u16,
+    tx_encapsulation: bool,
     /// One datapath task per active queue pair. Empty when the receive path is
     /// disabled.
     tasks: Vec<TaskControl<TxRxState, TxRxTask>>,
@@ -659,6 +669,7 @@ async fn start_vport_datapath(
             .map(|i| SqChannel {
                 sq_id: vport.queue_cfg.tx[i].wq_id,
                 sq_cq_id: vport.queue_cfg.tx[i].cq_id,
+                pending_tx: VecDeque::new(),
             })
             .collect();
 
@@ -715,6 +726,10 @@ async fn start_vport_datapath(
                 epqueue,
                 pool,
                 sqs,
+                tx_encapsulation: vport.tx_encapsulation,
+                next_tx_id: 0,
+                pending_backend: HashMap::new(),
+                pending_submissions: VecDeque::new(),
                 rq_id,
                 rq_cq_id,
                 tx_segment_buffer: Vec::new(),
@@ -767,6 +782,271 @@ struct QueueCfg {
 struct SqChannel {
     sq_id: u32,
     sq_cq_id: u32,
+    pending_tx: VecDeque<PendingTx>,
+}
+
+struct PendingTx {
+    wqe_offset: u32,
+    suppress_cqe: bool,
+    state: PendingTxState,
+}
+
+enum PendingTxState {
+    WaitingForSubmission(u32),
+    WaitingForBackend(u32),
+    Ready(u8),
+}
+
+struct PendingSubmission {
+    backend_id: u32,
+    slot: usize,
+    segments: Vec<TxSegment>,
+}
+
+struct TxOffloadGeometry {
+    l2_len: u8,
+    l3_len: u16,
+    transport_header_offset: u16,
+    is_ipv4: bool,
+    is_ipv6: bool,
+    vlan: Option<net_backend::VlanMetadata>,
+    encapsulation: Option<TxEncapsulationMetadata>,
+}
+
+fn tx_offload_geometry(oob: &ManaTxOob) -> anyhow::Result<TxOffloadGeometry> {
+    let is_long = oob.s_oob.pkt_fmt() == MANA_LONG_PKT_FMT;
+    let trans_off = oob.s_oob.trans_off();
+    let vlan = (is_long && oob.l_oob.inject_vlan_pri_tag()).then(|| {
+        net_backend::VlanMetadata::new()
+            .with_priority(oob.l_oob.pcp())
+            .with_drop_eligible_indicator(oob.l_oob.dei())
+            .with_vlan_id(oob.l_oob.vlan_id())
+    });
+
+    if is_long && oob.l_oob.is_encap() {
+        if oob.s_oob.is_outer_ipv4() == oob.s_oob.is_outer_ipv6() {
+            anyhow::bail!("encapsulated TX must select exactly one outer IP version");
+        }
+        let inner_ip_offset = oob.l_oob.inner_frame_offset() + oob.l_oob.inner_ip_rel_offset();
+        let l2_len: u8 = inner_ip_offset
+            .try_into()
+            .map_err(|_| anyhow!("encapsulated TX inner IP offset exceeds backend limit"))?;
+        let l3_len = trans_off
+            .checked_sub(inner_ip_offset)
+            .context("encapsulated TX transport offset precedes inner IP header")?;
+
+        Ok(TxOffloadGeometry {
+            l2_len,
+            l3_len,
+            transport_header_offset: trans_off,
+            is_ipv4: !oob.l_oob.inner_is_ipv6(),
+            is_ipv6: oob.l_oob.inner_is_ipv6(),
+            vlan,
+            encapsulation: Some(TxEncapsulationMetadata {
+                outer_is_ipv4: oob.s_oob.is_outer_ipv4(),
+                outer_is_ipv6: oob.s_oob.is_outer_ipv6(),
+                inner_frame_offset: oob.l_oob.inner_frame_offset(),
+                inner_ip_rel_offset: oob.l_oob.inner_ip_rel_offset() as u8,
+                inner_tcp_options: oob.l_oob.inner_tcp_opt(),
+            }),
+        })
+    } else {
+        let l2_len = if vlan.is_some() {
+            net_backend::ETHERNET_VLAN_HEADER_LEN
+        } else {
+            net_backend::ETHERNET_HEADER_LEN
+        } as u8;
+
+        Ok(TxOffloadGeometry {
+            l2_len,
+            l3_len: trans_off.clamp(l2_len as u16, 255) - l2_len as u16,
+            transport_header_offset: trans_off,
+            is_ipv4: oob.s_oob.is_outer_ipv4(),
+            is_ipv6: oob.s_oob.is_outer_ipv6() && !oob.s_oob.is_outer_ipv4(),
+            vlan,
+            encapsulation: None,
+        })
+    }
+}
+
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+
+fn tx_packet_prefix_len(oob: &ManaTxOob, total_len: usize, lso: bool) -> usize {
+    let inner_ip_offset =
+        usize::from(oob.l_oob.inner_frame_offset() + oob.l_oob.inner_ip_rel_offset());
+    let transport_offset = usize::from(oob.s_oob.trans_off());
+    let ip_end = inner_ip_offset + usize::from(net_backend::IPV6_MIN_HEADER_LEN);
+    let transport_end = if oob.s_oob.comp_tcp_csum() || lso {
+        transport_offset + 60
+    } else if oob.s_oob.comp_udp_csum() {
+        transport_offset + 8
+    } else {
+        transport_offset
+    };
+    total_len.min(ip_end.max(transport_end))
+}
+
+fn read_tx_prefix(memory: &GuestMemory, sgl: &[Sge], len: usize) -> anyhow::Result<Vec<u8>> {
+    let mut packet = vec![0; len];
+    let mut offset = 0;
+    for sge in sgl {
+        if offset == len {
+            break;
+        }
+        let copy_len = (sge.size as usize).min(len - offset);
+        memory
+            .read_at(sge.address, &mut packet[offset..offset + copy_len])
+            .context("reading encapsulated TX headers")?;
+        offset += copy_len;
+    }
+    if offset != len {
+        anyhow::bail!("TX SGL is shorter than its reported packet length");
+    }
+    Ok(packet)
+}
+
+fn ipv6_transport_protocol(
+    packet: &[u8],
+    ip_offset: usize,
+    transport_offset: usize,
+) -> anyhow::Result<u8> {
+    let header = packet
+        .get(ip_offset..ip_offset + net_backend::IPV6_MIN_HEADER_LEN as usize)
+        .context("truncated inner IPv6 header")?;
+    let mut next_header = header[6];
+    let mut offset = ip_offset + net_backend::IPV6_MIN_HEADER_LEN as usize;
+
+    while offset < transport_offset {
+        let (following, extension_len) = match next_header {
+            // Hop-by-hop options, routing, and destination options.
+            0 | 43 | 60 => {
+                let extension = packet
+                    .get(offset..offset + 2)
+                    .context("truncated inner IPv6 extension header")?;
+                (extension[0], (usize::from(extension[1]) + 1) * 8)
+            }
+            // Authentication header.
+            51 => {
+                let extension = packet
+                    .get(offset..offset + 2)
+                    .context("truncated inner IPv6 authentication header")?;
+                (extension[0], (usize::from(extension[1]) + 2) * 4)
+            }
+            44 => anyhow::bail!("fragmented inner IPv6 offload is unsupported"),
+            IPPROTO_TCP | IPPROTO_UDP => {
+                anyhow::bail!("inner IPv6 transport header precedes TX transport offset")
+            }
+            protocol => {
+                anyhow::bail!("unsupported inner IPv6 extension protocol {protocol}")
+            }
+        };
+        offset = offset
+            .checked_add(extension_len)
+            .context("inner IPv6 extension length overflow")?;
+        if offset > transport_offset {
+            anyhow::bail!("inner IPv6 extension header crosses TX transport offset");
+        }
+        next_header = following;
+    }
+
+    if offset != transport_offset {
+        anyhow::bail!("inner IPv6 transport offset does not follow the header chain");
+    }
+    Ok(next_header)
+}
+
+fn validate_encapsulated_tx(
+    oob: &ManaTxOob,
+    geometry: &TxOffloadGeometry,
+    packet: &[u8],
+    total_len: usize,
+    lso: bool,
+) -> anyhow::Result<Option<u8>> {
+    let inner_ip_offset = usize::from(geometry.l2_len);
+    let transport_offset = usize::from(geometry.transport_header_offset);
+    let tcp = oob.s_oob.comp_tcp_csum() || lso;
+    let udp = oob.s_oob.comp_udp_csum();
+
+    if tcp && udp {
+        anyhow::bail!("encapsulated TX requests both TCP and UDP offload");
+    }
+    if oob.s_oob.comp_iphdr_csum() && geometry.is_ipv6 {
+        anyhow::bail!("encapsulated TX requests an IPv4 checksum for inner IPv6");
+    }
+    if transport_offset > total_len {
+        anyhow::bail!("encapsulated TX transport offset exceeds packet length");
+    }
+
+    let protocol = if geometry.is_ipv4 {
+        let header = packet
+            .get(inner_ip_offset..inner_ip_offset + net_backend::IPV4_MIN_HEADER_LEN as usize)
+            .context("truncated inner IPv4 header")?;
+        if header[0] >> 4 != 4 {
+            anyhow::bail!("inner IP version does not match inner_is_ipv6");
+        }
+        let header_len = usize::from(header[0] & 0x0f) * 4;
+        if header_len < net_backend::IPV4_MIN_HEADER_LEN as usize {
+            anyhow::bail!("inner IPv4 header length is too small");
+        }
+        packet
+            .get(inner_ip_offset..inner_ip_offset + header_len)
+            .context("truncated inner IPv4 options")?;
+        if inner_ip_offset + header_len != transport_offset {
+            anyhow::bail!("inner IPv4 header does not end at TX transport offset");
+        }
+        if tcp || udp {
+            let fragments = u16::from_be_bytes([header[6], header[7]]);
+            if fragments & 0x3fff != 0 {
+                anyhow::bail!("fragmented inner IPv4 offload is unsupported");
+            }
+        }
+        header[9]
+    } else {
+        let header = packet
+            .get(inner_ip_offset..inner_ip_offset + net_backend::IPV6_MIN_HEADER_LEN as usize)
+            .context("truncated inner IPv6 header")?;
+        if header[0] >> 4 != 6 {
+            anyhow::bail!("inner IP version does not match inner_is_ipv6");
+        }
+        ipv6_transport_protocol(packet, inner_ip_offset, transport_offset)?
+    };
+
+    if tcp {
+        if protocol != IPPROTO_TCP {
+            anyhow::bail!("encapsulated TCP offload does not target an inner TCP header");
+        }
+        let header = packet
+            .get(transport_offset..transport_offset + 20)
+            .context("truncated inner TCP header")?;
+        let header_len = usize::from(header[12] >> 4) * 4;
+        if header_len < 20 {
+            anyhow::bail!("inner TCP header length is too small");
+        }
+        packet
+            .get(transport_offset..transport_offset + header_len)
+            .context("truncated inner TCP options")?;
+        if oob.l_oob.inner_tcp_opt() != (header_len > 20) {
+            anyhow::bail!("inner_tcp_opt does not match the inner TCP header");
+        }
+        Ok(Some(header_len as u8))
+    } else if udp {
+        if protocol != IPPROTO_UDP {
+            anyhow::bail!("encapsulated UDP offload does not target an inner UDP header");
+        }
+        packet
+            .get(transport_offset..transport_offset + 8)
+            .context("truncated inner UDP header")?;
+        if oob.l_oob.inner_tcp_opt() {
+            anyhow::bail!("inner_tcp_opt is set for an inner UDP packet");
+        }
+        Ok(None)
+    } else {
+        if oob.l_oob.inner_tcp_opt() {
+            anyhow::bail!("inner_tcp_opt is set without TCP offload");
+        }
+        Ok(None)
+    }
 }
 
 impl BasicNic {
@@ -782,10 +1062,12 @@ impl BasicNic {
                  }| {
                     assert!(endpoint.is_ordered());
                     let max_backend_queues = endpoint.multiqueue_support().max_queues;
+                    let tx_encapsulation = endpoint.tx_offload_support().encapsulation;
                     Vport {
                         mac_address,
                         endpoint: TaskControl::new(EndpointState { endpoint }),
                         max_backend_queues,
+                        tx_encapsulation,
                         tasks: Vec::new(),
                         queue_cfg: QueueCfg::default(),
                         serial_no: 0,
@@ -1424,6 +1706,10 @@ pub struct TxRxTask {
     /// several only when the guest created more queue pairs than the backend can
     /// service.
     sqs: Vec<SqChannel>,
+    tx_encapsulation: bool,
+    next_tx_id: u32,
+    pending_backend: HashMap<u32, usize>,
+    pending_submissions: VecDeque<PendingSubmission>,
     rq_id: u32,
     rq_cq_id: u32,
     tx_segment_buffer: Vec<TxSegment>,
@@ -1460,7 +1746,7 @@ impl TxRxTask {
         let max_rx_buf = 256;
 
         enum Event {
-            Sqe(usize, Wqe),
+            Sqe(usize, u32, Wqe),
             Rqe(u32, Wqe),
             Ready,
             Fence,
@@ -1489,9 +1775,16 @@ impl TxRxTask {
                         return Poll::Ready(Event::Rqe(wqe_offset, wqe));
                     }
                 }
+                if !self.pending_submissions.is_empty()
+                    && self.epqueue.poll_ready(cx, &mut self.pool).is_ready()
+                {
+                    return Poll::Ready(Event::Ready);
+                }
                 for (slot, sq) in self.sqs.iter().enumerate() {
-                    if let Poll::Ready(wqe) = self.queues.poll_sq(sq.sq_id, cx) {
-                        return Poll::Ready(Event::Sqe(slot, wqe));
+                    if let Poll::Ready((wqe_offset, wqe)) =
+                        self.queues.poll_sq_with_offset(sq.sq_id, cx)
+                    {
+                        return Poll::Ready(Event::Sqe(slot, wqe_offset, wqe));
                     }
                 }
                 if self.epqueue.poll_ready(cx, &mut self.pool).is_ready() {
@@ -1501,15 +1794,21 @@ impl TxRxTask {
             })
             .await;
             match event {
-                Event::Sqe(slot, sqe) => self.process_sqe(slot, sqe)?,
-                Event::Rqe(wqe_offset, wqe) => self.process_rqe(wqe, wqe_offset)?,
-                Event::Ready => self.process_backend()?,
+                Event::Sqe(slot, wqe_offset, sqe) => self.process_sqe(slot, wqe_offset, sqe)?,
+                Event::Rqe(wqe_offset, wqe) => {
+                    self.process_rqe(wqe, wqe_offset)?;
+                    self.retry_pending_tx()?;
+                }
+                Event::Ready => {
+                    self.process_backend()?;
+                    self.retry_pending_tx()?;
+                }
                 Event::Fence => self.post_fence()?,
             }
         }
     }
 
-    fn process_sqe(&mut self, slot: usize, sqe: Wqe) -> anyhow::Result<()> {
+    fn process_sqe(&mut self, slot: usize, wqe_offset: u32, sqe: Wqe) -> anyhow::Result<()> {
         tracing::trace!("tx wqe");
         let oob = sqe.oob();
         let oob = if oob.len() >= size_of::<ManaTxOob>() {
@@ -1523,46 +1822,114 @@ impl TxRxTask {
                 ..FromZeros::new_zeroed()
             }
         };
+        let suppress_cqe = oob.s_oob.suppress_txcqe_gen();
 
         let sge0 = sqe.sgl().first().context("no sgl")?;
         let total_len: usize = sqe.sgl().iter().map(|sge| sge.size as usize).sum();
-        let (l2_len, vlan) =
-            if oob.s_oob.pkt_fmt() == MANA_LONG_PKT_FMT && oob.l_oob.inject_vlan_pri_tag() {
-                (
-                    net_backend::ETHERNET_VLAN_HEADER_LEN,
-                    Some(
-                        net_backend::VlanMetadata::new()
-                            .with_priority(oob.l_oob.pcp())
-                            .with_drop_eligible_indicator(oob.l_oob.dei())
-                            .with_vlan_id(oob.l_oob.vlan_id()),
-                    ),
-                )
-            } else {
-                (net_backend::ETHERNET_HEADER_LEN, None)
+        let lso = sqe.header.params.client_oob_in_sgl();
+        let geometry = match tx_offload_geometry(&oob) {
+            Ok(geometry) => geometry,
+            Err(err) => {
+                tracelimit::error_ratelimited!(
+                    error = %err,
+                    "invalid TX OOB geometry"
+                );
+                self.queue_tx_completion(
+                    slot,
+                    wqe_offset,
+                    suppress_cqe,
+                    PendingTxState::Ready(CQE_TX_INVALID_OOB),
+                )?;
+                return Ok(());
+            }
+        };
+        if geometry.encapsulation.is_some() && !self.tx_encapsulation {
+            tracelimit::error_ratelimited!(
+                "encapsulated TX is unsupported by the configured backend"
+            );
+            self.queue_tx_completion(
+                slot,
+                wqe_offset,
+                suppress_cqe,
+                PendingTxState::Ready(CQE_TX_INVALID_OOB),
+            )?;
+            return Ok(());
+        }
+
+        let encapsulated_l4_len = if geometry.encapsulation.is_some() {
+            let prefix_len = tx_packet_prefix_len(&oob, total_len, lso);
+            let packet = match read_tx_prefix(self.pool.guest_memory(), sqe.sgl(), prefix_len) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    tracelimit::error_ratelimited!(
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "failed to read encapsulated TX headers"
+                    );
+                    self.queue_tx_completion(
+                        slot,
+                        wqe_offset,
+                        suppress_cqe,
+                        PendingTxState::Ready(CQE_TX_GDMA_ERR),
+                    )?;
+                    return Ok(());
+                }
             };
+            match validate_encapsulated_tx(&oob, &geometry, &packet, total_len, lso) {
+                Ok(l4_len) => l4_len,
+                Err(err) => {
+                    tracelimit::error_ratelimited!(
+                        error = %err,
+                        "invalid encapsulated TX packet"
+                    );
+                    self.queue_tx_completion(
+                        slot,
+                        wqe_offset,
+                        suppress_cqe,
+                        PendingTxState::Ready(CQE_TX_INVALID_OOB),
+                    )?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        if lso && sqe.header.params.gd_client_unit_data() == 0 {
+            tracelimit::error_ratelimited!("LSO enabled with a zero MSS");
+            self.queue_tx_completion(
+                slot,
+                wqe_offset,
+                suppress_cqe,
+                PendingTxState::Ready(CQE_TX_INVALID_OOB),
+            )?;
+            return Ok(());
+        }
+
+        let backend_id = self.allocate_backend_tx_id()?;
 
         let mut meta = TxMetadata {
-            id: TxId(slot as u32),
+            id: TxId(backend_id),
             segment_count: sqe.sgl().len().try_into().unwrap(),
             len: total_len.try_into().unwrap(),
             flags: net_backend::TxFlags::new()
                 .with_offload_ip_header_checksum(oob.s_oob.comp_iphdr_csum())
                 .with_offload_tcp_checksum(oob.s_oob.comp_tcp_csum())
                 .with_offload_udp_checksum(oob.s_oob.comp_udp_csum())
-                .with_is_ipv4(oob.s_oob.is_outer_ipv4())
-                .with_is_ipv6(oob.s_oob.is_outer_ipv6() && !oob.s_oob.is_outer_ipv4()),
-            l2_len: l2_len as u8,
-            l3_len: oob.s_oob.trans_off().clamp(l2_len as u16, 255) - l2_len as u16,
+                .with_is_ipv4(geometry.is_ipv4)
+                .with_is_ipv6(geometry.is_ipv6),
+            l2_len: geometry.l2_len,
+            l3_len: geometry.l3_len,
             l4_len: 0,
-            transport_header_offset: oob.s_oob.trans_off(),
+            transport_header_offset: geometry.transport_header_offset,
             max_segment_size: 0,
-            vlan,
+            vlan: geometry.vlan,
+            encapsulation: geometry.encapsulation,
         };
 
-        if sqe.header.params.client_oob_in_sgl() {
-            meta.l4_len =
+        if lso {
+            meta.l4_len = encapsulated_l4_len.unwrap_or_else(|| {
                 sge0.size
-                    .saturating_sub(meta.l2_len as u32 + meta.l3_len as u32) as u8;
+                    .saturating_sub(meta.l2_len as u32 + meta.l3_len as u32) as u8
+            });
             meta.max_segment_size = sqe.header.params.gd_client_unit_data();
             meta.flags.set_offload_tcp_segmentation(true);
         }
@@ -1578,7 +1945,12 @@ impl TxRxTask {
                     sgl_count = sqe.sgl().len(),
                     "LSO enabled, but only one SGE"
                 );
-                self.post_tx_completion_error(slot);
+                self.queue_tx_completion(
+                    slot,
+                    wqe_offset,
+                    suppress_cqe,
+                    PendingTxState::Ready(CQE_TX_GDMA_ERR),
+                )?;
                 return Ok(());
             }
             if sge0.size > 256 {
@@ -1586,7 +1958,12 @@ impl TxRxTask {
                     sge0_size = sge0.size,
                     "LSO enabled and SGE[0] size > 256 bytes"
                 );
-                self.post_tx_completion_error(slot);
+                self.queue_tx_completion(
+                    slot,
+                    wqe_offset,
+                    suppress_cqe,
+                    PendingTxState::Ready(CQE_TX_GDMA_ERR),
+                )?;
                 return Ok(());
             }
         }
@@ -1605,43 +1982,244 @@ impl TxRxTask {
                 len: sge.size,
             });
         }
-        let (sync, count) = self.epqueue.tx_avail(&mut self.pool, tx_segments)?;
-        if sync || count == 0 {
+        let tx_segments = std::mem::take(tx_segments);
+        self.submit_or_defer_tx(backend_id, slot, wqe_offset, suppress_cqe, tx_segments)?;
+        Ok(())
+    }
+
+    fn submit_or_defer_tx(
+        &mut self,
+        backend_id: u32,
+        slot: usize,
+        wqe_offset: u32,
+        suppress_cqe: bool,
+        segments: Vec<TxSegment>,
+    ) -> anyhow::Result<()> {
+        if self.pending_submissions.is_empty() {
+            let (sync, count) = self.epqueue.tx_avail(&mut self.pool, &segments)?;
+            if count == segments.len() {
+                self.finish_initial_tx_submission(
+                    backend_id,
+                    slot,
+                    wqe_offset,
+                    suppress_cqe,
+                    sync,
+                )?;
+                self.recycle_tx_segments(segments);
+                return Ok(());
+            }
+            if count != 0 {
+                anyhow::bail!(
+                    "backend accepted {count} of {} segments from one TX packet",
+                    segments.len()
+                );
+            }
+        }
+
+        self.queue_tx_completion(
+            slot,
+            wqe_offset,
+            suppress_cqe,
+            PendingTxState::WaitingForSubmission(backend_id),
+        )?;
+        self.pending_submissions.push_back(PendingSubmission {
+            backend_id,
+            slot,
+            segments,
+        });
+        Ok(())
+    }
+
+    fn finish_initial_tx_submission(
+        &mut self,
+        backend_id: u32,
+        slot: usize,
+        wqe_offset: u32,
+        suppress_cqe: bool,
+        sync: bool,
+    ) -> anyhow::Result<()> {
+        let state = if sync {
             tracing::trace!("tx sync complete");
-            self.post_tx_completion(slot);
+            PendingTxState::Ready(CQE_TX_OKAY)
+        } else {
+            if self.pending_backend.insert(backend_id, slot).is_some() {
+                anyhow::bail!("reused pending backend TX id {backend_id}");
+            }
+            PendingTxState::WaitingForBackend(backend_id)
+        };
+        self.queue_tx_completion(slot, wqe_offset, suppress_cqe, state)
+    }
+
+    fn retry_pending_tx(&mut self) -> anyhow::Result<()> {
+        while let Some(submission) = self.pending_submissions.pop_front() {
+            let (sync, count) = self
+                .epqueue
+                .tx_avail(&mut self.pool, &submission.segments)?;
+            if count == 0 {
+                self.pending_submissions.push_front(submission);
+                break;
+            }
+            if count != submission.segments.len() {
+                anyhow::bail!(
+                    "backend accepted {count} of {} segments from one TX packet",
+                    submission.segments.len()
+                );
+            }
+
+            self.finish_deferred_tx_submission(submission.backend_id, submission.slot, sync)?;
+            self.recycle_tx_segments(submission.segments);
         }
         Ok(())
     }
 
-    // Possible test improvement: provide proper OOB data for the GDMA error.
-    fn post_tx_completion_error(&mut self, slot: usize) {
-        let sq = &self.sqs[slot.min(self.sqs.len() - 1)];
-        let (sq_cq_id, sq_id) = (sq.sq_cq_id, sq.sq_id);
-        let tx_oob = ManaTxCompOob {
-            cqe_hdr: ManaCqeHeader::new()
-                .with_client_type(MANA_CQE_COMPLETION)
-                .with_cqe_type(CQE_TX_GDMA_ERR),
-            tx_data_offset: 0,
-            offsets: ManaTxCompOobOffsets::new(),
-            reserved: [0; 12],
+    fn finish_deferred_tx_submission(
+        &mut self,
+        backend_id: u32,
+        slot: usize,
+        sync: bool,
+    ) -> anyhow::Result<()> {
+        if !sync && self.pending_backend.insert(backend_id, slot).is_some() {
+            anyhow::bail!("reused pending backend TX id {backend_id}");
+        }
+        let pending = self
+            .sqs
+            .get_mut(slot)
+            .with_context(|| format!("invalid TX queue slot {slot}"))?
+            .pending_tx
+            .iter_mut()
+            .find(|pending| {
+                matches!(
+                    &pending.state,
+                    PendingTxState::WaitingForSubmission(id) if *id == backend_id
+                )
+            })
+            .with_context(|| format!("submitted backend TX id {backend_id} with no pending WQE"))?;
+        pending.state = if sync {
+            tracing::trace!("deferred tx sync complete");
+            PendingTxState::Ready(CQE_TX_OKAY)
+        } else {
+            PendingTxState::WaitingForBackend(backend_id)
         };
-        self.queues
-            .post_cq(sq_cq_id, tx_oob.as_bytes(), sq_id, true);
+        self.drain_tx_completions(slot)
     }
 
-    fn post_tx_completion(&mut self, slot: usize) {
-        let sq = &self.sqs[slot.min(self.sqs.len() - 1)];
+    fn recycle_tx_segments(&mut self, mut segments: Vec<TxSegment>) {
+        segments.clear();
+        if segments.capacity() > self.tx_segment_buffer.capacity() {
+            self.tx_segment_buffer = segments;
+        }
+    }
+
+    fn allocate_backend_tx_id(&mut self) -> anyhow::Result<u32> {
+        let first = self.next_tx_id;
+        loop {
+            let id = self.next_tx_id;
+            self.next_tx_id = self.next_tx_id.wrapping_add(1);
+            if !self.pending_backend.contains_key(&id)
+                && !self
+                    .pending_submissions
+                    .iter()
+                    .any(|submission| submission.backend_id == id)
+            {
+                return Ok(id);
+            }
+            if self.next_tx_id == first {
+                anyhow::bail!("exhausted backend TX ids");
+            }
+        }
+    }
+
+    fn queue_tx_completion(
+        &mut self,
+        slot: usize,
+        wqe_offset: u32,
+        suppress_cqe: bool,
+        state: PendingTxState,
+    ) -> anyhow::Result<()> {
+        self.sqs
+            .get_mut(slot)
+            .with_context(|| format!("invalid TX queue slot {slot}"))?
+            .pending_tx
+            .push_back(PendingTx {
+                wqe_offset,
+                suppress_cqe,
+                state,
+            });
+        self.drain_tx_completions(slot)
+    }
+
+    fn complete_backend_tx(&mut self, completion: TxCompletion) -> anyhow::Result<()> {
+        let backend_id = completion.id.0;
+        let slot = self
+            .pending_backend
+            .remove(&backend_id)
+            .with_context(|| format!("backend completed unknown TX id {backend_id}"))?;
+        let cqe_type = match completion.status {
+            TxCompletionStatus::Success => CQE_TX_OKAY,
+            TxCompletionStatus::InvalidOffload => CQE_TX_INVALID_OOB,
+            TxCompletionStatus::Failed => CQE_TX_HDR_PROCESSING_ERROR,
+        };
+        let pending = self
+            .sqs
+            .get_mut(slot)
+            .with_context(|| format!("backend completed invalid TX queue slot {slot}"))?
+            .pending_tx
+            .iter_mut()
+            .find(|pending| {
+                matches!(
+                    &pending.state,
+                    PendingTxState::WaitingForBackend(id) if *id == backend_id
+                )
+            })
+            .with_context(|| format!("backend completed TX id {backend_id} with no pending WQE"))?;
+        pending.state = PendingTxState::Ready(cqe_type);
+        self.drain_tx_completions(slot)
+    }
+
+    fn drain_tx_completions(&mut self, slot: usize) -> anyhow::Result<()> {
+        loop {
+            let pending = {
+                let sq = self
+                    .sqs
+                    .get_mut(slot)
+                    .with_context(|| format!("invalid TX queue slot {slot}"))?;
+                if !matches!(
+                    sq.pending_tx.front().map(|pending| &pending.state),
+                    Some(PendingTxState::Ready(_))
+                ) {
+                    break;
+                }
+                sq.pending_tx.pop_front().unwrap()
+            };
+            let PendingTxState::Ready(cqe_type) = pending.state else {
+                unreachable!()
+            };
+            if cqe_type != CQE_TX_OKAY || !pending.suppress_cqe {
+                self.post_tx_completion(slot, pending.wqe_offset, cqe_type)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn post_tx_completion(&self, slot: usize, wqe_offset: u32, cqe_type: u8) -> anyhow::Result<()> {
+        let sq = self
+            .sqs
+            .get(slot)
+            .with_context(|| format!("invalid TX queue slot {slot}"))?;
         let (sq_cq_id, sq_id) = (sq.sq_cq_id, sq.sq_id);
+        debug_assert!(wqe_offset.is_multiple_of(WQE_ALIGNMENT as u32));
         let tx_oob = ManaTxCompOob {
             cqe_hdr: ManaCqeHeader::new()
                 .with_client_type(MANA_CQE_COMPLETION)
-                .with_cqe_type(CQE_TX_OKAY),
+                .with_cqe_type(cqe_type),
             tx_data_offset: 0,
-            offsets: ManaTxCompOobOffsets::new(),
+            offsets: ManaTxCompOobOffsets::new()
+                .with_tx_wqe_offset(wqe_offset / WQE_ALIGNMENT as u32),
             reserved: [0; 12],
         };
         self.queues
             .post_cq(sq_cq_id, tx_oob.as_bytes(), sq_id, true);
+        Ok(())
     }
 
     fn process_rqe(&mut self, wqe: Wqe, wqe_offset: u32) -> anyhow::Result<()> {
@@ -1689,12 +2267,36 @@ impl TxRxTask {
             self.rx_buf_count -= n as u32;
         }
 
-        let mut packets = [TxId(0)];
-        if self.epqueue.tx_poll(&mut self.pool, &mut packets)? > 0 {
+        let mut packets = [TxCompletion {
+            id: TxId(0),
+            status: TxCompletionStatus::Success,
+        }];
+        let completed = match self
+            .epqueue
+            .tx_poll_with_status(&mut self.pool, &mut packets)
+        {
+            Ok(completed) => completed,
+            Err(err @ net_backend::TxError::TryRestart(_)) => {
+                self.post_tx_restart_errors()?;
+                return Err(err.into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if completed > 0 {
             tracing::trace!("tx async complete");
-            self.post_tx_completion(packets[0].0 as usize);
+            self.complete_backend_tx(packets[0])?;
         }
 
+        Ok(())
+    }
+
+    fn post_tx_restart_errors(&self) -> anyhow::Result<()> {
+        for (slot, sq) in self.sqs.iter().enumerate() {
+            if let Some(pending) = sq.pending_tx.front() {
+                // One fatal CQE disables the SQ; later WQEs are discarded with the task.
+                self.post_tx_completion(slot, pending.wqe_offset, CQE_TX_GDMA_ERR)?;
+            }
+        }
         Ok(())
     }
 

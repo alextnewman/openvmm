@@ -57,8 +57,11 @@ use net_backend::RxBufferSegment;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
 use net_backend::RxMetadata;
+use net_backend::TxCompletion;
+use net_backend::TxCompletionStatus;
 use net_backend::TxError;
 use net_backend::TxId;
+use net_backend::TxMetadata;
 use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
@@ -551,6 +554,7 @@ impl<T: DeviceBacking> Endpoint for ManaEndpoint<T> {
             // Tbe bounce buffer path does not support TSO.
             tso: !self.bounce_buffer,
             uso: false,
+            encapsulation: true,
         }
     }
 
@@ -713,6 +717,60 @@ pub const MAX_RWQE_SIZE: u32 = 256;
 
 /// SWQEs cannot be larger than 512 bytes.
 pub const MAX_SWQE_SIZE: u32 = 512;
+
+fn build_tx_oob(
+    meta: &TxMetadata,
+    vcq_num: u32,
+    vsq_frame: u16,
+    vp_offset: u16,
+) -> (ManaTxOob, bool) {
+    let mut oob = ManaTxOob::new_zeroed();
+    oob.s_oob.set_vcq_num(vcq_num);
+    oob.s_oob.set_vsq_frame(vsq_frame);
+
+    if let Some(encapsulation) = meta.encapsulation {
+        oob.s_oob.set_is_outer_ipv4(encapsulation.outer_is_ipv4);
+        oob.s_oob.set_is_outer_ipv6(encapsulation.outer_is_ipv6);
+        oob.l_oob.set_is_encap(true);
+        oob.l_oob.set_inner_is_ipv6(meta.flags.is_ipv6());
+        oob.l_oob.set_inner_tcp_opt(encapsulation.inner_tcp_options);
+        oob.l_oob
+            .set_inner_frame_offset(encapsulation.inner_frame_offset);
+        oob.l_oob
+            .set_inner_ip_rel_offset(encapsulation.inner_ip_rel_offset.into());
+    } else {
+        oob.s_oob.set_is_outer_ipv4(meta.flags.is_ipv4());
+        oob.s_oob.set_is_outer_ipv6(meta.flags.is_ipv6());
+    }
+    oob.s_oob
+        .set_comp_iphdr_csum(meta.flags.offload_ip_header_checksum());
+    oob.s_oob
+        .set_comp_tcp_csum(meta.flags.offload_tcp_checksum());
+    oob.s_oob
+        .set_comp_udp_csum(meta.flags.offload_udp_checksum());
+    if meta.flags.offload_tcp_checksum()
+        || meta.flags.offload_udp_checksum()
+        || meta.flags.offload_tcp_segmentation()
+    {
+        oob.s_oob.set_trans_off(meta.transport_header_offset);
+    }
+    if let Some(vlan) = &meta.vlan {
+        oob.l_oob.set_inject_vlan_pri_tag(true);
+        oob.l_oob.set_vlan_id(vlan.vlan_id());
+        oob.l_oob.set_pcp(vlan.priority());
+        oob.l_oob.set_dei(vlan.drop_eligible_indicator());
+    }
+    let short_format = vp_offset <= 0xff && meta.vlan.is_none() && meta.encapsulation.is_none();
+    if short_format {
+        oob.s_oob.set_pkt_fmt(MANA_SHORT_PKT_FMT);
+        oob.s_oob.set_short_vp_offset(vp_offset as u8);
+    } else {
+        oob.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+        oob.l_oob.set_long_vp_offset(vp_offset);
+    }
+
+    (oob, short_format)
+}
 
 impl<T: DeviceBacking> ManaQueue<T> {
     fn push_rqe(&mut self, pool: &mut dyn BufferAccess) -> bool {
@@ -1191,26 +1249,19 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
         _pool: &mut dyn BufferAccess,
         done: &mut [TxId],
     ) -> Result<usize, TxError> {
-        let mut i = 0;
-        while i < done.len() {
-            let id = if let Some(cqe) = self.tx_cq.pop() {
-                let tx_oob = ManaTxCompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
-                self.handle_tx_cqe(&tx_oob, cqe.params, done.len())?
-            } else if let Some(id) = self.dropped_tx.pop_front() {
-                self.stats.tx_dropped.increment();
-                id
-            } else {
-                if !self.tx_cq_armed {
-                    self.tx_cq.arm();
-                    self.tx_cq_armed = true;
-                }
-                break;
-            };
+        self.poll_tx_completions(done, |done, completion| {
+            *done = completion.id;
+        })
+    }
 
-            done[i] = id;
-            i += 1;
-        }
-        Ok(i)
+    fn tx_poll_with_status(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxCompletion],
+    ) -> Result<usize, TxError> {
+        self.poll_tx_completions(done, |done, completion| {
+            *done = completion;
+        })
     }
 
     fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {
@@ -1240,10 +1291,40 @@ impl BackendQueueStats for QueueStats {
 }
 
 impl<T: DeviceBacking> ManaQueue<T> {
+    fn poll_tx_completions<U>(
+        &mut self,
+        done: &mut [U],
+        mut set_completion: impl FnMut(&mut U, TxCompletion),
+    ) -> Result<usize, TxError> {
+        let mut i = 0;
+        while i < done.len() {
+            let completion = if let Some(cqe) = self.tx_cq.pop() {
+                let tx_oob = ManaTxCompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
+                self.handle_tx_cqe(&tx_oob, cqe.params, done.len())?
+            } else if let Some(id) = self.dropped_tx.pop_front() {
+                self.stats.tx_dropped.increment();
+                TxCompletion {
+                    id,
+                    status: TxCompletionStatus::Failed,
+                }
+            } else {
+                if !self.tx_cq_armed {
+                    self.tx_cq.arm();
+                    self.tx_cq_armed = true;
+                }
+                break;
+            };
+
+            set_completion(&mut done[i], completion);
+            i += 1;
+        }
+        Ok(i)
+    }
+
     /// Handle a single TX completion entry, or CQE. Advance the TX work queue
     /// and free the bounce buffer slot for the corresponding posted TX.
     ///
-    /// Returns the `TxId` of the completed packet on success, or
+    /// Returns the completed packet and status, or
     /// `TxError::TryRestart` if the queue must be torn down and rebuilt
     /// due to a hardware-reported queue-disabling error.
     /// Explicitly panics if a CQE is received with no matching posted TX.
@@ -1252,10 +1333,11 @@ impl<T: DeviceBacking> ManaQueue<T> {
         tx_oob: &ManaTxCompOob,
         cqe_params: CqeParams,
         done_len: usize,
-    ) -> Result<TxId, TxError> {
-        match tx_oob.cqe_hdr.cqe_type() {
+    ) -> Result<TxCompletion, TxError> {
+        let status = match tx_oob.cqe_hdr.cqe_type() {
             CQE_TX_OKAY => {
                 self.stats.tx_packets.increment();
+                TxCompletionStatus::Success
             }
             CQE_TX_GDMA_ERR => {
                 // Hardware hit an error with the packet coming from the Guest.
@@ -1271,6 +1353,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 // This is somewhat common, usually due to encapsulation, and only affects the specific packet.
                 self.stats.tx_errors.increment();
                 self.trace_tx(tracing::Level::WARN, cqe_params, tx_oob, done_len);
+                TxCompletionStatus::InvalidOffload
             }
             ty => {
                 tracelimit::error_ratelimited!(
@@ -1279,8 +1362,9 @@ impl<T: DeviceBacking> ManaQueue<T> {
                     "tx completion error"
                 );
                 self.stats.tx_errors.increment();
+                TxCompletionStatus::Failed
             }
-        }
+        };
         let Some(packet) = self.posted_tx.pop_front() else {
             // A CQE arrived with no matching posted TX.
             // We don't know how far to advance the tx_wq.
@@ -1291,7 +1375,10 @@ impl<T: DeviceBacking> ManaQueue<T> {
         if packet.bounced_len_with_padding > 0 {
             self.tx_bounce_buffer.free(packet.bounced_len_with_padding);
         }
-        Ok(packet.id)
+        Ok(TxCompletion {
+            id: packet.id,
+            status,
+        })
     }
 
     fn handle_tx(
@@ -1304,36 +1391,14 @@ impl<T: DeviceBacking> ManaQueue<T> {
             unreachable!()
         };
 
-        let mut oob = ManaTxOob::new_zeroed();
-        oob.s_oob.set_vcq_num(self.tx_cq.id());
-        oob.s_oob
-            .set_vsq_frame((self.tx_wq.id() >> 10) as u16 & 0x3fff);
-
-        oob.s_oob.set_is_outer_ipv4(meta.flags.is_ipv4());
-        oob.s_oob.set_is_outer_ipv6(meta.flags.is_ipv6());
-        oob.s_oob
-            .set_comp_iphdr_csum(meta.flags.offload_ip_header_checksum());
-        oob.s_oob
-            .set_comp_tcp_csum(meta.flags.offload_tcp_checksum());
-        oob.s_oob
-            .set_comp_udp_csum(meta.flags.offload_udp_checksum());
-        if meta.flags.offload_tcp_checksum() || meta.flags.offload_udp_checksum() {
-            oob.s_oob.set_trans_off(meta.l2_len as u16 + meta.l3_len);
-        }
-        if let Some(vlan) = &meta.vlan {
-            oob.l_oob.set_inject_vlan_pri_tag(true);
-            oob.l_oob.set_vlan_id(vlan.vlan_id());
-            oob.l_oob.set_pcp(vlan.priority());
-            oob.l_oob.set_dei(vlan.drop_eligible_indicator());
+        let (oob, short_format) = build_tx_oob(
+            meta,
+            self.tx_cq.id(),
+            (self.tx_wq.id() >> 10) as u16 & 0x3fff,
+            self.vp_offset,
+        );
+        if meta.vlan.is_some() {
             self.stats.tx_vlan_packets.increment();
-        }
-        let short_format = self.vp_offset <= 0xff && meta.vlan.is_none();
-        if short_format {
-            oob.s_oob.set_pkt_fmt(MANA_SHORT_PKT_FMT);
-            oob.s_oob.set_short_vp_offset(self.vp_offset as u8);
-        } else {
-            oob.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
-            oob.l_oob.set_long_vp_offset(self.vp_offset);
         }
         let mut builder = if short_format {
             self.tx_wq.wqe_builder(oob.s_oob)

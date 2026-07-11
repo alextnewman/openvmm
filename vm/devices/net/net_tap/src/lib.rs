@@ -188,6 +188,7 @@ impl Endpoint for TapEndpoint {
             udp: true,
             tso: true,
             uso: true,
+            encapsulation: false,
         }
     }
 }

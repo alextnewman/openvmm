@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
+use guestmem::GuestMemory;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use mana_driver::mana::ManaDevice;
@@ -24,7 +25,10 @@ use net_backend::Queue;
 use net_backend::QueueConfig;
 use net_backend::RssConfig;
 use net_backend::RxId;
+use net_backend::TxCompletion;
+use net_backend::TxCompletionStatus;
 use net_backend::TxId;
+use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::VlanMetadata;
 use net_backend::linearize;
@@ -45,6 +49,7 @@ use std::time::Duration;
 use test_with_tracing::test;
 use user_driver_emulated_mock::DeviceTestMemory;
 use user_driver_emulated_mock::EmulatedDevice;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -1119,6 +1124,7 @@ use gdma_defs::CqeParams;
 use gdma_defs::bnic::ManaTxCompOob;
 use mana_driver::mana::ResourceArena;
 use page_pool_alloc::PagePoolAllocator;
+use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
 type TestEmulatedDevice = EmulatedDevice<gdma::GdmaDevice, PagePoolAllocator>;
@@ -1169,6 +1175,44 @@ async fn new_test_queue(
     let (queue, _resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
 
     (queue, arena, endpoint)
+}
+
+#[test]
+fn tx_encapsulation_oob_matches_wire_layout() {
+    use crate::build_tx_oob;
+    use net_backend::TxEncapsulationMetadata;
+    use zerocopy::IntoBytes;
+
+    let mut meta = net_backend::TxMetadata {
+        transport_header_offset: 0x155,
+        encapsulation: Some(TxEncapsulationMetadata {
+            outer_is_ipv4: true,
+            outer_is_ipv6: false,
+            inner_frame_offset: 0x2aa,
+            inner_ip_rel_offset: 0x2b,
+            inner_tcp_options: true,
+        }),
+        vlan: Some(
+            VlanMetadata::new()
+                .with_priority(5)
+                .with_drop_eligible_indicator(true)
+                .with_vlan_id(0xabc),
+        ),
+        ..Default::default()
+    };
+    meta.flags.set_is_ipv6(true);
+    meta.flags.set_offload_tcp_checksum(true);
+
+    let (oob, short_format) = build_tx_oob(&meta, 0xa1b2, 0x1234, 0x456);
+
+    assert!(!short_format);
+    assert_eq!(
+        oob.as_bytes(),
+        &[
+            0x25, 0xb2, 0xa1, 0x00, 0x55, 0xd1, 0x48, 0x00, 0x0f, 0x00, 0xcd, 0xab, 0xaa, 0xae,
+            0x56, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
 }
 
 #[async_test]
@@ -1234,8 +1278,9 @@ async fn tx_cqe_invalid_oob_completes_packet(driver: DefaultDriver) {
     oob.cqe_hdr.set_cqe_type(CQE_TX_INVALID_OOB);
 
     // CQE_TX_INVALID_OOB logs an error but still pops posted_tx.
-    let result = queue.handle_tx_cqe(&oob, CqeParams::new(), 8);
-    assert_eq!(result.unwrap().0, 7);
+    let completion = queue.handle_tx_cqe(&oob, CqeParams::new(), 8).unwrap();
+    assert_eq!(completion.id.0, 7);
+    assert_eq!(completion.status, TxCompletionStatus::InvalidOffload);
     assert_eq!(queue.stats.tx_errors.get(), 1);
     assert!(queue.posted_tx.is_empty());
 
@@ -1260,8 +1305,9 @@ async fn tx_cqe_okay_completes_packet(driver: DefaultDriver) {
     let mut oob = ManaTxCompOob::new_zeroed();
     oob.cqe_hdr.set_cqe_type(CQE_TX_OKAY);
 
-    let result = queue.handle_tx_cqe(&oob, CqeParams::new(), 8);
-    assert_eq!(result.unwrap().0, 99);
+    let completion = queue.handle_tx_cqe(&oob, CqeParams::new(), 8).unwrap();
+    assert_eq!(completion.id.0, 99);
+    assert_eq!(completion.status, TxCompletionStatus::Success);
     assert_eq!(queue.stats.tx_packets.get(), 1);
     assert!(queue.posted_tx.is_empty());
 
@@ -1707,7 +1753,7 @@ async fn rss_reconfig_preserves_rx_buffer_stream(driver: DefaultDriver) {
     async fn loopback_recv(
         queue: &mut ManaQueue<TestEmulatedDevice>,
         pool: &mut net_backend::tests::Bufs,
-        payload_mem: &guestmem::GuestMemory,
+        payload_mem: &GuestMemory,
         packets: &[Vec<u8>],
     ) -> Vec<RxId> {
         let mut builder = TxPacketBuilder::new();
@@ -2852,6 +2898,1273 @@ async fn rx_fence_cqe_is_bare_completion(driver: DefaultDriver) {
     drop(queue);
     endpoint.vport.destroy(arena).await;
     endpoint.stop().await;
+}
+
+#[derive(Default)]
+struct TxRecordState {
+    metas: Vec<net_backend::TxMetadata>,
+    waker: Option<Waker>,
+    completion_waker: Option<Waker>,
+    completions_released: bool,
+    backend_polled: bool,
+    backend_poll_waker: Option<Waker>,
+    completion_status: Option<TxCompletionStatus>,
+    reverse_completions: bool,
+    submissions_blocked: bool,
+    submission_waiting: bool,
+    submission_ready_waker: Option<Waker>,
+    submission_waiting_waker: Option<Waker>,
+    restart_on_completion: bool,
+}
+
+#[derive(Clone, Default)]
+struct TxRecord {
+    state: Arc<Mutex<TxRecordState>>,
+}
+
+impl TxRecord {
+    fn push(&self, meta: net_backend::TxMetadata) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.metas.push(meta);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll_count(&self, cx: &mut Context<'_>, count: usize) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.metas.len() >= count {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn metas(&self) -> Vec<net_backend::TxMetadata> {
+        self.state.lock().metas.clone()
+    }
+
+    fn poll_backend_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let (poll, waker) = {
+            let mut state = self.state.lock();
+            state.backend_polled = true;
+            let poll = if state.completions_released {
+                Poll::Ready(())
+            } else {
+                state.completion_waker = Some(cx.waker().clone());
+                Poll::Pending
+            };
+            (poll, state.backend_poll_waker.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        poll
+    }
+
+    fn poll_backend_polled(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.backend_polled {
+            Poll::Ready(())
+        } else {
+            state.backend_poll_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn release_completions(&self) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.completions_released = true;
+            state.completion_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn set_completion_status(&self, status: TxCompletionStatus) {
+        self.state.lock().completion_status = Some(status);
+    }
+
+    fn completion_status(&self) -> TxCompletionStatus {
+        self.state
+            .lock()
+            .completion_status
+            .unwrap_or(TxCompletionStatus::Success)
+    }
+
+    fn set_reverse_completions(&self) {
+        self.state.lock().reverse_completions = true;
+    }
+
+    fn reverse_completions(&self) -> bool {
+        self.state.lock().reverse_completions
+    }
+
+    fn block_submissions(&self) {
+        self.state.lock().submissions_blocked = true;
+    }
+
+    fn release_submissions(&self) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.submissions_blocked = false;
+            state.submission_ready_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn accept_submission(&self) -> bool {
+        let (accepted, waker) = {
+            let mut state = self.state.lock();
+            if state.submissions_blocked {
+                state.submission_waiting = true;
+                (false, state.submission_waiting_waker.take())
+            } else {
+                state.submission_waiting = false;
+                (true, None)
+            }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        accepted
+    }
+
+    fn poll_submission_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.submission_waiting && !state.submissions_blocked {
+            Poll::Ready(())
+        } else {
+            state.submission_ready_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn poll_submission_waiting(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.submission_waiting {
+            Poll::Ready(())
+        } else {
+            state.submission_waiting_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn restart_on_completion(&self) {
+        self.state.lock().restart_on_completion = true;
+    }
+
+    fn take_restart_on_completion(&self) -> bool {
+        let mut state = self.state.lock();
+        std::mem::take(&mut state.restart_on_completion)
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingEndpoint {
+    async_mode: bool,
+    supports_encapsulation: bool,
+    record: TxRecord,
+}
+
+#[async_trait]
+impl Endpoint for RecordingEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "tx-oob-recording-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        for _ in config {
+            queues.push(Box::new(RecordingQueue {
+                async_mode: self.async_mode,
+                record: self.record.clone(),
+                tx_done: VecDeque::new(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn tx_offload_support(&self) -> TxOffloadSupport {
+        TxOffloadSupport {
+            ipv4_header: true,
+            tcp: true,
+            udp: true,
+            tso: true,
+            uso: false,
+            encapsulation: self.supports_encapsulation,
+        }
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 64,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingQueue {
+    async_mode: bool,
+    record: TxRecord,
+    tx_done: VecDeque<TxId>,
+}
+
+impl Queue for RecordingQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.record.poll_submission_ready(cx).is_ready() {
+            Poll::Ready(())
+        } else if self.async_mode && !self.tx_done.is_empty() {
+            self.record.poll_backend_ready(cx)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, _done: &[RxId]) {}
+
+    fn rx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let Some(net_backend::TxSegmentType::Head(meta)) = segments.first().map(|s| &s.ty) else {
+            anyhow::bail!("transmit has no head segment");
+        };
+        if !self.record.accept_submission() {
+            return Ok((false, 0));
+        }
+        self.record.push(meta.clone());
+        if self.async_mode {
+            self.tx_done.push_back(meta.id);
+        }
+        Ok((!self.async_mode, segments.len()))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        let n = done.len().min(self.tx_done.len());
+        let reverse = self.record.reverse_completions();
+        for done in done.iter_mut().take(n) {
+            *done = if reverse {
+                self.tx_done.pop_back().unwrap()
+            } else {
+                self.tx_done.pop_front().unwrap()
+            };
+        }
+        Ok(n)
+    }
+
+    fn tx_poll_with_status(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxCompletion],
+    ) -> Result<usize, net_backend::TxError> {
+        if self.record.take_restart_on_completion() {
+            return Err(net_backend::TxError::TryRestart(anyhow::anyhow!(
+                "injected backend restart"
+            )));
+        }
+        let n = done.len().min(self.tx_done.len());
+        let status = self.record.completion_status();
+        let reverse = self.record.reverse_completions();
+        for done in done.iter_mut().take(n) {
+            let id = if reverse {
+                self.tx_done.pop_back().unwrap()
+            } else {
+                self.tx_done.pop_front().unwrap()
+            };
+            *done = TxCompletion { id, status };
+        }
+        Ok(n)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct RecordingHarnessConfig {
+    async_mode: bool,
+    supports_encapsulation: bool,
+    defer_completions: bool,
+}
+
+async fn new_recording_harness(
+    driver: &DefaultDriver,
+    config: RecordingHarnessConfig,
+) -> (
+    ManaQueue<TestEmulatedDevice>,
+    ResourceArena,
+    ManaEndpoint<TestEmulatedDevice>,
+    ManaDevice<TestEmulatedDevice>,
+    TxRecord,
+    Arc<Mutex<gdma::GdmaDevice>>,
+    GuestMemory,
+) {
+    let record = TxRecord::default();
+    if !config.defer_completions {
+        record.release_completions();
+    }
+    let mem = DeviceTestMemory::new(512, true, "tx oob test");
+    let guest_memory = mem.guest_memory();
+    let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        guest_memory.clone(),
+        msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(RecordingEndpoint {
+                async_mode: config.async_mode,
+                supports_encapsulation: config.supports_encapsulation,
+                record: record.clone(),
+            }),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let device = ManaDevice::new(driver, device, 1, 1, None).await.unwrap();
+    let vport = device.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+    let mut arena = ResourceArena::new();
+    let (queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    (
+        queue,
+        arena,
+        endpoint,
+        device,
+        record,
+        device_inner,
+        guest_memory,
+    )
+}
+
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the test executor is single-threaded and GdmaDevice::reset does not re-enter the device lock"
+)]
+async fn reset_recording_device(device: &Arc<Mutex<gdma::GdmaDevice>>) {
+    device.lock().reset().await;
+}
+
+fn post_raw_tx_wqe<T: zerocopy::IntoBytes + zerocopy::Immutable + zerocopy::KnownLayout>(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    oob: T,
+) -> u32 {
+    post_raw_tx_wqe_with_len(queue, oob, 512)
+}
+
+fn post_raw_tx_wqe_with_len<
+    T: zerocopy::IntoBytes + zerocopy::Immutable + zerocopy::KnownLayout,
+>(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    oob: T,
+    packet_len: u32,
+) -> u32 {
+    let wqe_offset = queue.tx_wq.get_tail();
+    let sge = gdma_defs::Sge {
+        address: 0,
+        mem_key: queue.mem_key,
+        size: packet_len,
+    };
+    queue.tx_wq.push(oob, [sge]).expect("TX WQ is full");
+    wqe_offset
+}
+
+fn encapsulated_tcp_packet(outer_ipv6: bool, inner_ipv6: bool) -> (Vec<u8>, u16, u16) {
+    let mut packet = vec![0; 12];
+    packet.extend_from_slice(if outer_ipv6 {
+        &[0x86, 0xdd]
+    } else {
+        &[0x08, 0x00]
+    });
+    if outer_ipv6 {
+        let mut outer = [0u8; 40];
+        outer[0] = 0x60;
+        outer[6] = 17;
+        packet.extend_from_slice(&outer);
+    } else {
+        let mut outer = [0u8; 20];
+        outer[0] = 0x45;
+        outer[9] = 17;
+        packet.extend_from_slice(&outer);
+    }
+    packet.extend_from_slice(&[0u8; 16]); // UDP + VXLAN.
+
+    let inner_frame_offset = packet.len() as u16;
+    packet.extend_from_slice(&[0u8; 12]);
+    packet.extend_from_slice(if inner_ipv6 {
+        &[0x86, 0xdd]
+    } else {
+        &[0x08, 0x00]
+    });
+    if inner_ipv6 {
+        let mut inner = [0u8; 40];
+        inner[0] = 0x60;
+        inner[6] = 6;
+        packet.extend_from_slice(&inner);
+    } else {
+        let mut inner = [0u8; 20];
+        inner[0] = 0x45;
+        inner[9] = 6;
+        packet.extend_from_slice(&inner);
+    }
+    let transport_offset = packet.len() as u16;
+    let mut tcp = [0u8; 20];
+    tcp[12] = 5 << 4;
+    packet.extend_from_slice(&tcp);
+    packet.extend_from_slice(&[0u8; 32]);
+    (packet, inner_frame_offset, transport_offset)
+}
+
+fn encapsulated_ipv6_tcp_packet_with_options() -> (Vec<u8>, u16, u16) {
+    let (mut packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    let inner_ip_offset = usize::from(inner_frame_offset) + 14;
+    packet[inner_ip_offset + 6] = 0;
+    packet.splice(
+        usize::from(transport_offset)..usize::from(transport_offset),
+        [6, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let transport_offset = transport_offset + 8;
+    packet[usize::from(transport_offset) + 12] = 6 << 4;
+    packet.splice(
+        usize::from(transport_offset) + 20..usize::from(transport_offset) + 20,
+        [1, 1, 1, 1],
+    );
+    (packet, inner_frame_offset, transport_offset)
+}
+
+fn encapsulated_tcp_oob(
+    outer_ipv6: bool,
+    inner_ipv6: bool,
+    inner_frame_offset: u16,
+    transport_offset: u16,
+) -> gdma_defs::bnic::ManaTxOob {
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+
+    let mut oob = gdma_defs::bnic::ManaTxOob::new_zeroed();
+    oob.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    oob.s_oob.set_is_outer_ipv4(!outer_ipv6);
+    oob.s_oob.set_is_outer_ipv6(outer_ipv6);
+    oob.s_oob.set_comp_tcp_csum(true);
+    oob.s_oob.set_trans_off(transport_offset);
+    oob.l_oob.set_is_encap(true);
+    oob.l_oob.set_inner_is_ipv6(inner_ipv6);
+    oob.l_oob.set_inner_frame_offset(inner_frame_offset);
+    oob.l_oob.set_inner_ip_rel_offset(14);
+    oob
+}
+
+async fn wait_for_tx_completions(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    record: &TxRecord,
+    expected_metas: usize,
+    expected_completions: usize,
+) -> Vec<ManaTxCompOob> {
+    let mut completions = Vec::new();
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            loop {
+                while let Some(cqe) = queue.tx_cq.pop() {
+                    completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                if record.poll_count(cx, expected_metas).is_ready()
+                    && completions.len() >= expected_completions
+                {
+                    return Poll::Ready(());
+                }
+                if queue.interrupt.poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        }))
+        .await
+        .expect("timed out waiting for TX completion");
+    completions
+}
+
+async fn verify_tx_completion_suppression(driver: &DefaultDriver, async_mode: bool) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::MANA_CQE_COMPLETION;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            driver,
+            RecordingHarnessConfig {
+                async_mode,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+
+    let suppressed = ManaTxShortOob::new().with_suppress_txcqe_gen(true);
+    post_raw_tx_wqe(&mut queue, suppressed);
+    let completed_offset = post_raw_tx_wqe(&mut queue, ManaTxShortOob::new());
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 2, 1).await;
+    assert_eq!(record.metas().len(), 2);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.client_type(), MANA_CQE_COMPLETION);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        completed_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_completion_suppression_sync_is_cumulative(driver: DefaultDriver) {
+    verify_tx_completion_suppression(&driver, false).await;
+}
+
+#[async_test]
+async fn tx_completion_suppression_async_is_cumulative(driver: DefaultDriver) {
+    verify_tx_completion_suppression(&driver, true).await;
+}
+
+#[async_test]
+async fn tx_suppressed_backend_error_is_reported(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.set_completion_status(TxCompletionStatus::InvalidOffload);
+
+    post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_suppressed_backend_restart_disables_queue(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_GDMA_ERR;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.restart_on_completion();
+
+    let wqe_offset = post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_GDMA_ERR);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        wqe_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_backend_backpressure_does_not_complete_early(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.block_submissions();
+
+    let wqe_offset = post_raw_tx_wqe(&mut queue, ManaTxShortOob::new());
+    queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| record.poll_submission_waiting(cx)))
+        .await
+        .expect("timed out waiting for backend backpressure");
+    assert!(record.metas().is_empty());
+    assert!(
+        queue.tx_cq.pop().is_none(),
+        "backpressured TX completed before the backend accepted it"
+    );
+
+    record.release_submissions();
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        wqe_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_local_error_waits_for_prior_async_completion(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+    use gdma_defs::bnic::ManaTxOob;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: true,
+            },
+        )
+        .await;
+
+    post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    let mut invalid = ManaTxOob::new_zeroed();
+    invalid.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    invalid.s_oob.set_suppress_txcqe_gen(true);
+    invalid.s_oob.set_trans_off(60);
+    invalid.l_oob.set_is_encap(true);
+    invalid.l_oob.set_inner_frame_offset(50);
+    invalid.l_oob.set_inner_ip_rel_offset(14);
+    let invalid_offset = post_raw_tx_wqe(&mut queue, invalid);
+    queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if record.poll_count(cx, 1).is_ready() && record.poll_backend_polled(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+        .await
+        .expect("timed out waiting for deferred backend completion");
+    assert!(
+        queue.tx_cq.pop().is_none(),
+        "local error overtook an earlier asynchronous WQE"
+    );
+
+    record.release_completions();
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        invalid_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_async_completions_correlate_across_send_queues(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut first_queue, mut arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: true,
+            },
+        )
+        .await;
+    record.set_reverse_completions();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(false),
+            rss_enable: None,
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+    let (mut second_queue, second_resources) =
+        endpoint.new_queue(&tx_config, &mut arena, 1).await.unwrap();
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(second_resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    post_raw_tx_wqe(
+        &mut first_queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    let first_boundary = post_raw_tx_wqe(&mut first_queue, ManaTxShortOob::new());
+    let second_boundary = post_raw_tx_wqe(&mut second_queue, ManaTxShortOob::new());
+    first_queue.tx_wq.commit();
+    second_queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if record.poll_count(cx, 3).is_ready() && record.poll_backend_polled(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+        .await
+        .expect("timed out waiting for deferred multi-queue completions");
+    assert!(first_queue.tx_cq.pop().is_none());
+    assert!(second_queue.tx_cq.pop().is_none());
+
+    record.release_completions();
+    let mut first_completions = Vec::new();
+    let mut second_completions = Vec::new();
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            loop {
+                while let Some(cqe) = first_queue.tx_cq.pop() {
+                    first_completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                while let Some(cqe) = second_queue.tx_cq.pop() {
+                    second_completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                if first_completions.len() == 1 && second_completions.len() == 1 {
+                    return Poll::Ready(());
+                }
+                let first_pending = first_queue.interrupt.poll(cx).is_pending();
+                let second_pending = second_queue.interrupt.poll(cx).is_pending();
+                if first_pending && second_pending {
+                    return Poll::Pending;
+                }
+            }
+        }))
+        .await
+        .expect("timed out waiting for multi-queue TX completions");
+
+    assert_eq!(first_completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        first_completions[0].offsets.tx_wqe_offset(),
+        first_boundary / WQE_ALIGNMENT as u32
+    );
+    assert_eq!(second_completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        second_completions[0].offsets.tx_wqe_offset(),
+        second_boundary / WQE_ALIGNMENT as u32
+    );
+
+    drop(first_queue);
+    drop(second_queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+async fn verify_inner_tx_geometry(driver: &DefaultDriver, inner_ipv6: bool) {
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let l3_len = if inner_ipv6 { 40 } else { 20 };
+    let outer_ipv6 = !inner_ipv6;
+    let (packet, inner_frame_offset, transport_offset) =
+        encapsulated_tcp_packet(outer_ipv6, inner_ipv6);
+    guest_memory.write_at(0, &packet).unwrap();
+    let oob = encapsulated_tcp_oob(outer_ipv6, inner_ipv6, inner_frame_offset, transport_offset);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    let metas = record.metas();
+    assert_eq!(metas.len(), 1);
+    let meta = &metas[0];
+    assert_eq!(meta.l2_len, (inner_frame_offset + 14) as u8);
+    assert_eq!(meta.l3_len, l3_len);
+    assert_eq!(meta.transport_header_offset, transport_offset);
+    assert_eq!(meta.flags.is_ipv4(), !inner_ipv6);
+    assert_eq!(meta.flags.is_ipv6(), inner_ipv6);
+    assert!(meta.flags.offload_tcp_checksum());
+    let encapsulation = meta.encapsulation.expect("encapsulation metadata");
+    assert_eq!(encapsulation.outer_is_ipv4, !outer_ipv6);
+    assert_eq!(encapsulation.outer_is_ipv6, outer_ipv6);
+    assert_eq!(encapsulation.inner_frame_offset, inner_frame_offset);
+    assert_eq!(encapsulation.inner_ip_rel_offset, 14);
+    assert!(!encapsulation.inner_tcp_options);
+    assert_eq!(completions.len(), 1);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_encapsulation_uses_inner_header_geometry(driver: DefaultDriver) {
+    verify_inner_tx_geometry(&driver, false).await;
+    verify_inner_tx_geometry(&driver, true).await;
+}
+
+#[async_test]
+async fn tx_encapsulation_accepts_ipv6_extensions_and_tcp_options(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_OKAY;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) =
+        encapsulated_ipv6_tcp_packet_with_options();
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    oob.l_oob.set_inner_tcp_opt(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    let metas = record.metas();
+    let meta = &metas[0];
+    assert_eq!(meta.l2_len, (inner_frame_offset + 14) as u8);
+    assert_eq!(meta.l3_len, 48);
+    assert_eq!(meta.transport_header_offset, transport_offset);
+    assert!(
+        meta.encapsulation
+            .expect("missing encapsulation metadata")
+            .inner_tcp_options
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn mana_endpoint_encapsulation_round_trips(driver: DefaultDriver) {
+    use net_backend::TxEncapsulationMetadata;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    guest_memory.write_at(0, &packet).unwrap();
+
+    let mut meta = net_backend::TxMetadata {
+        id: TxId(77),
+        segment_count: 1,
+        len: packet.len() as u32,
+        l2_len: (inner_frame_offset + 14).try_into().unwrap(),
+        l3_len: 40,
+        transport_header_offset: transport_offset,
+        encapsulation: Some(TxEncapsulationMetadata {
+            outer_is_ipv4: true,
+            outer_is_ipv6: false,
+            inner_frame_offset,
+            inner_ip_rel_offset: 14,
+            inner_tcp_options: false,
+        }),
+        ..Default::default()
+    };
+    meta.flags.set_is_ipv6(true);
+    meta.flags.set_offload_tcp_checksum(true);
+    let segment = TxSegment {
+        ty: net_backend::TxSegmentType::Head(meta.clone()),
+        gpa: 0,
+        len: packet.len() as u32,
+    };
+    let mut pool = net_backend::tests::Bufs::new(guest_memory);
+
+    assert_eq!(queue.tx_avail(&mut pool, &[segment]).unwrap(), (false, 1));
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| record.poll_count(cx, 1)))
+        .await
+        .expect("timed out waiting for MANA transmit");
+
+    let submitted = record.metas();
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0].encapsulation, meta.encapsulation);
+    assert_eq!(submitted[0].l2_len, meta.l2_len);
+    assert_eq!(submitted[0].l3_len, meta.l3_len);
+    assert_eq!(submitted[0].l4_len, meta.l4_len);
+    assert_eq!(
+        submitted[0].transport_header_offset,
+        meta.transport_header_offset
+    );
+    assert!(submitted[0].flags.is_ipv6());
+    assert!(submitted[0].flags.offload_tcp_checksum());
+
+    let mut completion = [TxCompletion {
+        id: TxId(0),
+        status: TxCompletionStatus::Failed,
+    }];
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if queue.poll_ready(cx, &mut pool).is_pending() {
+                return Poll::Pending;
+            }
+            match queue.tx_poll_with_status(&mut pool, &mut completion) {
+                Ok(0) => Poll::Pending,
+                result => Poll::Ready(result),
+            }
+        }))
+        .await
+        .expect("timed out waiting for MANA completion")
+        .unwrap();
+    assert_eq!(completion[0].id.0, 77);
+    assert_eq!(completion[0].status, TxCompletionStatus::Success);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_encapsulation_rejects_unsupported_backend(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: false,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    oob.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 1).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_encapsulation_packet_returns_error(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, false);
+    guest_memory.write_at(0, &packet).unwrap();
+
+    let mut version_mismatch =
+        encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    version_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, version_mismatch, packet.len() as u32);
+
+    let mut protocol_mismatch =
+        encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    protocol_mismatch.s_oob.set_comp_tcp_csum(false);
+    protocol_mismatch.s_oob.set_comp_udp_csum(true);
+    protocol_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, protocol_mismatch, packet.len() as u32);
+
+    let mut truncated = encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    truncated.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, truncated, u32::from(transport_offset) + 10);
+
+    let mut tcp_options_mismatch =
+        encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    tcp_options_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    tcp_options_mismatch.l_oob.set_inner_tcp_opt(true);
+    post_raw_tx_wqe_with_len(&mut queue, tcp_options_mismatch, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 4).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions.len(), 4);
+    for completion in completions {
+        assert_eq!(completion.cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    }
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_ipv6_extension_chain_returns_error(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (mut packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    let inner_ip_offset = usize::from(inner_frame_offset) + 14;
+    packet[inner_ip_offset + 6] = 0;
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset + 4);
+    oob.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 1).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_encapsulation_geometry_returns_error(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+    use gdma_defs::bnic::ManaTxOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+
+    let mut oversized = ManaTxOob::new_zeroed();
+    oversized.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    oversized.s_oob.set_comp_tcp_csum(true);
+    oversized.s_oob.set_suppress_txcqe_gen(true);
+    oversized.s_oob.set_trans_off(284);
+    oversized.l_oob.set_is_encap(true);
+    oversized.l_oob.set_inner_frame_offset(250);
+    oversized.l_oob.set_inner_ip_rel_offset(14);
+    let oversized_offset = post_raw_tx_wqe(&mut queue, oversized);
+
+    let mut reversed = ManaTxOob::new_zeroed();
+    reversed.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    reversed.s_oob.set_comp_tcp_csum(true);
+    reversed.s_oob.set_suppress_txcqe_gen(true);
+    reversed.s_oob.set_trans_off(60);
+    reversed.l_oob.set_is_encap(true);
+    reversed.l_oob.set_inner_frame_offset(50);
+    reversed.l_oob.set_inner_ip_rel_offset(14);
+    let reversed_offset = post_raw_tx_wqe(&mut queue, reversed);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 2).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions.len(), 2);
+    for completion in &completions {
+        assert_eq!(completion.cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    }
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        oversized_offset / WQE_ALIGNMENT as u32
+    );
+    assert_eq!(
+        completions[1].offsets.tx_wqe_offset(),
+        reversed_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
 }
 
 /// Backend state for [`FenceOrderEndpoint`]. Receive completions are injected

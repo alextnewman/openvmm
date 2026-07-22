@@ -91,6 +91,7 @@ mod tests {
     fn test_v2m() -> GicV2mInfo {
         GicV2mInfo {
             frame_base: 0x1000,
+            doorbell_base: 0x3000,
             mbi: Some(GicMbiInfo {
                 base: 0x2000,
                 spi_base: 64,

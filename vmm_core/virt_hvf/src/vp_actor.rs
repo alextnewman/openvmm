@@ -96,6 +96,10 @@ impl VpActor {
         ScanToken(self.sequence.load(Ordering::Acquire))
     }
 
+    pub(crate) fn scan_changed(&self, scan: ScanToken) -> bool {
+        self.sequence.load(Ordering::Acquire) != scan.0
+    }
+
     fn clear_park(&self, waker: &Waker) {
         let mut park = self.park.lock();
         if park
@@ -123,6 +127,16 @@ impl VpActor {
             self.clear_park(waker);
             ParkDecision::Rescan
         }
+    }
+}
+
+impl std::task::Wake for VpActor {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.notify();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.notify();
     }
 }
 
@@ -242,5 +256,13 @@ mod tests {
 
         assert_eq!(fired(&c2), 1);
         assert_eq!(fired(&c1), 1);
+    }
+
+    #[test]
+    fn wake_trait_publishes_a_notification() {
+        let actor = Arc::new(VpActor::new());
+        let scan = actor.begin_scan();
+        Waker::from(actor.clone()).wake_by_ref();
+        assert!(actor.scan_changed(scan));
     }
 }

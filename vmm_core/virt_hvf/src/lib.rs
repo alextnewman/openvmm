@@ -48,7 +48,9 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context as TaskContext;
 use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use thiserror::Error;
 use virt::BindProcessor;
@@ -78,6 +80,8 @@ const HV_CALL_SYNC_CONTEXT_EX: u16 = 0x001a;
 const HV_CALL_FLUSH_TLB: u16 = 0x00d6;
 const HV_CALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00d7;
 const HV_CALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS: u16 = 0x00d8;
+// The Microsoft AArch64 UEFI GTDT exposes the non-secure EL1 physical timer here.
+const PHYSICAL_TIMER_PPI: u32 = 19;
 
 enum HvfLocalHypercall {
     Complete(hvdef::hypercall::HypercallOutput),
@@ -238,7 +242,7 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
                     HvfVpInner {
                         needs_yield: NeedsYield::new(),
                         message_queues: hv1_emulator::message_queues::MessageQueues::new(),
-                        actor: vp_actor::VpActor::new(),
+                        actor: Arc::new(vp_actor::VpActor::new()),
                         vp_info,
                         cpu_on: Default::default(),
                         power_state: AtomicU8::new(power_state),
@@ -603,7 +607,7 @@ struct HvfVpInner {
     vp_info: Aarch64VpInfo,
     message_queues: hv1_emulator::message_queues::MessageQueues,
     #[inspect(skip)]
-    actor: vp_actor::VpActor,
+    actor: Arc<vp_actor::VpActor>,
     cpu_on: Mutex<Option<CpuOnState>>,
     #[inspect(skip)]
     power_state: AtomicU8,
@@ -829,6 +833,7 @@ impl BindProcessor for HvfProcessorBinder {
             gicr: state.gicr,
             hv1: state.hv1,
             vmtime: state.vmtime,
+            physical_timer: PhysicalTimer::default(),
             pmu: PmuState::default(),
             crash_regs: Default::default(),
             synthetic_vbar_el1: 0,
@@ -1005,23 +1010,22 @@ mod xzr_tests {
 }
 
 /// Reflects the host counter for trapped physical and virtual counter reads.
-fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
-    match reg {
-        SystemReg::CNTPCT_EL0 | SystemReg::CNTVCT_EL0 => {
-            let count: u64;
-            // SAFETY: CNTVCT_EL0 is unprivileged-readable on AArch64 and has no
-            // side effects.
-            unsafe {
-                core::arch::asm!(
-                    "mrs {}, cntvct_el0",
-                    out(reg) count,
-                    options(nomem, nostack, preserves_flags),
-                );
-            }
-            Some(count)
-        }
-        _ => None,
+fn read_counter() -> u64 {
+    let count: u64;
+    // SAFETY: CNTVCT_EL0 is unprivileged-readable on AArch64 and has no side
+    // effects. HVF exposes the same counter basis to the guest.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntvct_el0",
+            out(reg) count,
+            options(nomem, nostack, preserves_flags),
+        );
     }
+    count
+}
+
+fn read_counter_sysreg(reg: SystemReg) -> Option<u64> {
+    matches!(reg, SystemReg::CNTPCT_EL0 | SystemReg::CNTVCT_EL0).then(read_counter)
 }
 
 /// Reads the counter frequency (`CNTFRQ_EL0`) in Hz — the tick rate shared by
@@ -1053,6 +1057,7 @@ pub struct HvfProcessor<'a> {
     wfi: bool,
     on: bool,
     pmu: PmuState,
+    physical_timer: PhysicalTimer,
     #[inspect(skip)]
     crash_regs: hypercall::GuestCrashRegisters,
     synthetic_vbar_el1: u64,
@@ -1192,11 +1197,11 @@ impl Drop for HvfVcpu {
     }
 }
 
-const MAX_VTIMER_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_TIMER_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Converts a generic-timer compare value to a bounded host wait. `None` means
 /// the unsigned counter has already reached the compare value.
-fn vtimer_wait_duration(counter: u64, compare: u64, frequency: NonZeroU64) -> Option<Duration> {
+fn timer_wait_duration(counter: u64, compare: u64, frequency: NonZeroU64) -> Option<Duration> {
     if compare <= counter {
         return None;
     }
@@ -1208,8 +1213,66 @@ fn vtimer_wait_duration(counter: u64, compare: u64, frequency: NonZeroU64) -> Op
             ticks / frequency,
             ((ticks % frequency) as u128 * 1_000_000_000 / frequency as u128) as u32,
         )
-        .min(MAX_VTIMER_WAIT),
+        .min(MAX_TIMER_WAIT),
     )
+}
+
+#[derive(Debug, Default, Inspect)]
+struct PhysicalTimer {
+    control: u64,
+    compare: u64,
+}
+
+impl PhysicalTimer {
+    const ENABLE: u64 = 1 << 0;
+    const IMASK: u64 = 1 << 1;
+    const ISTATUS: u64 = 1 << 2;
+
+    fn expired(&self, counter: u64) -> bool {
+        self.compare <= counter
+    }
+
+    fn output_asserted(&self, counter: u64) -> bool {
+        self.control & Self::ENABLE != 0 && self.control & Self::IMASK == 0 && self.expired(counter)
+    }
+
+    fn read(&self, reg: SystemReg, counter: u64) -> Option<u64> {
+        let value = match reg {
+            SystemReg::CNTP_CTL_EL0 => {
+                self.control
+                    | if self.expired(counter) {
+                        Self::ISTATUS
+                    } else {
+                        0
+                    }
+            }
+            SystemReg::CNTP_CVAL_EL0 => self.compare,
+            SystemReg::CNTP_TVAL_EL0 => self.compare.wrapping_sub(counter) as u32 as u64,
+            _ => return None,
+        };
+        Some(value)
+    }
+
+    fn write(&mut self, reg: SystemReg, value: u64, counter: u64) -> bool {
+        match reg {
+            SystemReg::CNTP_CTL_EL0 => self.control = value & (Self::ENABLE | Self::IMASK),
+            SystemReg::CNTP_CVAL_EL0 => self.compare = value,
+            SystemReg::CNTP_TVAL_EL0 => {
+                let offset = value as u32 as i32 as i64 as u64;
+                self.compare = counter.wrapping_add(offset);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn deadline(&self, counter: u64, now: VmTime, frequency: NonZeroU64) -> Option<VmTime> {
+        if self.control & Self::ENABLE == 0 || self.control & Self::IMASK != 0 {
+            return None;
+        }
+        timer_wait_duration(counter, self.compare, frequency)
+            .map(|duration| now.wrapping_add(duration))
+    }
 }
 
 #[cfg(test)]
@@ -1220,10 +1283,10 @@ mod vtimer_tests {
     fn deadline_conversion_handles_expired_and_future_values() {
         let frequency = NonZeroU64::new(10).unwrap();
 
-        assert_eq!(vtimer_wait_duration(10, 10, frequency), None);
-        assert_eq!(vtimer_wait_duration(11, 10, frequency), None);
+        assert_eq!(timer_wait_duration(10, 10, frequency), None);
+        assert_eq!(timer_wait_duration(11, 10, frequency), None);
         assert_eq!(
-            vtimer_wait_duration(10, 25, frequency),
+            timer_wait_duration(10, 25, frequency),
             Some(Duration::new(1, 500_000_000))
         );
     }
@@ -1233,10 +1296,40 @@ mod vtimer_tests {
         let frequency = NonZeroU64::new(1).unwrap();
 
         assert_eq!(
-            vtimer_wait_duration(1, u64::MAX, frequency),
-            Some(MAX_VTIMER_WAIT)
+            timer_wait_duration(1, u64::MAX, frequency),
+            Some(MAX_TIMER_WAIT)
         );
-        assert_eq!(vtimer_wait_duration(u64::MAX - 10, 9, frequency), None);
+        assert_eq!(timer_wait_duration(u64::MAX - 10, 9, frequency), None);
+    }
+
+    #[test]
+    fn physical_timer_registers_and_output() {
+        let mut timer = PhysicalTimer::default();
+
+        assert!(timer.write(SystemReg::CNTP_TVAL_EL0, 25, 100));
+        assert_eq!(timer.read(SystemReg::CNTP_CVAL_EL0, 100), Some(125));
+        assert_eq!(timer.read(SystemReg::CNTP_TVAL_EL0, 110), Some(15));
+
+        assert!(timer.write(SystemReg::CNTP_CTL_EL0, PhysicalTimer::ENABLE, 110));
+        assert!(!timer.output_asserted(124));
+        assert!(timer.output_asserted(125));
+        assert_eq!(
+            timer.read(SystemReg::CNTP_CTL_EL0, 125),
+            Some(PhysicalTimer::ENABLE | PhysicalTimer::ISTATUS)
+        );
+
+        assert!(timer.write(SystemReg::CNTP_CTL_EL0, PhysicalTimer::IMASK, 125));
+        assert!(!timer.output_asserted(125));
+
+        let frequency = NonZeroU64::new(10).unwrap();
+        assert_eq!(timer.deadline(125, VmTime::from_100ns(50), frequency), None);
+    }
+
+    #[test]
+    fn physical_timer_value_sign_extends() {
+        let mut timer = PhysicalTimer::default();
+        assert!(timer.write(SystemReg::CNTP_TVAL_EL0, u32::MAX.into(), 100));
+        assert_eq!(timer.read(SystemReg::CNTP_CVAL_EL0, 100), Some(99));
     }
 }
 
@@ -1321,7 +1414,7 @@ impl HvfProcessor<'_> {
         let freq = NonZeroU64::new(read_cntfrq()).context("CNTFRQ_EL0 reported zero")?;
 
         Ok(Some(
-            vtimer_wait_duration(guest_now, cval, freq)
+            timer_wait_duration(guest_now, cval, freq)
                 .map_or(now, |duration| now.wrapping_add(duration)),
         ))
     }
@@ -1369,6 +1462,7 @@ impl HvfProcessor<'_> {
         self.recreate_vcpu()?;
         self.set_reset_registers(Some(cpu_on))?;
         self.pmu = PmuState::default();
+        self.physical_timer = PhysicalTimer::default();
         self.wfi = false;
         self.on = true;
         self.inner.power_state.store(VP_ON, Ordering::Release);
@@ -1532,6 +1626,7 @@ impl<'p> Processor for HvfProcessor<'p> {
         self.gicr.reset();
         self.hv1.reset();
         self.pmu = PmuState::default();
+        self.physical_timer = PhysicalTimer::default();
         self.crash_regs.clear();
         self.synthetic_vbar_el1 = 0;
         self.tlbi_control = 0;
@@ -1561,6 +1656,21 @@ impl<'p> Processor for HvfProcessor<'p> {
 
                     // Capture notifications before scanning persistent work.
                     let scan = self.inner.actor.begin_scan();
+
+                    let counter = read_counter();
+                    self.gicr.set_pending(
+                        PHYSICAL_TIMER_PPI,
+                        self.physical_timer.output_asserted(counter),
+                    );
+                    if let Some(deadline) = self.physical_timer.deadline(
+                        counter,
+                        self.vmtime.now(),
+                        NonZeroU64::new(read_cntfrq()).ok_or_else(|| {
+                            dev.fatal_error(anyhow::anyhow!("CNTFRQ_EL0 is zero").into())
+                        })?,
+                    ) {
+                        self.vmtime.set_timeout_if_before(deadline);
+                    }
 
                     if let Some(cpu_on) = self.inner.cpu_on.lock().take() {
                         if self.on {
@@ -1648,6 +1758,16 @@ impl<'p> Processor for HvfProcessor<'p> {
                             }
                             vp_actor::ParkDecision::Rescan => continue,
                         }
+                    }
+
+                    let timer_waker = Waker::from(self.inner.actor.clone());
+                    if self
+                        .vmtime
+                        .poll_timeout(&mut TaskContext::from_waker(&timer_waker))
+                        .is_ready()
+                        || self.inner.actor.scan_changed(scan)
+                    {
+                        continue;
                     }
 
                     break Poll::Ready(Result::<_, VpHaltReason>::Ok(()));
@@ -1757,6 +1877,10 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     value
                                 } else if let Some(value) = read_counter_sysreg(reg) {
                                     value
+                                } else if let Some(value) =
+                                    self.physical_timer.read(reg, read_counter())
+                                {
+                                    value
                                 } else if let Some(value) = self.pmu.read_sysreg(reg, now) {
                                     value
                                 } else if reg == SystemReg::OSLSR_EL1 {
@@ -1792,7 +1916,10 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     value,
                                     |index| self.partition.vps[index].notify(),
                                 );
-                                if !handled_by_gic && !self.pmu.write_sysreg(reg, value, now) {
+                                if !handled_by_gic
+                                    && !self.physical_timer.write(reg, value, read_counter())
+                                    && !self.pmu.write_sysreg(reg, value, now)
+                                {
                                     tracing::warn!(
                                         ?reg,
                                         value,

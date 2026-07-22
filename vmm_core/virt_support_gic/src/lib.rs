@@ -1465,8 +1465,17 @@ mod gicr {
             Some(value)
         }
 
+        pub fn set_pending(&mut self, intid: u32, pending: bool) {
+            let mask = 1 << intid;
+            if pending {
+                self.shared.pending.fetch_or(mask, Ordering::Relaxed);
+            } else {
+                self.shared.pending.fetch_and(!mask, Ordering::Relaxed);
+            }
+        }
+
         pub fn raise(&mut self, intid: u32) {
-            self.shared.pending.fetch_or(1 << intid, Ordering::Relaxed);
+            self.set_pending(intid, true);
         }
 
         /// The best deliverable Group-`group1` SGI/PPI candidate on this
@@ -1851,6 +1860,20 @@ mod gicr {
             redist.eoi(true, 20);
             redist.raise(20);
             assert!(redist.irq_pending());
+        }
+
+        #[test]
+        fn level_ppi_withdraws_pending_state_when_deasserted() {
+            use aarch64defs::SystemReg;
+            let (mut redist, shared) = Redistributor::new(0, 0, true);
+            redist.write_cpuif(SystemReg::ICC_PMR_EL1, 0xff);
+            enable_cpu_group(&mut redist, true);
+            enable_group1(&shared, 20);
+
+            redist.set_pending(20, true);
+            assert!(redist.irq_pending());
+            redist.set_pending(20, false);
+            assert!(!redist.irq_pending());
         }
 
         // ---- Priority-engine helper unit tests ------------------------------

@@ -1131,6 +1131,53 @@ impl InitializedVm {
                 0
             };
 
+        #[cfg(not(guest_arch = "aarch64"))]
+        if cfg
+            .virtio_devices
+            .iter()
+            .any(|(bus, _)| matches!(bus, VirtioBus::MmioFixed(_)))
+        {
+            anyhow::bail!("fixed virtio-mmio placement is only supported on aarch64");
+        }
+
+        #[cfg(guest_arch = "aarch64")]
+        {
+            const VIRTIO_MMIO_FIXED_SIZE: u64 = 0x200;
+            let mut fixed_ranges = Vec::new();
+            for (bus, _) in &cfg.virtio_devices {
+                let VirtioBus::MmioFixed(mmio) = bus else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    mmio.address.is_multiple_of(VIRTIO_MMIO_FIXED_SIZE),
+                    "fixed virtio-mmio address {:#x} is not 0x200-byte aligned",
+                    mmio.address
+                );
+                let end = mmio
+                    .address
+                    .checked_add(VIRTIO_MMIO_FIXED_SIZE)
+                    .context("fixed virtio-mmio range overflows the GPA space")?;
+                anyhow::ensure!(
+                    ram_start_address != 0 && end <= ram_start_address,
+                    "fixed virtio-mmio range {:#x}..{end:#x} must fit below the direct-boot RAM base",
+                    mmio.address
+                );
+                anyhow::ensure!(
+                    (32..processor_topology.gic_nr_irqs()).contains(&mmio.gsiv),
+                    "fixed virtio-mmio GSIV {} is outside the configured GIC SPI range",
+                    mmio.gsiv
+                );
+                let range = mmio.address..end;
+                anyhow::ensure!(
+                    fixed_ranges.iter().all(|existing: &std::ops::Range<u64>| {
+                        existing.end <= range.start || range.end <= existing.start
+                    }),
+                    "fixed virtio-mmio range {range:#x?} overlaps another fixed virtio-mmio device"
+                );
+                fixed_ranges.push(range);
+            }
+        }
+
         let vtl2_framebuffer_size = if cfg.vtl2_gfx {
             cfg.framebuffer
                 .as_ref()
@@ -2834,6 +2881,26 @@ impl InitializedVm {
                             partition.clone().into_doorbell_registration(Vtl::Vtl0),
                             mmio_start,
                             0x1000,
+                        )
+                    })?;
+                }
+                VirtioBus::MmioFixed(mmio) => {
+                    const GIC_SPI_BASE: u32 = 32;
+                    let irq = mmio
+                        .gsiv
+                        .checked_sub(GIC_SPI_BASE)
+                        .context("fixed virtio-mmio GSIV is not a GIC SPI")?;
+                    let id = format!("{id}-{}", mmio.address);
+                    let gm = gm.clone();
+                    chipset_builder.arc_mutex_device(id).try_add(|services| {
+                        VirtioMmioDevice::new(
+                            device.0,
+                            &driver_source.simple(),
+                            gm,
+                            services.new_line(IRQ_LINE_SET, "interrupt", irq),
+                            partition.clone().into_doorbell_registration(Vtl::Vtl0),
+                            mmio.address,
+                            0x200,
                         )
                     })?;
                 }

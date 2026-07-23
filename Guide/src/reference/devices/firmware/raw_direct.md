@@ -43,3 +43,17 @@ openvmm --kernel path/to/image.bin \
 The alias shares the canonical UART's complete device state, backend, and
 interrupt. It is not emitted in ACPI or the device tree. Alias ranges must be
 4 KiB aligned and fit below the 1 GiB direct-boot RAM base.
+
+## Fixed virtio-MMIO
+
+Firmware-less guests may also require a virtio device at a predetermined
+address and interrupt. A virtio-blk disk can use an explicit 0x200-byte MMIO
+window and full GIC interrupt ID:
+
+```bash
+openvmm --kernel path/to/image.bin \
+    --virtio-blk file:path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
+```
+
+Fixed virtio-MMIO placement is limited to AArch64 direct boot and must fit
+below the 1 GiB RAM base. It is mutually exclusive with PCIe placement.

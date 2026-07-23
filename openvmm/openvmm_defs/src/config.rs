@@ -559,7 +559,16 @@ pub enum PcatBootDevice {
 #[derive(Eq, PartialEq, Debug, Copy, Clone, MeshPayload)]
 pub enum VirtioBus {
     Mmio,
+    MmioFixed(VirtioMmioConfig),
     Pci,
+}
+
+#[derive(Eq, PartialEq, Debug, Copy, Clone, MeshPayload)]
+pub struct VirtioMmioConfig {
+    /// Guest-physical base of the 0x200-byte virtio-mmio register window.
+    pub address: u64,
+    /// Full GIC interrupt ID.
+    pub gsiv: u32,
 }
 
 /// Policy for the partition when mapping VTL0 memory late.

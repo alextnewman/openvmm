@@ -54,6 +54,9 @@ pub(crate) trait TransportOps: Send {
     /// Signal a config-change interrupt to the guest.
     fn signal_config_change(&mut self);
 
+    /// Notify the guest that asynchronous DRIVER_OK processing has completed.
+    fn signal_driver_ready(&mut self);
+
     /// Reset transport-specific interrupt state (clear status, deassert lines).
     fn reset_interrupts(&mut self);
 
@@ -251,7 +254,8 @@ impl VirtioTransportCore {
         match result {
             TransportStateResult::EnableComplete(true) => {
                 self.device_status.set_driver_ok(true);
-                self.update_config_generation(ops);
+                self.config_generation = self.config_generation.wrapping_add(1);
+                ops.signal_driver_ready();
             }
             TransportStateResult::EnableComplete(false) | TransportStateResult::DisableComplete => {
                 self.reset_status(ops);

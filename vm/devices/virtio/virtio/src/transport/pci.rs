@@ -180,6 +180,10 @@ impl TransportOps for PciTransport {
         }
     }
 
+    fn signal_driver_ready(&mut self) {
+        self.signal_config_change();
+    }
+
     fn reset_interrupts(&mut self) {
         *self.interrupt_status.lock() = 0;
         if let InterruptKind::IntX(line) = &self.interrupt_kind {

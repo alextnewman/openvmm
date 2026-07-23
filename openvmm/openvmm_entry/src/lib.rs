@@ -505,12 +505,17 @@ async fn vm_config_from_command_line(
         is_dvd,
         underhill,
         ref pcie_port,
+        mmio_base,
+        mmio_gsiv,
         ref controller,
         nsid,
         lun,
         ref relay,
     } in &opt.disk
     {
+        if mmio_base.is_some() || mmio_gsiv.is_some() {
+            anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
+        }
         if controller.is_none() && underhill.is_none() && relay.is_none() {
             tracing::warn!(
                 "--disk without `on` is deprecated; \
@@ -609,12 +614,17 @@ async fn vm_config_from_command_line(
         is_dvd,
         underhill,
         ref pcie_port,
+        mmio_base,
+        mmio_gsiv,
         controller: _,
         nsid: _,
         lun: _,
         relay: _,
     } in &opt.nvme
     {
+        if mmio_base.is_some() || mmio_gsiv.is_some() {
+            anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
+        }
         let target = if let Some(port) = pcie_port {
             storage_builder::DiskLocation::Named {
                 controller: port.clone(),
@@ -636,6 +646,8 @@ async fn vm_config_from_command_line(
         is_dvd,
         ref underhill,
         ref pcie_port,
+        mmio_base,
+        mmio_gsiv,
         controller: _,
         nsid: _,
         lun: _,
@@ -650,7 +662,12 @@ async fn vm_config_from_command_line(
                 vtl,
                 None,
                 None,
-                storage_builder::DiskLocation::VirtioBlk(pcie_port.clone()),
+                storage_builder::DiskLocation::VirtioBlk {
+                    pcie_port: pcie_port.clone(),
+                    mmio: mmio_base.zip(mmio_gsiv).map(|(address, gsiv)| {
+                        openvmm_defs::config::VirtioMmioConfig { address, gsiv }
+                    }),
+                },
                 kind,
                 is_dvd,
                 read_only,
@@ -1406,15 +1423,23 @@ async fn vm_config_from_command_line(
             "raw direct-boot images are not supported on x86_64"
         );
 
-        let initrd = (opt.initrd.0)
+        anyhow::ensure!(
+            image_format != openvmm_defs::config::DirectBootImageFormat::Raw
+                || opt.initrd.is_none(),
+            "raw direct boot does not support an initrd"
+        );
+        let initrd_path = if image_format == openvmm_defs::config::DirectBootImageFormat::Linux {
+            opt.initrd
+                .clone()
+                .or_else(cli_args::default_linux_direct_initrd)
+        } else {
+            None
+        };
+        let initrd = initrd_path
             .as_ref()
             .map(fs_err::File::open)
             .transpose()
             .context("failed to open initrd")?;
-        anyhow::ensure!(
-            image_format != openvmm_defs::config::DirectBootImageFormat::Raw || initrd.is_none(),
-            "raw direct boot does not support an initrd"
-        );
 
         let mut cmdline = String::new();
         let mut push_arg = |arg: &str| {

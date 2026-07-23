@@ -367,6 +367,16 @@ PCIe root port. The syntax varies slightly between device types:
 --nvme-pci id=nvme0,pcie_port=rp0 --disk file:/path/to/disk.raw,on=nvme0
 ```
 
+An AArch64 direct-boot guest can instead use an explicitly placed
+virtio-MMIO transport. `mmio_gsiv` is the full GIC interrupt ID:
+
+```sh
+--virtio-blk file:/path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
+```
+
+The fixed transport uses a 0x200-byte register window and must fit below the
+direct-boot RAM base. It is mutually exclusive with `pcie_port`.
+
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
 ```sh

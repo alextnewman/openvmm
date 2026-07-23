@@ -19,6 +19,8 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::PcieDeviceConfig;
+use openvmm_defs::config::VirtioBus;
+use openvmm_defs::config::VirtioMmioConfig;
 use openvmm_defs::config::VpciDeviceConfig;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use scsidisk_resources::SimpleScsiDvdHandle;
@@ -130,6 +132,7 @@ pub(super) struct StorageBuilder {
     controllers: BTreeMap<String, ControllerEntry>,
     openhcl_controllers: BTreeMap<String, OpenhclControllerEntry>,
     pcie_virtio_blk_disks: Vec<(String, VirtioBlkDisk)>,
+    fixed_mmio_virtio_blk_disks: Vec<(VirtioMmioConfig, VirtioBlkDisk)>,
     underhill_scsi_luns: Vec<Lun>,
     underhill_nvme_luns: Vec<Lun>,
     vtl0_virtio_blk_disks: Vec<VirtioBlkDisk>,
@@ -154,7 +157,10 @@ pub enum DiskLocation {
         nsid: Option<u32>,
         lun: Option<u8>,
     },
-    VirtioBlk(Option<String>),
+    VirtioBlk {
+        pcie_port: Option<String>,
+        mmio: Option<VirtioMmioConfig>,
+    },
 }
 
 impl From<UnderhillDiskSource> for DiskLocation {
@@ -195,6 +201,7 @@ impl StorageBuilder {
             controllers: BTreeMap::new(),
             openhcl_controllers: BTreeMap::new(),
             pcie_virtio_blk_disks: Vec::new(),
+            fixed_mmio_virtio_blk_disks: Vec::new(),
             underhill_scsi_luns: Vec::new(),
             underhill_nvme_luns: Vec::new(),
             vtl0_virtio_blk_disks: Vec::new(),
@@ -506,7 +513,7 @@ impl StorageBuilder {
                     anyhow::bail!("unknown controller: '{controller}'");
                 }
             },
-            DiskLocation::VirtioBlk(pcie_port) => {
+            DiskLocation::VirtioBlk { pcie_port, mmio } => {
                 if vtl != DeviceVtl::Vtl0 {
                     anyhow::bail!("virtio-blk only supported for VTL0");
                 }
@@ -514,10 +521,15 @@ impl StorageBuilder {
                     anyhow::bail!("dvd not supported with virtio-blk");
                 }
                 let vblk = VirtioBlkDisk { disk, read_only };
-                if let Some(port) = pcie_port {
-                    self.pcie_virtio_blk_disks.push((port, vblk));
-                } else {
-                    self.vtl0_virtio_blk_disks.push(vblk);
+                match (pcie_port, mmio) {
+                    (Some(port), None) => self.pcie_virtio_blk_disks.push((port, vblk)),
+                    (None, Some(mmio)) => {
+                        self.fixed_mmio_virtio_blk_disks.push((mmio, vblk));
+                    }
+                    (None, None) => self.vtl0_virtio_blk_disks.push(vblk),
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("virtio-blk cannot use PCIe and fixed MMIO together")
+                    }
                 }
                 None
             }
@@ -654,7 +666,7 @@ impl StorageBuilder {
                     NVME_VTL0_INSTANCE_ID
                 },
             ),
-            DiskLocation::VirtioBlk(_) => {
+            DiskLocation::VirtioBlk { .. } => {
                 anyhow::bail!("OpenHCL relay not supported with virtio-blk")
             }
             DiskLocation::Named { .. } => {
@@ -674,7 +686,7 @@ impl StorageBuilder {
                 let nsid = nsid.unwrap_or(self.underhill_nvme_luns.len() as u32 + 1);
                 (&mut self.underhill_nvme_luns, nsid)
             }
-            DiskLocation::VirtioBlk(_) => {
+            DiskLocation::VirtioBlk { .. } => {
                 anyhow::bail!("OpenHCL relay not supported with virtio-blk")
             }
             DiskLocation::Named { .. } => {
@@ -913,6 +925,17 @@ impl StorageBuilder {
                 )
                 .into_resource(),
             });
+        }
+
+        for (mmio, vblk) in std::mem::take(&mut self.fixed_mmio_virtio_blk_disks) {
+            config.virtio_devices.push((
+                VirtioBus::MmioFixed(mmio),
+                VirtioBlkHandle {
+                    disk: vblk.disk,
+                    read_only: vblk.read_only,
+                }
+                .into_resource(),
+            ));
         }
 
         Ok(())

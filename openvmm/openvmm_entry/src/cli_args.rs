@@ -272,8 +272,8 @@ Examples:
     pub kernel_format: KernelFormatCli,
 
     /// initrd image (when using linux direct boot)
-    #[clap(short = 'r', long, value_name = "FILE", default_value = default_value_from_arch_env("OPENVMM_LINUX_DIRECT_INITRD"))]
-    pub initrd: OptionalPathBuf,
+    #[clap(short = 'r', long, value_name = "FILE")]
+    pub initrd: Option<PathBuf>,
 
     /// extra kernel command line args
     #[clap(short = 'c', long, value_name = "STRING")]
@@ -2006,6 +2006,8 @@ pub struct DiskCli {
     pub is_dvd: bool,
     pub underhill: Option<UnderhillDiskSource>,
     pub pcie_port: Option<String>,
+    pub mmio_base: Option<u64>,
+    pub mmio_gsiv: Option<u32>,
     pub controller: Option<String>,
     pub nsid: Option<u32>,
     pub lun: Option<u8>,
@@ -2059,6 +2061,8 @@ struct DiskArgs {
     #[kv(flag, key = "uh-nvme")]
     uh_nvme: bool,
     pcie_port: Option<String>,
+    mmio_base: Option<HexAddress>,
+    mmio_gsiv: Option<u32>,
     #[kv(key = "on")]
     controller: Option<String>,
     nsid: Option<u32>,
@@ -2082,6 +2086,8 @@ impl FromStr for DiskCli {
         let is_dvd = args.dvd;
         let vtl = args.vtl;
         let pcie_port = args.pcie_port;
+        let mmio_base = args.mmio_base.map(|address| address.0);
+        let mmio_gsiv = args.mmio_gsiv;
         let controller = args.controller;
         let nsid = args.nsid;
         let lun = args.lun;
@@ -2093,6 +2099,30 @@ impl FromStr for DiskCli {
 
         if pcie_port.is_some() && (underhill.is_some() || vtl != DeviceVtl::Vtl0 || is_dvd) {
             anyhow::bail!("`pcie_port` is incompatible with `uh`, `uh-nvme`, `vtl2`, and `dvd`");
+        }
+
+        match (mmio_base, mmio_gsiv) {
+            (Some(base), Some(gsiv)) => {
+                anyhow::ensure!(
+                    base.is_multiple_of(0x200),
+                    "`mmio_base` must be 0x200-byte aligned"
+                );
+                anyhow::ensure!(
+                    base.checked_add(0x200).is_some(),
+                    "`mmio_base` range overflows the GPA space"
+                );
+                anyhow::ensure!(gsiv >= 32, "`mmio_gsiv` must identify a GIC SPI (>= 32)");
+                anyhow::ensure!(
+                    pcie_port.is_none()
+                        && controller.is_none()
+                        && underhill.is_none()
+                        && vtl == DeviceVtl::Vtl0
+                        && !is_dvd,
+                    "fixed virtio-mmio is incompatible with `pcie_port`, `on`, `uh`, `uh-nvme`, `vtl2`, and `dvd`"
+                );
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("`mmio_base` and `mmio_gsiv` must be specified together"),
         }
 
         if controller.is_some() && pcie_port.is_some() {
@@ -2136,6 +2166,8 @@ impl FromStr for DiskCli {
             is_dvd,
             underhill,
             pcie_port,
+            mmio_base,
+            mmio_gsiv,
             controller,
             nsid,
             lun,
@@ -3292,6 +3324,11 @@ fn default_value_from_arch_env(name: &str) -> OsString {
         .unwrap_or_default()
 }
 
+pub(crate) fn default_linux_direct_initrd() -> Option<PathBuf> {
+    let value = default_value_from_arch_env("OPENVMM_LINUX_DIRECT_INITRD");
+    (!value.is_empty()).then(|| value.into())
+}
+
 /// Workaround to use `Option<PathBuf>` alongside [`default_value_from_arch_env`]
 #[derive(Clone)]
 pub struct OptionalPathBuf(pub Option<PathBuf>);
@@ -3536,6 +3573,24 @@ mod tests {
         assert!(DiskCli::from_str("file:disk.vhd,pcie_port=p0,vtl2").is_err());
         assert!(DiskCli::from_str("file:disk.vhd,pcie_port=p0,uh").is_err());
         assert!(DiskCli::from_str("file:disk.vhd,pcie_port=p0,uh-nvme").is_err());
+    }
+
+    #[test]
+    fn test_parse_fixed_virtio_mmio_disk() {
+        let disk =
+            DiskCli::from_str("memdiff:file:disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79").unwrap();
+        assert_eq!(disk.mmio_base, Some(0x0a00_3e00));
+        assert_eq!(disk.mmio_gsiv, Some(79));
+        assert!(disk.pcie_port.is_none());
+
+        assert!(DiskCli::from_str("file:disk.raw,mmio_base=0x0a003e00").is_err());
+        assert!(DiskCli::from_str("file:disk.raw,mmio_gsiv=79").is_err());
+        assert!(
+            DiskCli::from_str("file:disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79,pcie_port=rp0")
+                .is_err()
+        );
+        assert!(DiskCli::from_str("file:disk.raw,mmio_base=0x0a003e01,mmio_gsiv=79").is_err());
+        assert!(DiskCli::from_str("file:disk.raw,mmio_base=0x0a003e00,mmio_gsiv=31").is_err());
     }
 
     #[test]
@@ -4877,6 +4932,17 @@ mod tests {
     fn test_kernel_format_parsed() {
         let opt = Options::try_parse_from(["openvmm", "--kernel-format", "raw"]).unwrap();
         assert_eq!(opt.kernel_format, KernelFormatCli::Raw);
+        assert!(opt.initrd.is_none());
+
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--kernel-format",
+            "linux",
+            "--initrd",
+            "initrd.img",
+        ])
+        .unwrap();
+        assert_eq!(opt.initrd, Some(PathBuf::from("initrd.img")));
     }
 
     #[cfg(guest_arch = "aarch64")]

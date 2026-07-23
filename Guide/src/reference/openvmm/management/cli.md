@@ -159,10 +159,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--virtio-fs`: Expose a virtio-fs file system. The format is the same as `--virtio-9p`. The
   file system can be mounted in a Linux guest using `mount -t virtiofs tag /mnt/point`.
   You can specify this argument multiple times to create multiple file systems.
-* `--virtio-rng`: Add a virtio entropy (RNG) device, exposing `/dev/hwrng` in the Linux guest.
-  The guest kernel must have `CONFIG_HW_RANDOM_VIRTIO` enabled.
-* `--virtio-rng-bus <BUS>`: Select the bus for the virtio-rng device (`auto`, `mmio`, `pci`, `vpci`).
-  Defaults to `auto`.
+* `--virtio-rng [OPTIONS]`: Add a virtio entropy (RNG) device, exposing
+  `/dev/hwrng` in the Linux guest. Options include `bus=auto|mmio|pci|vpci`,
+  `pcie_port=<PORT>`, or paired fixed-placement options
+  `mmio_base=<ADDRESS>,mmio_gsiv=<GSIV>`. The guest kernel must have
+  `CONFIG_HW_RANDOM_VIRTIO` enabled.
 * `--vhost-user <SOCKET_PATH>,type=<TYPE>[,tag=<NAME>][,num_queues=<N>][,queue_size=<N>][,pcie_port=<PORT>]`: Attach a
   vhost-user device backed by an external process over a Unix socket (Linux
   only). The backend process must already be listening on `SOCKET_PATH`.
@@ -194,10 +195,11 @@ Serial devices can be configured to appear as different devices inside the guest
   dropped bytes with its own retransmission. Debugger mode is chosen
   independently per COM port, so one port can talk to WinDbg while another
   behaves normally.
-  * `--serial-mmio-alias <PORT=ADDRESS>`: Add a 4 KiB-aligned MMIO alias for an
-  AArch64 PL011 port in a direct-boot VM, for example
-  `--serial-mmio-alias com1=0x09000000`. The alias maps the same device state,
-  backend, and interrupt and is not advertised in firmware tables.
+  Append `mmio_base_alias=<ADDRESS>` to `--com1` or `--com2` to add a
+  4 KiB-aligned MMIO alias for that AArch64 PL011 device in a direct-boot VM,
+  for example `--com1 console,mmio_base_alias=0x09000000`. The alias maps the
+  same device state, backend, and interrupt and is not advertised in firmware
+  tables.
 * `--virtio-console <BACKEND>`: Expose a virtio console device (appears as
   `/dev/hvc0` inside the guest).
 
@@ -372,6 +374,7 @@ virtio-MMIO transport. `mmio_gsiv` is the full GIC interrupt ID:
 
 ```sh
 --virtio-blk file:/path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
+--virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77
 ```
 
 The fixed transport uses a 0x200-byte register window and must fit below the
@@ -405,10 +408,11 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 --virtio-pmem pcie_port=rp0:/path/to/file
 ```
 
-For `--virtio-rng` and `--virtio-console`, use their separate PCIe port flags:
+For virtio-rng, append the PCIe port to its device options. Virtio-console
+continues to use its separate PCIe port flag:
 
 ```sh
---virtio-rng --virtio-rng-pcie-port rp0
+--virtio-rng pcie_port=rp0
 --virtio-console console --virtio-console-pcie-port rp0
 ```
 

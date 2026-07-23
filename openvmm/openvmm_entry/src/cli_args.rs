@@ -610,8 +610,8 @@ options:
     #[clap(long, value_name = "SMMU_CONFIG")]
     pub smmu: Vec<SmmuCli>,
 
-    /// COM1 binding, optionally prefixed with `debugger-mode:` (see below)
-    /// (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
+    /// COM1 binding, optionally followed by `mmio_base_alias=<address>` or
+    /// prefixed with `debugger-mode:` (see below)
     ///
     /// Prefix the binding with `debugger-mode:` to run this COM port in
     /// debugger mode for WinDbg kernel debugging over serial (KD), e.g.
@@ -638,15 +638,6 @@ options:
     /// (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[clap(long, value_name = "SERIAL")]
     pub com4: Option<ComSerialConfigCli>,
-
-    /// Add an MMIO alias for an ARM64 PL011 serial port (repeatable, e.g. com1=0x09000000)
-    #[cfg(guest_arch = "aarch64")]
-    #[clap(
-        long,
-        value_name = "PORT=ADDRESS",
-        conflicts_with_all = ["uefi", "pcat", "igvm"]
-    )]
-    pub serial_mmio_alias: Vec<SerialMmioAliasCli>,
 
     /// vmbus com1 serial binding (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[structopt(long, value_name = "SERIAL")]
@@ -750,17 +741,14 @@ options:
     #[clap(long, value_name = "[pcie_port=PORT:]PATH")]
     pub virtio_pmem: Option<VirtioPmemArgs>,
 
-    /// add a virtio entropy (RNG) device
-    #[clap(long)]
-    pub virtio_rng: bool,
-
-    /// add a virtio-rng device under either the PCI or MMIO bus, or whatever the hypervisor supports (pci | mmio | vpci | auto)
-    #[clap(long, value_name = "BUS", default_value = "auto")]
-    pub virtio_rng_bus: VirtioBusCli,
-
-    /// attach the virtio-rng device to the specified PCIe port (overrides --virtio-rng-bus)
-    #[clap(long, value_name = "PORT", requires("virtio_rng"))]
-    pub virtio_rng_pcie_port: Option<String>,
+    /// add a virtio entropy (RNG) device, optionally with transport options
+    #[clap(
+        long,
+        value_name = "OPTIONS",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub virtio_rng: Option<VirtioRngCli>,
 
     /// virtio console device backed by a serial backend (/dev/hvc0 in guest)
     ///
@@ -1451,12 +1439,28 @@ fn parse_guest_power_action(s: &str) -> Result<GuestPowerAction, String> {
     }
 }
 
-#[derive(Copy, Clone, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum VirtioBusCli {
     Auto,
     Mmio,
     Pci,
     Vpci,
+}
+
+impl FromStr for VirtioBusCli {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "mmio" => Ok(Self::Mmio),
+            "pci" => Ok(Self::Pci),
+            "vpci" => Ok(Self::Vpci),
+            _ => Err(format!(
+                "invalid virtio bus '{value}'; expected auto, mmio, pci, or vpci"
+            )),
+        }
+    }
 }
 
 /// Parse an optional `pcie_port=<name>:` prefix from a CLI argument string.
@@ -1604,13 +1608,6 @@ fn parse_number(s: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
-/// An additional MMIO base address for an ARM64 PL011 serial port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SerialMmioAliasCli {
-    pub(crate) port_index: usize,
-    pub(crate) base: u64,
-}
-
 /// Direct-boot image format.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum KernelFormatCli {
@@ -1621,26 +1618,6 @@ pub enum KernelFormatCli {
     Linux,
     /// Load an opaque flat binary.
     Raw,
-}
-
-impl FromStr for SerialMmioAliasCli {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (port, base) = value
-            .split_once('=')
-            .ok_or_else(|| "expected PORT=ADDRESS".to_string())?;
-        let port_index = match port {
-            "com1" => 0,
-            "com2" => 1,
-            _ => return Err("PORT must be com1 or com2".to_string()),
-        };
-        let base = parse_number(base).map_err(|err| format!("invalid MMIO address: {err}"))?;
-        if !base.is_multiple_of(0x1000) {
-            return Err("MMIO address must be 4 KiB aligned".to_string());
-        }
-        Ok(Self { port_index, base })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1997,6 +1974,127 @@ pub struct VncCli {
     pub vnc_evict_oldest: bool,
 }
 
+/// Explicit placement for a 0x200-byte virtio-MMIO transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedVirtioMmioCli {
+    /// Guest-physical base address.
+    pub address: u64,
+    /// Full GIC interrupt ID.
+    pub gsiv: u32,
+}
+
+impl From<FixedVirtioMmioCli> for openvmm_defs::config::VirtioMmioConfig {
+    fn from(value: FixedVirtioMmioCli) -> Self {
+        Self {
+            address: value.address,
+            gsiv: value.gsiv,
+        }
+    }
+}
+
+#[derive(Default, vmm_cli::KeyValueArgs)]
+struct FixedVirtioMmioArgs {
+    mmio_base: Option<HexAddress>,
+    mmio_gsiv: Option<u32>,
+}
+
+impl FixedVirtioMmioArgs {
+    fn resolve(self) -> anyhow::Result<Option<FixedVirtioMmioCli>> {
+        match (self.mmio_base, self.mmio_gsiv) {
+            (Some(base), Some(gsiv)) => {
+                anyhow::ensure!(
+                    base.0.is_multiple_of(0x200),
+                    "`mmio_base` must be 0x200-byte aligned"
+                );
+                anyhow::ensure!(
+                    base.0.checked_add(0x200).is_some(),
+                    "`mmio_base` range overflows the GPA space"
+                );
+                anyhow::ensure!(gsiv >= 32, "`mmio_gsiv` must identify a GIC SPI (>= 32)");
+                Ok(Some(FixedVirtioMmioCli {
+                    address: base.0,
+                    gsiv,
+                }))
+            }
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("`mmio_base` and `mmio_gsiv` must be specified together"),
+        }
+    }
+}
+
+#[derive(Default, vmm_cli::KeyValueArgs)]
+struct VirtioTransportArgs {
+    pcie_port: Option<String>,
+    #[kv(flatten)]
+    mmio: FixedVirtioMmioArgs,
+}
+
+impl VirtioTransportArgs {
+    fn resolve(self) -> anyhow::Result<(Option<String>, Option<FixedVirtioMmioCli>)> {
+        let mmio = self.mmio.resolve()?;
+        anyhow::ensure!(
+            self.pcie_port.is_none() || mmio.is_none(),
+            "`pcie_port` is incompatible with fixed virtio-MMIO placement"
+        );
+        Ok((self.pcie_port, mmio))
+    }
+}
+
+#[derive(Default, vmm_cli::KeyValueArgs)]
+struct VirtioRngArgs {
+    #[kv(flatten)]
+    transport: VirtioTransportArgs,
+    bus: Option<String>,
+}
+
+/// Configuration for a virtio entropy device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtioRngCli {
+    /// Automatically selected or explicitly requested virtio bus.
+    pub bus: VirtioBusCli,
+    /// Named emulated PCIe root port.
+    pub pcie_port: Option<String>,
+    /// Explicit fixed virtio-MMIO placement.
+    pub mmio: Option<FixedVirtioMmioCli>,
+}
+
+impl FromStr for VirtioRngCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        let VirtioRngArgs { transport, bus } = if value.is_empty() {
+            VirtioRngArgs::default()
+        } else {
+            value.parse()?
+        };
+        let (pcie_port, mmio) = transport.resolve()?;
+        let bus = bus
+            .as_deref()
+            .unwrap_or("auto")
+            .parse::<VirtioBusCli>()
+            .map_err(anyhow::Error::msg)?;
+
+        if pcie_port.is_some() {
+            anyhow::ensure!(
+                matches!(bus, VirtioBusCli::Auto | VirtioBusCli::Pci),
+                "`pcie_port` requires `bus=auto` or `bus=pci`"
+            );
+        }
+        if mmio.is_some() {
+            anyhow::ensure!(
+                matches!(bus, VirtioBusCli::Auto | VirtioBusCli::Mmio),
+                "fixed virtio-MMIO placement requires `bus=auto` or `bus=mmio`"
+            );
+        }
+
+        Ok(Self {
+            bus,
+            pcie_port,
+            mmio,
+        })
+    }
+}
+
 // <kind>[,ro]
 #[derive(Clone)]
 pub struct DiskCli {
@@ -2006,8 +2104,7 @@ pub struct DiskCli {
     pub is_dvd: bool,
     pub underhill: Option<UnderhillDiskSource>,
     pub pcie_port: Option<String>,
-    pub mmio_base: Option<u64>,
-    pub mmio_gsiv: Option<u32>,
+    pub mmio: Option<FixedVirtioMmioCli>,
     pub controller: Option<String>,
     pub nsid: Option<u32>,
     pub lun: Option<u8>,
@@ -2060,9 +2157,8 @@ struct DiskArgs {
     uh: bool,
     #[kv(flag, key = "uh-nvme")]
     uh_nvme: bool,
-    pcie_port: Option<String>,
-    mmio_base: Option<HexAddress>,
-    mmio_gsiv: Option<u32>,
+    #[kv(flatten)]
+    transport: VirtioTransportArgs,
     #[kv(key = "on")]
     controller: Option<String>,
     nsid: Option<u32>,
@@ -2085,9 +2181,7 @@ impl FromStr for DiskCli {
         let read_only = args.ro || args.dvd;
         let is_dvd = args.dvd;
         let vtl = args.vtl;
-        let pcie_port = args.pcie_port;
-        let mmio_base = args.mmio_base.map(|address| address.0);
-        let mmio_gsiv = args.mmio_gsiv;
+        let (pcie_port, mmio) = args.transport.resolve()?;
         let controller = args.controller;
         let nsid = args.nsid;
         let lun = args.lun;
@@ -2101,28 +2195,11 @@ impl FromStr for DiskCli {
             anyhow::bail!("`pcie_port` is incompatible with `uh`, `uh-nvme`, `vtl2`, and `dvd`");
         }
 
-        match (mmio_base, mmio_gsiv) {
-            (Some(base), Some(gsiv)) => {
-                anyhow::ensure!(
-                    base.is_multiple_of(0x200),
-                    "`mmio_base` must be 0x200-byte aligned"
-                );
-                anyhow::ensure!(
-                    base.checked_add(0x200).is_some(),
-                    "`mmio_base` range overflows the GPA space"
-                );
-                anyhow::ensure!(gsiv >= 32, "`mmio_gsiv` must identify a GIC SPI (>= 32)");
-                anyhow::ensure!(
-                    pcie_port.is_none()
-                        && controller.is_none()
-                        && underhill.is_none()
-                        && vtl == DeviceVtl::Vtl0
-                        && !is_dvd,
-                    "fixed virtio-mmio is incompatible with `pcie_port`, `on`, `uh`, `uh-nvme`, `vtl2`, and `dvd`"
-                );
-            }
-            (None, None) => {}
-            _ => anyhow::bail!("`mmio_base` and `mmio_gsiv` must be specified together"),
+        if mmio.is_some() {
+            anyhow::ensure!(
+                controller.is_none() && underhill.is_none() && vtl == DeviceVtl::Vtl0 && !is_dvd,
+                "fixed virtio-mmio is incompatible with `on`, `uh`, `uh-nvme`, `vtl2`, and `dvd`"
+            );
         }
 
         if controller.is_some() && pcie_port.is_some() {
@@ -2166,8 +2243,7 @@ impl FromStr for DiskCli {
             is_dvd,
             underhill,
             pcie_port,
-            mmio_base,
-            mmio_gsiv,
+            mmio,
             controller,
             nsid,
             lun,
@@ -2385,22 +2461,47 @@ pub struct ComSerialConfigCli {
     pub debugger_mode: bool,
     /// The serial backend for this COM port.
     pub backend: SerialConfigCli,
+    /// Additional guest-physical MMIO base for the same serial device.
+    pub mmio_base_alias: Option<u64>,
 }
 
 impl FromStr for ComSerialConfigCli {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.strip_prefix("debugger-mode:") {
-            Some(rest) => Ok(Self {
-                debugger_mode: true,
-                backend: rest.parse()?,
-            }),
-            None => Ok(Self {
-                debugger_mode: false,
-                backend: s.parse()?,
-            }),
+        let (debugger_mode, value) = match s.strip_prefix("debugger-mode:") {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+
+        let mut backend_parts = Vec::new();
+        let mut mmio_base_alias = None;
+        for part in value.split(',') {
+            if let Some(address) = part.strip_prefix("mmio_base_alias=") {
+                if mmio_base_alias.is_some() {
+                    return Err("`mmio_base_alias` was specified more than once".to_string());
+                }
+                let address = parse_number(address)
+                    .map_err(|err| format!("invalid MMIO alias address: {err}"))?;
+                if !address.is_multiple_of(0x1000) {
+                    return Err("`mmio_base_alias` must be 4 KiB aligned".to_string());
+                }
+                mmio_base_alias = Some(address);
+            } else if part == "mmio_base_alias" {
+                return Err("`mmio_base_alias` requires a value".to_string());
+            } else {
+                backend_parts.push(part);
+            }
         }
+        if backend_parts.is_empty() {
+            return Err("serial configuration requires a backend".to_string());
+        }
+
+        Ok(Self {
+            debugger_mode,
+            backend: backend_parts.join(",").parse()?,
+            mmio_base_alias,
+        })
     }
 }
 
@@ -3579,8 +3680,13 @@ mod tests {
     fn test_parse_fixed_virtio_mmio_disk() {
         let disk =
             DiskCli::from_str("memdiff:file:disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79").unwrap();
-        assert_eq!(disk.mmio_base, Some(0x0a00_3e00));
-        assert_eq!(disk.mmio_gsiv, Some(79));
+        assert_eq!(
+            disk.mmio,
+            Some(FixedVirtioMmioCli {
+                address: 0x0a00_3e00,
+                gsiv: 79,
+            })
+        );
         assert!(disk.pcie_port.is_none());
 
         assert!(DiskCli::from_str("file:disk.raw,mmio_base=0x0a003e00").is_err());
@@ -4875,6 +4981,7 @@ mod tests {
         let com1 = opt.com1.unwrap();
         assert!(!com1.debugger_mode);
         assert_eq!(com1.backend, SerialConfigCli::None);
+        assert!(com1.mmio_base_alias.is_none());
 
         // The `debugger-mode:` prefix enables debugger mode for just that port,
         // and the remainder still parses as the backend.
@@ -4889,6 +4996,7 @@ mod tests {
         let com1 = opt.com1.unwrap();
         assert!(com1.debugger_mode);
         assert_eq!(com1.backend, SerialConfigCli::Pipe("/tmp/kd".into()));
+        assert!(com1.mmio_base_alias.is_none());
         // Other ports remain independent (not in debugger mode).
         assert!(!opt.com2.unwrap().debugger_mode);
 
@@ -4945,20 +5053,64 @@ mod tests {
         assert_eq!(opt.initrd, Some(PathBuf::from("initrd.img")));
     }
 
-    #[cfg(guest_arch = "aarch64")]
     #[test]
     fn test_serial_mmio_alias_parsed() {
         let opt =
-            Options::try_parse_from(["openvmm", "--serial-mmio-alias", "com1=0x09000000"]).unwrap();
-        assert_eq!(
-            opt.serial_mmio_alias,
-            [SerialMmioAliasCli {
-                port_index: 0,
-                base: 0x0900_0000,
-            }]
+            Options::try_parse_from(["openvmm", "--com1", "console,mmio_base_alias=0x09000000"])
+                .unwrap();
+        let com1 = opt.com1.unwrap();
+        assert_eq!(com1.backend, SerialConfigCli::Console);
+        assert_eq!(com1.mmio_base_alias, Some(0x0900_0000));
+
+        let config =
+            ComSerialConfigCli::from_str("debugger-mode:listen=/tmp/kd,mmio_base_alias=0x09000000")
+                .unwrap();
+        assert!(config.debugger_mode);
+        assert_eq!(config.backend, SerialConfigCli::Pipe("/tmp/kd".into()));
+        assert_eq!(config.mmio_base_alias, Some(0x0900_0000));
+
+        assert!(ComSerialConfigCli::from_str("console,mmio_base_alias=0x09000001").is_err());
+        assert!(ComSerialConfigCli::from_str("mmio_base_alias=0x09000000").is_err());
+        assert!(
+            ComSerialConfigCli::from_str(
+                "console,mmio_base_alias=0x09000000,mmio_base_alias=0x0a000000"
+            )
+            .is_err()
         );
-        assert!(SerialMmioAliasCli::from_str("com3=0x09000000").is_err());
-        assert!(SerialMmioAliasCli::from_str("com1=0x09000001").is_err());
+    }
+
+    #[test]
+    fn test_virtio_rng_options_parsed() {
+        let opt =
+            Options::try_parse_from(["openvmm", "--virtio-rng", "--kernel-format", "raw"]).unwrap();
+        let rng = opt.virtio_rng.unwrap();
+        assert_eq!(rng.bus, VirtioBusCli::Auto);
+        assert!(rng.pcie_port.is_none());
+        assert!(rng.mmio.is_none());
+
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--virtio-rng",
+            "mmio_base=0x0a003a00,mmio_gsiv=77",
+        ])
+        .unwrap();
+        assert_eq!(
+            opt.virtio_rng.unwrap().mmio,
+            Some(FixedVirtioMmioCli {
+                address: 0x0a00_3a00,
+                gsiv: 77,
+            })
+        );
+
+        let rng = VirtioRngCli::from_str("bus=pci,pcie_port=rp0").unwrap();
+        assert_eq!(rng.bus, VirtioBusCli::Pci);
+        assert_eq!(rng.pcie_port.as_deref(), Some("rp0"));
+        assert!(rng.mmio.is_none());
+
+        assert!(VirtioRngCli::from_str("mmio_base=0x0a003a00").is_err());
+        assert!(VirtioRngCli::from_str("mmio_gsiv=77").is_err());
+        assert!(VirtioRngCli::from_str("mmio_base=0x0a003a00,mmio_gsiv=77,pcie_port=rp0").is_err());
+        assert!(VirtioRngCli::from_str("bus=pci,mmio_base=0x0a003a00,mmio_gsiv=77").is_err());
     }
 
     #[test]

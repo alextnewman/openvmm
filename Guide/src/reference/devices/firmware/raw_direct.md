@@ -37,7 +37,7 @@ additional address to the same UART instance:
 
 ```bash
 openvmm --kernel path/to/image.bin \
-    --serial-mmio-alias com1=0x09000000
+    --com1 console,mmio_base_alias=0x09000000
 ```
 
 The alias shares the canonical UART's complete device state, backend, and
@@ -46,13 +46,14 @@ interrupt. It is not emitted in ACPI or the device tree. Alias ranges must be
 
 ## Fixed virtio-MMIO
 
-Firmware-less guests may also require a virtio device at a predetermined
-address and interrupt. A virtio-blk disk can use an explicit 0x200-byte MMIO
-window and full GIC interrupt ID:
+Firmware-less guests may also require virtio devices at predetermined
+addresses and interrupts. Device options use `mmio_base` for the explicit
+0x200-byte MMIO window and `mmio_gsiv` for the full GIC interrupt ID:
 
 ```bash
 openvmm --kernel path/to/image.bin \
-    --virtio-blk file:path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
+    --virtio-blk file:path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79 \
+    --virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77
 ```
 
 Fixed virtio-MMIO placement is limited to AArch64 direct boot and must fit

@@ -325,6 +325,54 @@ async fn vm_config_from_command_line(
         opt.com4.as_ref().is_some_and(|c| c.debugger_mode),
     ];
 
+    let serial_mmio_base_aliases = [
+        opt.com1.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com2.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com3.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com4.as_ref().and_then(|config| config.mmio_base_alias),
+    ];
+
+    #[cfg(not(guest_arch = "aarch64"))]
+    anyhow::ensure!(
+        serial_mmio_base_aliases.iter().all(Option::is_none),
+        "`mmio_base_alias` is only supported for AArch64 PL011 serial devices"
+    );
+
+    #[cfg(guest_arch = "aarch64")]
+    {
+        anyhow::ensure!(
+            serial_mmio_base_aliases[2..].iter().all(Option::is_none),
+            "`mmio_base_alias` is only supported on com1 and com2"
+        );
+        anyhow::ensure!(
+            serial_mmio_base_aliases.iter().all(Option::is_none)
+                || (!opt.uefi && !opt.pcat && opt.igvm.is_none()),
+            "`mmio_base_alias` is only supported with direct boot"
+        );
+
+        let serial_options = [opt.com1.as_ref(), opt.com2.as_ref()];
+        let mut used_bases = Vec::new();
+        for (port_index, alias) in serial_mmio_base_aliases[..2].iter().copied().enumerate() {
+            let Some(base) = alias else {
+                continue;
+            };
+            anyhow::ensure!(
+                serial_options[port_index]
+                    .is_some_and(|config| !matches!(&config.backend, SerialConfigCli::None)),
+                "cannot add an MMIO alias for a disabled serial port"
+            );
+            anyhow::ensure!(
+                base.checked_add(0x1000).is_some_and(|end| end <= 1 << 30),
+                "serial MMIO aliases must fit below the 1 GiB direct-boot RAM base"
+            );
+            anyhow::ensure!(
+                !used_bases.contains(&base),
+                "serial MMIO alias {base:#x} was specified more than once"
+            );
+            used_bases.push(base);
+        }
+    }
+
     let serial0_cfg = setup_serial(
         "com1",
         opt.com1
@@ -505,15 +553,14 @@ async fn vm_config_from_command_line(
         is_dvd,
         underhill,
         ref pcie_port,
-        mmio_base,
-        mmio_gsiv,
+        mmio,
         ref controller,
         nsid,
         lun,
         ref relay,
     } in &opt.disk
     {
-        if mmio_base.is_some() || mmio_gsiv.is_some() {
+        if mmio.is_some() {
             anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
         }
         if controller.is_none() && underhill.is_none() && relay.is_none() {
@@ -614,15 +661,14 @@ async fn vm_config_from_command_line(
         is_dvd,
         underhill,
         ref pcie_port,
-        mmio_base,
-        mmio_gsiv,
+        mmio,
         controller: _,
         nsid: _,
         lun: _,
         relay: _,
     } in &opt.nvme
     {
-        if mmio_base.is_some() || mmio_gsiv.is_some() {
+        if mmio.is_some() {
             anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
         }
         let target = if let Some(port) = pcie_port {
@@ -646,8 +692,7 @@ async fn vm_config_from_command_line(
         is_dvd,
         ref underhill,
         ref pcie_port,
-        mmio_base,
-        mmio_gsiv,
+        mmio,
         controller: _,
         nsid: _,
         lun: _,
@@ -664,9 +709,7 @@ async fn vm_config_from_command_line(
                 None,
                 storage_builder::DiskLocation::VirtioBlk {
                     pcie_port: pcie_port.clone(),
-                    mmio: mmio_base.zip(mmio_gsiv).map(|(address, gsiv)| {
-                        openvmm_defs::config::VirtioMmioConfig { address, gsiv }
-                    }),
+                    mmio: mmio.map(Into::into),
                 },
                 kind,
                 is_dvd,
@@ -1173,32 +1216,10 @@ async fn vm_config_from_command_line(
         || serial3_cfg.is_some();
 
     #[cfg(guest_arch = "aarch64")]
-    let serial_pl011_mmio_aliases = {
-        let serial_configured = [serial0_cfg.is_some(), serial1_cfg.is_some()];
-        let mut aliases = [Vec::new(), Vec::new()];
-        let mut used_bases = Vec::new();
-        for alias in &opt.serial_mmio_alias {
-            anyhow::ensure!(
-                serial_configured[alias.port_index],
-                "cannot add an MMIO alias for a disabled serial port"
-            );
-            anyhow::ensure!(
-                alias
-                    .base
-                    .checked_add(0x1000)
-                    .is_some_and(|end| end <= 1 << 30),
-                "serial MMIO aliases must fit below the 1 GiB direct-boot RAM base"
-            );
-            anyhow::ensure!(
-                !used_bases.contains(&alias.base),
-                "serial MMIO alias {:#x} was specified more than once",
-                alias.base
-            );
-            used_bases.push(alias.base);
-            aliases[alias.port_index].push(alias.base);
-        }
-        aliases
-    };
+    let serial_pl011_mmio_aliases: [Vec<u64>; 2] = [
+        serial_mmio_base_aliases[0].into_iter().collect(),
+        serial_mmio_base_aliases[1].into_iter().collect(),
+    ];
 
     let has_com3 = serial2_cfg.is_some();
 
@@ -1784,32 +1805,39 @@ async fn vm_config_from_command_line(
     }
 
     let mut virtio_devices = Vec::new();
-    let mut add_virtio_device = |bus, resource: Resource<VirtioDeviceHandle>| {
-        let bus = match bus {
-            VirtioBusCli::Auto => {
-                // Use VPCI when possible (currently only on Windows and macOS due
-                // to KVM backend limitations).
-                if with_hv && (cfg!(windows) || cfg!(target_os = "macos")) {
-                    None
-                } else {
-                    Some(VirtioBus::Pci)
+    let mut add_virtio_device =
+        |bus,
+         mmio: Option<cli_args::FixedVirtioMmioCli>,
+         resource: Resource<VirtioDeviceHandle>| {
+            let bus = if let Some(mmio) = mmio {
+                Some(VirtioBus::MmioFixed(mmio.into()))
+            } else {
+                match bus {
+                    VirtioBusCli::Auto => {
+                        // Use VPCI when possible (currently only on Windows and macOS due
+                        // to KVM backend limitations).
+                        if with_hv && (cfg!(windows) || cfg!(target_os = "macos")) {
+                            None
+                        } else {
+                            Some(VirtioBus::Pci)
+                        }
+                    }
+                    VirtioBusCli::Mmio => Some(VirtioBus::Mmio),
+                    VirtioBusCli::Pci => Some(VirtioBus::Pci),
+                    VirtioBusCli::Vpci => None,
                 }
+            };
+            if let Some(bus) = bus {
+                virtio_devices.push((bus, resource));
+            } else {
+                vpci_devices.push(VpciDeviceConfig {
+                    vtl: DeviceVtl::Vtl0,
+                    instance_id: Guid::new_random(),
+                    resource: VirtioPciDeviceHandle(resource).into_resource(),
+                    vnode: None,
+                });
             }
-            VirtioBusCli::Mmio => Some(VirtioBus::Mmio),
-            VirtioBusCli::Pci => Some(VirtioBus::Pci),
-            VirtioBusCli::Vpci => None,
         };
-        if let Some(bus) = bus {
-            virtio_devices.push((bus, resource));
-        } else {
-            vpci_devices.push(VpciDeviceConfig {
-                vtl: DeviceVtl::Vtl0,
-                instance_id: Guid::new_random(),
-                resource: VirtioPciDeviceHandle(resource).into_resource(),
-                vnode: None,
-            });
-        }
-    };
 
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
@@ -1828,7 +1856,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource);
+            add_virtio_device(VirtioBusCli::Auto, None, resource);
         }
     }
 
@@ -1847,7 +1875,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_fs_bus, resource);
+            add_virtio_device(opt.virtio_fs_bus, None, resource);
         }
     }
 
@@ -1865,7 +1893,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_fs_bus, resource);
+            add_virtio_device(opt.virtio_fs_bus, None, resource);
         }
     }
 
@@ -1882,7 +1910,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource);
+            add_virtio_device(VirtioBusCli::Auto, None, resource);
         }
     }
 
@@ -1897,20 +1925,20 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource);
+            add_virtio_device(VirtioBusCli::Auto, None, resource);
         }
     }
 
-    if opt.virtio_rng {
+    if let Some(rng) = &opt.virtio_rng {
         let resource: Resource<VirtioDeviceHandle> =
             virtio_resources::rng::VirtioRngHandle.into_resource();
-        if let Some(pcie_port) = &opt.virtio_rng_pcie_port {
+        if let Some(pcie_port) = &rng.pcie_port {
             pcie_devices.push(PcieDeviceConfig {
                 port_name: pcie_port.clone(),
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_rng_bus, resource);
+            add_virtio_device(rng.bus, rng.mmio, resource);
         }
     }
 
@@ -1923,7 +1951,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource);
+            add_virtio_device(VirtioBusCli::Auto, None, resource);
         }
     }
 
@@ -1976,7 +2004,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource);
+            add_virtio_device(VirtioBusCli::Auto, None, resource);
         }
     }
 
@@ -1984,6 +2012,7 @@ async fn vm_config_from_command_line(
         let listener = vsock_listener(Some(vsock_path))?.unwrap();
         add_virtio_device(
             VirtioBusCli::Auto,
+            None,
             virtio_resources::vsock::VirtioVsockHandle {
                 // The guest CID does not matter since the UDS relay does not use it. It just needs
                 // to be some non-reserved value for the guest to use.

@@ -16,6 +16,8 @@ use vm_resource::kind::SerialBackendHandle;
 pub struct SerialPl011DeviceHandle {
     /// The base address for MMIO.
     pub base: u64,
+    /// Additional MMIO base addresses that decode to the same device.
+    pub mmio_aliases: Vec<u64>,
     /// IRQ line for interrupts.
     pub irq: u32,
     /// The IO backend.

@@ -85,6 +85,10 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--uefi`: Boot using `mu_msvm` UEFI
 * `--uefi-firmware <FILE>`: Path to the UEFI firmware file (`MSVM.fd`). When `--uefi` is specified, this option is required only if you do not set the environment variable `OPENVMM_UEFI_FIRMWARE` (or the architecture-specific variants `X86_64_OPENVMM_UEFI_FIRMWARE`, or `AARCH64_OPENVMM_UEFI_FIRMWARE`). If omitted, the default is read from `OPENVMM_UEFI_FIRMWARE` first, then falls back to the architecture-specific variables.
 * `--pcat`: Boot using the Microsoft Hyper-V PCAT BIOS
+* `--kernel <FILE>`: Direct-boot an executable image.
+* `--kernel-format <auto|linux|raw>`: Select direct-boot image handling.
+  AArch64 `auto` recognizes Linux `Image` headers and otherwise uses raw
+  loading. Raw loading is not supported on x86_64.
 * `--vmbus-scsi id=<name>[,sub_channels=<N>][,vtl2]`: Creates a
   named VMBus SCSI controller. Use with `--disk ...,on=<name>` to
   attach disks.
@@ -190,6 +194,10 @@ Serial devices can be configured to appear as different devices inside the guest
   dropped bytes with its own retransmission. Debugger mode is chosen
   independently per COM port, so one port can talk to WinDbg while another
   behaves normally.
+  * `--serial-mmio-alias <PORT=ADDRESS>`: Add a 4 KiB-aligned MMIO alias for an
+  AArch64 PL011 port in a direct-boot VM, for example
+  `--serial-mmio-alias com1=0x09000000`. The alias maps the same device state,
+  backend, and interrupt and is not advertised in firmware tables.
 * `--virtio-console <BACKEND>`: Expose a virtio console device (appears as
   `/dev/hvc0` inside the guest).
 

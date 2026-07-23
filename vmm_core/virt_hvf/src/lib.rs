@@ -10,6 +10,7 @@
 #![expect(unsafe_code)]
 
 mod abi;
+mod emu;
 mod hypercall;
 mod vp_actor;
 mod vp_state;
@@ -214,11 +215,15 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
             ),
             self.config.processor_topology.gic_nr_irqs() - 32,
         );
+        let vp_count = self.config.processor_topology.vp_count() as usize;
         let gicrs = self
             .config
             .processor_topology
             .vps_arch()
-            .map(|vp_info| gicd.add_redistributor(vp_info.mpidr.into(), true))
+            .enumerate()
+            .map(|(index, vp_info)| {
+                gicd.add_redistributor(vp_info.mpidr.into(), index + 1 == vp_count)
+            })
             .collect::<Vec<_>>();
 
         let inner = Arc::new(HvfPartitionInner {
@@ -1146,6 +1151,25 @@ impl HvfVcpu {
         }
     }
 
+    fn q(&self, n: u8) -> u128 {
+        assert!(n < 32);
+        let mut value = [0; 16];
+        // SAFETY: `value` is a valid 16-byte output buffer.
+        unsafe { abi::openvmm_hv_vcpu_get_simd_fp_reg(self.vcpu, n.into(), value.as_mut_ptr()) }
+            .chk()
+            .expect("unrecoverable error getting SIMD register");
+        u128::from_ne_bytes(value)
+    }
+
+    fn set_q(&mut self, n: u8, value: u128) {
+        assert!(n < 32);
+        let value = value.to_ne_bytes();
+        // SAFETY: `value` is a valid 16-byte input buffer.
+        unsafe { abi::openvmm_hv_vcpu_set_simd_fp_reg(self.vcpu, n.into(), value.as_ptr()) }
+            .chk()
+            .expect("unrecoverable error setting SIMD register");
+    }
+
     fn pc(&self) -> u64 {
         self.reg(abi::HvReg::PC)
             .expect("unrecoverable error getting PC")
@@ -1461,6 +1485,12 @@ impl HvfProcessor<'_> {
     fn power_on(&mut self, cpu_on: CpuOnState) -> Result<(), Error> {
         self.recreate_vcpu()?;
         self.set_reset_registers(Some(cpu_on))?;
+        tracing::trace!(
+            vp = self.inner.vp_info.base.vp_index.index(),
+            expected_mpidr = u64::from(self.inner.vp_info.mpidr),
+            actual_mpidr = self.vcpu.sys_reg(abi::HvSysReg::MPIDR_EL1)?,
+            "powered on vCPU"
+        );
         self.pmu = PmuState::default();
         self.physical_timer = PhysicalTimer::default();
         self.wfi = false;
@@ -1810,61 +1840,66 @@ impl<'p> Processor for HvfProcessor<'p> {
                         ExceptionClass::DATA_ABORT_LOWER => {
                             let iss = IssDataAbort::from(exception.syndrome.iss());
                             if !iss.isv() {
-                                return Err(dev.fatal_error(
-                                    anyhow::anyhow!("can't handle data abort without isv: {iss:?}")
-                                        .into(),
-                                ));
-                            }
-                            let len = 1 << iss.sas();
-                            let sign_extend = iss.sse();
+                                emu::emulate_data_abort(
+                                    &mut self.vcpu,
+                                    self.partition,
+                                    vp_index,
+                                    exception,
+                                    dev,
+                                )
+                                .await?;
+                            } else {
+                                let len = 1 << iss.sas();
+                                let sign_extend = iss.sse();
 
-                            // SRT 31 encodes XZR, not SP.
-                            let reg = iss.srt();
+                                // SRT 31 encodes XZR, not SP.
+                                let reg = iss.srt();
 
-                            if iss.wnr() {
-                                let data = if reg_is_xzr(reg) {
-                                    0
-                                } else {
-                                    self.vcpu.gp(reg)
-                                }
-                                .to_ne_bytes();
-                                if !self
-                                    .partition
-                                    .gicd
-                                    .write(exception.physical_address, &data[..len])
-                                {
-                                    dev.write_mmio(
-                                        vp_index,
-                                        exception.physical_address,
-                                        &data[..len],
-                                    )
-                                    .await;
-                                }
-                            } else if !reg_is_xzr(reg) {
-                                let mut data = [0; 8];
-                                if !self
-                                    .partition
-                                    .gicd
-                                    .read(exception.physical_address, &mut data[..len])
-                                {
-                                    dev.read_mmio(
-                                        vp_index,
-                                        exception.physical_address,
-                                        &mut data[..len],
-                                    )
-                                    .await;
-                                }
-                                let mut data = u64::from_ne_bytes(data);
-                                if sign_extend {
-                                    let shift = 64 - len * 8;
-                                    data = ((data as i64) << shift >> shift) as u64;
-                                    if !iss.sf() {
-                                        data &= 0xffffffff;
+                                if iss.wnr() {
+                                    let data = if reg_is_xzr(reg) {
+                                        0
+                                    } else {
+                                        self.vcpu.gp(reg)
                                     }
+                                    .to_ne_bytes();
+                                    if !self
+                                        .partition
+                                        .gicd
+                                        .write(exception.physical_address, &data[..len])
+                                    {
+                                        dev.write_mmio(
+                                            vp_index,
+                                            exception.physical_address,
+                                            &data[..len],
+                                        )
+                                        .await;
+                                    }
+                                } else if !reg_is_xzr(reg) {
+                                    let mut data = [0; 8];
+                                    if !self
+                                        .partition
+                                        .gicd
+                                        .read(exception.physical_address, &mut data[..len])
+                                    {
+                                        dev.read_mmio(
+                                            vp_index,
+                                            exception.physical_address,
+                                            &mut data[..len],
+                                        )
+                                        .await;
+                                    }
+                                    let mut data = u64::from_ne_bytes(data);
+                                    if sign_extend {
+                                        let shift = 64 - len * 8;
+                                        data = ((data as i64) << shift >> shift) as u64;
+                                        if !iss.sf() {
+                                            data &= 0xffffffff;
+                                        }
+                                    }
+                                    self.vcpu.set_gp(reg, data);
                                 }
-                                self.vcpu.set_gp(reg, data);
+                                advance(&mut self.vcpu);
                             }
-                            advance(&mut self.vcpu);
                         }
                         ExceptionClass::SYSTEM => {
                             let iss = IssSystem::from(exception.syndrome.iss());

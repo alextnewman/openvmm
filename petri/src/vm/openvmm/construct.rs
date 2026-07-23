@@ -880,6 +880,7 @@ impl PetriVmConfigSetupCore<'_> {
                     initrd: Some(initrd),
                     cmdline,
                     enable_serial: self.enable_serial,
+                    image_format: openvmm_defs::config::DirectBootImageFormat::Linux,
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                 }
             }

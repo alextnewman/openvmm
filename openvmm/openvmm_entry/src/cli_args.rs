@@ -263,9 +263,13 @@ Examples:
     #[clap(short = 'P', long)]
     pub paused: bool,
 
-    /// kernel image (when using linux direct boot)
+    /// executable image for direct boot
     #[clap(short = 'k', long, value_name = "FILE", default_value = default_value_from_arch_env("OPENVMM_LINUX_DIRECT_KERNEL"))]
     pub kernel: OptionalPathBuf,
+
+    /// direct-boot image format
+    #[clap(long, value_enum, default_value_t)]
+    pub kernel_format: KernelFormatCli,
 
     /// initrd image (when using linux direct boot)
     #[clap(short = 'r', long, value_name = "FILE", default_value = default_value_from_arch_env("OPENVMM_LINUX_DIRECT_INITRD"))]
@@ -634,6 +638,15 @@ options:
     /// (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[clap(long, value_name = "SERIAL")]
     pub com4: Option<ComSerialConfigCli>,
+
+    /// Add an MMIO alias for an ARM64 PL011 serial port (repeatable, e.g. com1=0x09000000)
+    #[cfg(guest_arch = "aarch64")]
+    #[clap(
+        long,
+        value_name = "PORT=ADDRESS",
+        conflicts_with_all = ["uefi", "pcat", "igvm"]
+    )]
+    pub serial_mmio_alias: Vec<SerialMmioAliasCli>,
 
     /// vmbus com1 serial binding (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[structopt(long, value_name = "SERIAL")]
@@ -1588,6 +1601,45 @@ fn parse_number(s: &str) -> Result<u64, std::num::ParseIntError> {
     match s.strip_prefix("0x") {
         Some(rest) => u64::from_str_radix(rest, 16),
         None => s.parse::<u64>(),
+    }
+}
+
+/// An additional MMIO base address for an ARM64 PL011 serial port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SerialMmioAliasCli {
+    pub(crate) port_index: usize,
+    pub(crate) base: u64,
+}
+
+/// Direct-boot image format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum KernelFormatCli {
+    /// Detect Linux ARM64 Image files and otherwise use raw AArch64 loading.
+    #[default]
+    Auto,
+    /// Require a Linux kernel image.
+    Linux,
+    /// Load an opaque flat binary.
+    Raw,
+}
+
+impl FromStr for SerialMmioAliasCli {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (port, base) = value
+            .split_once('=')
+            .ok_or_else(|| "expected PORT=ADDRESS".to_string())?;
+        let port_index = match port {
+            "com1" => 0,
+            "com2" => 1,
+            _ => return Err("PORT must be com1 or com2".to_string()),
+        };
+        let base = parse_number(base).map_err(|err| format!("invalid MMIO address: {err}"))?;
+        if !base.is_multiple_of(0x1000) {
+            return Err("MMIO address must be 4 KiB aligned".to_string());
+        }
+        Ok(Self { port_index, base })
     }
 }
 
@@ -4819,6 +4871,28 @@ mod tests {
     fn test_pidfile_option_parsed() {
         let opt = Options::try_parse_from(["openvmm", "--pidfile", "/tmp/test.pid"]).unwrap();
         assert_eq!(opt.pidfile, Some(PathBuf::from("/tmp/test.pid")));
+    }
+
+    #[test]
+    fn test_kernel_format_parsed() {
+        let opt = Options::try_parse_from(["openvmm", "--kernel-format", "raw"]).unwrap();
+        assert_eq!(opt.kernel_format, KernelFormatCli::Raw);
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn test_serial_mmio_alias_parsed() {
+        let opt =
+            Options::try_parse_from(["openvmm", "--serial-mmio-alias", "com1=0x09000000"]).unwrap();
+        assert_eq!(
+            opt.serial_mmio_alias,
+            [SerialMmioAliasCli {
+                port_index: 0,
+                base: 0x0900_0000,
+            }]
+        );
+        assert!(SerialMmioAliasCli::from_str("com3=0x09000000").is_err());
+        assert!(SerialMmioAliasCli::from_str("com1=0x09000001").is_err());
     }
 
     #[test]

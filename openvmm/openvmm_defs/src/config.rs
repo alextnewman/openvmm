@@ -120,6 +120,17 @@ pub enum LinuxDirectBootMode {
     Acpi,
 }
 
+/// How a direct-boot image should be interpreted.
+#[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectBootImageFormat {
+    /// Detect a Linux ARM64 Image header and otherwise load an AArch64 image raw.
+    Auto,
+    /// Require a Linux kernel image.
+    Linux,
+    /// Load the image as an opaque flat binary.
+    Raw,
+}
+
 #[derive(MeshPayload, Debug)]
 pub enum LoadMode {
     Linux {
@@ -128,6 +139,7 @@ pub enum LoadMode {
         cmdline: String,
         enable_serial: bool,
         boot_mode: LinuxDirectBootMode,
+        image_format: DirectBootImageFormat,
     },
     Uefi {
         firmware: File,

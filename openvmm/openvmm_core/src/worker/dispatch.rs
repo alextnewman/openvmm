@@ -1112,7 +1112,7 @@ impl InitializedVm {
             .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
             .count();
 
-        // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
+        // On aarch64 direct boot, start RAM at 1 GiB to avoid the low GPA
         // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
         // doorbell in IOVA space. Without this gap, iommufd identity-mapped DMA
         // for passthrough devices fails because it cannot allocate IOVAs in
@@ -3127,7 +3127,11 @@ impl LoadedVmInner {
                 ref cmdline,
                 enable_serial,
                 boot_mode,
+                image_format,
             } => {
+                if image_format == openvmm_defs::config::DirectBootImageFormat::Raw {
+                    anyhow::bail!("raw direct-boot images are not supported on x86_64");
+                }
                 match boot_mode {
                     openvmm_defs::config::LinuxDirectBootMode::DeviceTree => {
                         anyhow::bail!("device tree boot mode is not supported on x86_64");
@@ -3140,6 +3144,7 @@ impl LoadedVmInner {
                     cmdline,
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
+                    image_format,
                 };
                 super::vm_loaders::linux::load_linux_x86(&kernel_config, &self.gm, |gpa| {
                     let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
@@ -3169,6 +3174,7 @@ impl LoadedVmInner {
                 ref cmdline,
                 enable_serial,
                 boot_mode,
+                image_format,
             } => {
                 use openvmm_defs::config::LinuxDirectBootMode;
 
@@ -3178,6 +3184,7 @@ impl LoadedVmInner {
                     cmdline,
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
+                    image_format,
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
@@ -3201,7 +3208,7 @@ impl LoadedVmInner {
                         IommuDevices::Smmu(devices) => &devices.configs,
                         IommuDevices::None => &[],
                     };
-                super::vm_loaders::linux::load_linux_arm64(
+                super::vm_loaders::linux::load_direct_arm64(
                     &kernel_config,
                     &self.gm,
                     enable_serial,

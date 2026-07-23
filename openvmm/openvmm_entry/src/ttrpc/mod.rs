@@ -708,6 +708,7 @@ impl VmService {
                     initrd,
                     cmdline: boot.kernel_cmdline,
                     enable_serial: true,
+                    image_format: openvmm_defs::config::DirectBootImageFormat::Linux,
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                 }
             }

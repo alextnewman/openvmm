@@ -910,6 +910,32 @@ struct Aarch64ImageHeader {
 
 const AARCH64_MAGIC_NUMBER: &[u8] = b"ARM\x64";
 
+/// Return whether an image has a Linux AArch64 `Image` header.
+///
+/// Short files are valid raw-image candidates and return `false`. The file
+/// position is reset to the beginning before returning successfully.
+pub fn is_arm64_image<F>(kernel_image: &mut F) -> Result<bool, Error>
+where
+    F: Read + Seek,
+{
+    kernel_image
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| Error::FlatLoader(FlatLoaderError::SeekKernelStart))?;
+
+    let mut header = Aarch64ImageHeader::new_zeroed();
+    let is_linux_image = match kernel_image.read_exact(header.as_mut_bytes()) {
+        Ok(()) => header.magic == AARCH64_MAGIC_NUMBER,
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(_) => return Err(Error::FlatLoader(FlatLoaderError::ReadKernelImage)),
+    };
+
+    kernel_image
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| Error::FlatLoader(FlatLoaderError::SeekKernelStart))?;
+
+    Ok(is_linux_image)
+}
+
 /// Load only an arm64 the flat Linux kernel `Image` and optional initrd.
 /// This does not setup register state or any other config information.
 ///
@@ -1047,13 +1073,26 @@ pub fn set_direct_boot_registers_arm64(
     importer: &mut impl ImageLoad<Aarch64Register>,
     load_info: &LoadInfo,
 ) -> Result<(), Error> {
+    set_direct_boot_registers_arm64_for_entry(
+        importer,
+        load_info.kernel.entrypoint,
+        load_info.dtb.as_ref().map(|dtb| dtb.start),
+    )
+}
+
+/// Set the initial AArch64 register state for a direct-boot entry point.
+pub fn set_direct_boot_registers_arm64_for_entry(
+    importer: &mut impl ImageLoad<Aarch64Register>,
+    entrypoint: u64,
+    dtb_address: Option<u64>,
+) -> Result<(), Error> {
     let mut import_reg = |register| {
         importer
             .import_vp_register(register)
             .map_err(Error::Importer)
     };
 
-    import_reg(Aarch64Register::Pc(load_info.kernel.entrypoint))?;
+    import_reg(Aarch64Register::Pc(entrypoint))?;
     import_reg(Aarch64Register::Cpsr(
         Cpsr64::new()
             .with_sp(true)
@@ -1103,8 +1142,8 @@ pub fn set_direct_boot_registers_arm64(
     import_reg(Aarch64Register::Ttbr1El1(TranslationBaseEl1::new().into()))?;
     import_reg(Aarch64Register::VbarEl1(0))?;
 
-    if let Some(dtb) = &load_info.dtb {
-        import_reg(Aarch64Register::X0(dtb.start))?;
+    if let Some(dtb_address) = dtb_address {
+        import_reg(Aarch64Register::X0(dtb_address))?;
     }
 
     Ok(())
@@ -1116,6 +1155,7 @@ mod tests {
     use crate::importer::IsolationConfig;
     use crate::importer::ParameterAreaIndex;
     use crate::importer::StartupMemoryType;
+    use std::io::Cursor;
     use test_with_tracing::test;
     use zerocopy::FromBytes;
 
@@ -1619,5 +1659,19 @@ mod tests {
             ),
             Err(Error::LowTablesTooLarge(..))
         ));
+    }
+
+    #[test]
+    fn detects_linux_and_raw_arm64_images() {
+        let mut linux_image = vec![0; size_of::<Aarch64ImageHeader>()];
+        linux_image[56..60].copy_from_slice(AARCH64_MAGIC_NUMBER);
+        let mut linux_image = Cursor::new(linux_image);
+        assert!(is_arm64_image(&mut linux_image).unwrap());
+        assert_eq!(linux_image.stream_position().unwrap(), 0);
+
+        let mut raw_image = vec![0; size_of::<Aarch64ImageHeader>()];
+        raw_image[56..60].copy_from_slice(&0xd503201fu32.to_le_bytes());
+        assert!(!is_arm64_image(&mut Cursor::new(raw_image)).unwrap());
+        assert!(!is_arm64_image(&mut Cursor::new(vec![0; 4])).unwrap());
     }
 }

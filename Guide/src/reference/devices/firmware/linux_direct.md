@@ -23,6 +23,9 @@ built-in decompressor to run at boot time. All standard bzImage compression
 formats are supported since decompression is handled by the kernel itself.
 
 On AArch64, pass the uncompressed `Image` file (not `Image.gz`).
+`--kernel-format auto` recognizes the `ARM\x64` header and is the default.
+Use `--kernel-format linux` to reject images without that header. Images without
+the header otherwise use [raw AArch64 direct boot](./raw_direct.md).
 
 ## x86_64 Boot Flow
 

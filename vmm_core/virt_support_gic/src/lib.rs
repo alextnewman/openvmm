@@ -1198,6 +1198,10 @@ mod gicr {
                     3 << 4
                 }
                 GicrRdRegister::CTLR => GicrCtlr::new().into(),
+                GicrRdRegister::TYPER => self.rd_read64(GicrRdRegister::TYPER)? as u32,
+                address if address.0 == GicrRdRegister::TYPER.0 + 4 => {
+                    (self.rd_read64(GicrRdRegister::TYPER)? >> 32) as u32
+                }
                 GicrRdRegister::WAKER => {
                     let sleep = self.mutable.lock().sleep;
                     GicrWaker::new()
@@ -1235,6 +1239,12 @@ mod gicr {
                     .into(),
                 _ => return None,
             };
+            tracing::trace!(
+                mpidr = u64::from(self.mpidr),
+                last = self.last,
+                v,
+                "gicr typer read"
+            );
             Some(v)
         }
 
@@ -1612,13 +1622,31 @@ mod gicr {
     #[cfg(test)]
     mod tests {
         use super::Redistributor;
+        use aarch64defs::gic::GicrRdRegister;
         use aarch64defs::gic::GicrSgiRegister;
+        use aarch64defs::gic::GicrTyper;
 
         // Offset from a redistributor base to its SGI frame.
         const SGI: u64 = 0x1_0000;
         const IPRIORITYR0: u64 = GicrSgiRegister::IPRIORITYR0.0 as u64;
         const ISENABLER0: u64 = GicrSgiRegister::ISENABLER0.0 as u64;
         const ICENABLER0: u64 = GicrSgiRegister::ICENABLER0.0 as u64;
+
+        #[test]
+        fn typer_supports_split_word_reads() {
+            let (_redist, shared) = Redistributor::new(1, 1, false);
+            let mut low = [0; 4];
+            let mut high = [0; 4];
+
+            shared.read(GicrRdRegister::TYPER.0.into(), &mut low);
+            shared.read((GicrRdRegister::TYPER.0 + 4).into(), &mut high);
+
+            let typer = GicrTyper::from(
+                u64::from(u32::from_ne_bytes(low)) | (u64::from(u32::from_ne_bytes(high)) << 32),
+            );
+            assert_eq!(typer.aff0(), 1);
+            assert!(!typer.last());
+        }
 
         // Architecture permits byte access to IPRIORITYR; the guest uses it.
         #[test]

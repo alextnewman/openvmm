@@ -93,6 +93,7 @@
   - [UEFI: mu_msvm](./reference/devices/firmware/mu_msvm_uefi.md)
   - [BIOS: Hyper-V PCAT BIOS](./reference/devices/firmware/pcat_bios.md)
   - [Linux Direct](./reference/devices/firmware/linux_direct.md)
+  - [Raw AArch64 Direct](./reference/devices/firmware/raw_direct.md)
 - [Devices]()
   - [PCI IDs](./reference/devices/pci_ids.md)
   - [Virtio]()

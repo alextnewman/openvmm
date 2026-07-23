@@ -32,6 +32,7 @@ use cli_args::DiskCliKind;
 use cli_args::EfiDiagnosticsLogLevelCli;
 use cli_args::EndpointConfigCli;
 use cli_args::GuestPowerAction;
+use cli_args::KernelFormatCli;
 use cli_args::NicConfigCli;
 use cli_args::ProvisionVmgs;
 use cli_args::SerialConfigCli;
@@ -104,7 +105,6 @@ use serial_core::resources::DisconnectedSerialBackendHandle;
 use sparse_mmap::alloc_shared_memory;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::io;
 #[cfg(unix)]
 use std::io::IsTerminal;
@@ -1155,6 +1155,34 @@ async fn vm_config_from_command_line(
         || serial2_cfg.is_some()
         || serial3_cfg.is_some();
 
+    #[cfg(guest_arch = "aarch64")]
+    let serial_pl011_mmio_aliases = {
+        let serial_configured = [serial0_cfg.is_some(), serial1_cfg.is_some()];
+        let mut aliases = [Vec::new(), Vec::new()];
+        let mut used_bases = Vec::new();
+        for alias in &opt.serial_mmio_alias {
+            anyhow::ensure!(
+                serial_configured[alias.port_index],
+                "cannot add an MMIO alias for a disabled serial port"
+            );
+            anyhow::ensure!(
+                alias
+                    .base
+                    .checked_add(0x1000)
+                    .is_some_and(|end| end <= 1 << 30),
+                "serial MMIO aliases must fit below the 1 GiB direct-boot RAM base"
+            );
+            anyhow::ensure!(
+                !used_bases.contains(&alias.base),
+                "serial MMIO alias {:#x} was specified more than once",
+                alias.base
+            );
+            used_bases.push(alias.base);
+            aliases[alias.port_index].push(alias.base);
+        }
+        aliases
+    };
+
     let has_com3 = serial2_cfg.is_some();
 
     let mut chipset = VmManifestBuilder::new(
@@ -1182,6 +1210,13 @@ async fn vm_config_from_command_line(
         chipset = chipset.with_serial([serial0_cfg, serial1_cfg, serial2_cfg, serial3_cfg]);
     }
     chipset = chipset.with_serial_debugger_mode(com_debugger_mode);
+    #[cfg(guest_arch = "aarch64")]
+    if serial_pl011_mmio_aliases
+        .iter()
+        .any(|aliases| !aliases.is_empty())
+    {
+        chipset = chipset.with_serial_pl011_mmio_aliases(serial_pl011_mmio_aliases);
+    }
     if opt.battery {
         let (tx, rx) = mesh::channel();
         tx.send(HostBatteryUpdate::default_present());
@@ -1344,43 +1379,78 @@ async fn vm_config_from_command_line(
             force_dma_bounce: opt.uefi_force_dma_bounce,
         };
     } else {
-        // Linux Direct
-        let mut cmdline = "panic=-1 debug".to_string();
-
-        with_hv = opt.hv;
-        if with_hv && opt.pcie_root_complex.is_empty() {
-            cmdline += " pci=off";
-        }
-
-        if !console_str.is_empty() {
-            let _ = write!(&mut cmdline, " console={}", console_str);
-        }
-
-        if opt.gfx {
-            cmdline += " console=tty";
-        }
-        for extra in &opt.cmdline {
-            let _ = write!(&mut cmdline, " {}", extra);
-        }
-
-        let kernel = fs_err::File::open(
+        let mut kernel = fs_err::File::open(
             (opt.kernel.0)
                 .as_ref()
-                .context("must provide kernel when booting with linux direct")?,
+                .context("must provide an image when using direct boot")?,
         )
         .context("failed to open kernel")?;
+        let image_format = match opt.kernel_format {
+            KernelFormatCli::Auto if arch == MachineArch::Aarch64 => {
+                if loader::linux::is_arm64_image(&mut kernel)
+                    .context("failed to detect direct-boot image format")?
+                {
+                    openvmm_defs::config::DirectBootImageFormat::Linux
+                } else {
+                    openvmm_defs::config::DirectBootImageFormat::Raw
+                }
+            }
+            KernelFormatCli::Auto | KernelFormatCli::Linux => {
+                openvmm_defs::config::DirectBootImageFormat::Linux
+            }
+            KernelFormatCli::Raw => openvmm_defs::config::DirectBootImageFormat::Raw,
+        };
+        anyhow::ensure!(
+            arch != MachineArch::X86_64
+                || image_format != openvmm_defs::config::DirectBootImageFormat::Raw,
+            "raw direct-boot images are not supported on x86_64"
+        );
+
         let initrd = (opt.initrd.0)
             .as_ref()
             .map(fs_err::File::open)
             .transpose()
             .context("failed to open initrd")?;
+        anyhow::ensure!(
+            image_format != openvmm_defs::config::DirectBootImageFormat::Raw || initrd.is_none(),
+            "raw direct boot does not support an initrd"
+        );
+
+        let mut cmdline = String::new();
+        let mut push_arg = |arg: &str| {
+            if !cmdline.is_empty() {
+                cmdline.push(' ');
+            }
+            cmdline.push_str(arg);
+        };
+
+        with_hv = opt.hv;
+        if image_format == openvmm_defs::config::DirectBootImageFormat::Linux {
+            push_arg("panic=-1");
+            push_arg("debug");
+            if with_hv && opt.pcie_root_complex.is_empty() {
+                push_arg("pci=off");
+            }
+            if !console_str.is_empty() {
+                push_arg(&format!("console={console_str}"));
+            }
+            if opt.gfx {
+                push_arg("console=tty");
+            }
+        }
+        for extra in &opt.cmdline {
+            push_arg(extra);
+        }
 
         load_mode = LoadMode::Linux {
             kernel: kernel.into(),
             initrd: initrd.map(Into::into),
             cmdline,
             enable_serial: any_serial_configured,
-            boot_mode: if opt.device_tree {
+            image_format,
+            boot_mode: if opt.device_tree
+                || image_format == openvmm_defs::config::DirectBootImageFormat::Raw
+            {
                 openvmm_defs::config::LinuxDirectBootMode::DeviceTree
             } else {
                 openvmm_defs::config::LinuxDirectBootMode::Acpi

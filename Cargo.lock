@@ -5733,6 +5733,7 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
+ "loader",
  "memory_range",
  "mesh",
  "mesh_process",
@@ -9385,8 +9386,10 @@ name = "virt_hvf"
 version = "0.0.0"
 dependencies = [
  "aarch64defs",
+ "aarch64emu",
  "anyhow",
  "build_rs_guest_arch",
+ "cc",
  "guestmem",
  "hv1_emulator",
  "hv1_hypercall",
@@ -9400,6 +9403,7 @@ dependencies = [
  "tracelimit",
  "tracing",
  "virt",
+ "virt_support_aarch64emu",
  "virt_support_gic",
  "vm_topology",
  "vmcore",

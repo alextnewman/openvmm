@@ -74,9 +74,10 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, SerialPl011DeviceHandle>
             .debugger_mode
             .then(|| pal_async::timer::PolledTimer::new(&input.task_driver_source.simple()));
 
-        let device = SerialPl011::new(
+        let device = SerialPl011::new_with_mmio_aliases(
             input.device_name.to_string(),
             resource.base,
+            resource.mmio_aliases,
             interrupt,
             io,
             debugger_poll_timer,

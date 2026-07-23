@@ -103,6 +103,8 @@ impl PetriVmConfigOpenVmm {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,
                     }],
+                    bm_hostmode: false,
+                    pf_caps: false,
                 }
                 .into_resource(),
                 vnode: None,
@@ -147,6 +149,8 @@ impl PetriVmConfigOpenVmm {
                     mac_address,
                     endpoint,
                 }],
+                bm_hostmode: false,
+                pf_caps: false,
             }
             .into_resource(),
         });
@@ -295,6 +299,7 @@ impl PetriVmConfigOpenVmm {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,
                     }],
+                    bm_hostmode: false,
                 }
                 .into_resource(),
                 vnode: None,

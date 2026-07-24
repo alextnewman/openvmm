@@ -1755,6 +1755,7 @@ async fn vm_config_from_command_line(
                     openvmm_defs::config::GicMsiConfig::V2m { spi_count: None }
                 }
             },
+            virt_timer_gsiv: opt.virt_timer_gsiv,
         },
     );
     #[cfg(guest_arch = "x86_64")]

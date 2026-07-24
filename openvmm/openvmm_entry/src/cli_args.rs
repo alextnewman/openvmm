@@ -605,6 +605,11 @@ options:
     #[clap(long, default_value = "auto")]
     pub gic_msi: GicMsiCli,
 
+    /// configure the AArch64 virtual timer interrupt using the full GIC INTID
+    #[cfg(guest_arch = "aarch64")]
+    #[clap(long, value_name = "GSIV")]
+    pub virt_timer_gsiv: Option<u32>,
+
     /// configure SMMUv3 IOMMU for an aarch64 PCIe root complex (repeatable).
     ///
     /// Syntax: `rc=<name>[,accel][,oas=auto|N]`.
@@ -5103,6 +5108,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(opt.initrd, Some(PathBuf::from("initrd.img")));
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn test_virtual_timer_gsiv_parsed() {
+        let opt = Options::try_parse_from(["openvmm", "--virt-timer-gsiv", "27"]).unwrap();
+        assert_eq!(opt.virt_timer_gsiv, Some(27));
     }
 
     #[test]

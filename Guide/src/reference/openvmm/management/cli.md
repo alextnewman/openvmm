@@ -8,6 +8,8 @@ as well as the generated CLI help (via `cargo run -- --help`).
 ```
 
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--virt-timer-gsiv <GSIV>`: Select the full GIC INTID for the AArch64
+  virtual timer. Defaults to 20; QEMU `virt` uses 27.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

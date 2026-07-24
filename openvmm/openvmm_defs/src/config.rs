@@ -408,6 +408,7 @@ pub struct Aarch64TopologyConfig {
     pub gic_config: Option<GicConfig>,
     pub pmu_gsiv: PmuGsivConfig,
     pub gic_msi: GicMsiConfig,
+    pub virt_timer_gsiv: Option<u32>,
 }
 
 /// GIC configuration for the virtual machine.

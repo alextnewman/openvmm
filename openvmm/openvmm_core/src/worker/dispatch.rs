@@ -544,6 +544,7 @@ impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
                     None => PmuGsivConfig::Disabled,
                 },
                 gic_msi: Default::default(),
+                virt_timer_gsiv: Some(self.virt_timer_ppi()),
             })),
         }
     }
@@ -560,7 +561,6 @@ fn build_aarch64_topology(
     config: &ProcessorTopologyConfig,
     platform_info: &virt::PlatformInfo,
     smmu_count: usize,
-    virt_timer_ppi: u32,
 ) -> anyhow::Result<Aarch64TopologyResult> {
     use openvmm_defs::config::GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
@@ -578,6 +578,13 @@ fn build_aarch64_topology(
         Some(ArchTopologyConfig::Aarch64(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
+    let virt_timer_ppi = arch
+        .virt_timer_gsiv
+        .unwrap_or(openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI);
+    anyhow::ensure!(
+        (16..32).contains(&virt_timer_ppi),
+        "virtual timer GSIV {virt_timer_ppi} is not a GIC PPI"
+    );
 
     let pmu_gsiv = match arch.pmu_gsiv {
         PmuGsivConfig::Disabled => None,
@@ -1016,32 +1023,13 @@ impl InitializedVm {
 
         #[cfg(guest_arch = "aarch64")]
         let (mut processor_topology, spi_layout) = {
-            const ARCHITECTURAL_VIRT_TIMER_PPI: u32 = 16 + 11;
-
-            let virt_timer_ppi = if matches!(
-                &cfg.load_mode,
-                LoadMode::Linux {
-                    image_format: openvmm_defs::config::DirectBootImageFormat::Raw,
-                    ..
-                }
-            ) {
-                // Firmware-less QEMU-compatible guests use the architectural
-                // virtual timer interrupt (PPI 11, INTID 27).
-                ARCHITECTURAL_VIRT_TIMER_PPI
-            } else {
-                openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI
-            };
             let smmu_count = cfg
                 .pcie_root_complexes
                 .iter()
                 .filter(|rc| matches!(rc.iommu, Some(PcieIommuConfig::Smmu { .. })))
                 .count();
-            let result = build_aarch64_topology(
-                &cfg.processor_topology,
-                &platform_info,
-                smmu_count,
-                virt_timer_ppi,
-            )?;
+            let result =
+                build_aarch64_topology(&cfg.processor_topology, &platform_info, smmu_count)?;
             (result.processor_topology, result.spi_layout)
         };
         #[cfg(not(guest_arch = "aarch64"))]

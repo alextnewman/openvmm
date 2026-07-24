@@ -375,10 +375,13 @@ virtio-MMIO transport. `mmio_gsiv` is the full GIC interrupt ID:
 ```sh
 --virtio-blk file:/path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
 --virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77
+--virtio-net mmio_base=0x0a003c00:mmio_gsiv=78:consomme
 ```
 
 The fixed transport uses a 0x200-byte register window and must fit below the
-direct-boot RAM base. It is mutually exclusive with `pcie_port`.
+direct-boot RAM base. It is mutually exclusive with `pcie_port` and is emitted
+in the generated device tree. The addresses above are explicit QEMU `virt`
+compatibility placements, not OpenVMM defaults.
 
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
@@ -394,6 +397,7 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 
 ```sh
 --virtio-net pcie_port=rp0:tap:tap0  # TAP is Linux-only
+--virtio-net mmio_base=0x0a003c00:mmio_gsiv=78:consomme
 --net pcie_port=rp0:consomme
 --mana pcie_port=rp0:tap:tap0        # TAP is Linux-only
 ```

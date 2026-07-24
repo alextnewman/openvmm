@@ -552,7 +552,9 @@ options:
     ///
     /// Prefix with `uh:` to add this NIC via Mana emulation through OpenHCL,
     /// `vtl2:` to assign this NIC to VTL2, or `pcie_port=<port_name>:` to
-    /// expose the NIC over emulated PCIe at the specified port.
+    /// expose the NIC over emulated PCIe at the specified port. Use paired
+    /// `mmio_base=<address>:` and `mmio_gsiv=<gsiv>:` prefixes for explicit
+    /// fixed virtio-MMIO placement.
     ///
     /// For consomme, forward host ports into the guest with `hostfwd=`:
     ///   --net consomme:hostfwd=tcp::3389-:3389
@@ -2746,6 +2748,7 @@ pub struct NicConfigCli {
     pub max_queues: Option<u16>,
     pub underhill: bool,
     pub pcie_port: Option<String>,
+    pub mmio: Option<FixedVirtioMmioCli>,
 }
 
 impl FromStr for NicConfigCli {
@@ -2756,6 +2759,7 @@ impl FromStr for NicConfigCli {
         let mut max_queues = None;
         let mut underhill = false;
         let mut pcie_port = None;
+        let mut mmio = FixedVirtioMmioArgs::default();
         while let Some((opt, rest)) = s.split_once(':') {
             if let Some((opt, val)) = opt.split_once('=') {
                 match opt {
@@ -2767,6 +2771,22 @@ impl FromStr for NicConfigCli {
                             return Err("`pcie_port=` requires port name argument".into());
                         }
                         pcie_port = Some(val.to_string());
+                    }
+                    "mmio_base" => {
+                        if mmio.mmio_base.is_some() {
+                            return Err("`mmio_base` was specified more than once".into());
+                        }
+                        mmio.mmio_base = Some(
+                            val.parse()
+                                .map_err(|err| format!("invalid `mmio_base`: {err}"))?,
+                        );
+                    }
+                    "mmio_gsiv" => {
+                        if mmio.mmio_gsiv.is_some() {
+                            return Err("`mmio_gsiv` was specified more than once".into());
+                        }
+                        mmio.mmio_gsiv =
+                            Some(val.parse().map_err(|_| "failed to parse `mmio_gsiv`")?);
                     }
                     _ => break,
                 }
@@ -2786,8 +2806,15 @@ impl FromStr for NicConfigCli {
             return Err("`uh` is incompatible with `vtl2`".into());
         }
 
+        let (pcie_port, mmio) = VirtioTransportArgs { pcie_port, mmio }
+            .resolve()
+            .map_err(|err| err.to_string())?;
+
         if pcie_port.is_some() && (underhill || vtl != DeviceVtl::Vtl0) {
             return Err("`pcie_port` is incompatible with `uh` and `vtl2`".into());
+        }
+        if mmio.is_some() && (underhill || vtl != DeviceVtl::Vtl0) {
+            return Err("fixed virtio-MMIO is incompatible with `uh` and `vtl2`".into());
         }
 
         let endpoint = s.parse()?;
@@ -2797,6 +2824,7 @@ impl FromStr for NicConfigCli {
             max_queues,
             underhill,
             pcie_port,
+            mmio,
         })
     }
 }
@@ -4134,6 +4162,7 @@ mod tests {
         assert!(config.max_queues.is_none());
         assert!(!config.underhill);
         assert!(config.pcie_port.is_none());
+        assert!(config.mmio.is_none());
         assert!(matches!(config.endpoint, EndpointConfigCli::None));
 
         // Test with vtl2
@@ -4159,6 +4188,24 @@ mod tests {
         assert_eq!(config.pcie_port.unwrap(), "rp0".to_string());
         assert!(matches!(config.endpoint, EndpointConfigCli::None));
 
+        // Test fixed virtio-MMIO placement.
+        let config = NicConfigCli::from_str(
+            "mmio_base=0x0a003c00:mmio_gsiv=78:consomme:hostfwd=tcp:2229-:22",
+        )
+        .unwrap();
+        assert_eq!(
+            config.mmio,
+            Some(FixedVirtioMmioCli {
+                address: 0x0a00_3c00,
+                gsiv: 78,
+            })
+        );
+        assert!(config.pcie_port.is_none());
+        assert!(matches!(
+            config.endpoint,
+            EndpointConfigCli::Consomme { .. }
+        ));
+
         // Test error cases
         assert!(NicConfigCli::from_str("queues=invalid:none").is_err());
         assert!(NicConfigCli::from_str("uh:vtl2:none").is_err()); // uh incompatible with vtl2
@@ -4166,6 +4213,11 @@ mod tests {
         assert!(NicConfigCli::from_str("uh:pcie_port=rp0:none").is_err());
         assert!(NicConfigCli::from_str("pcie_port=:none").is_err());
         assert!(NicConfigCli::from_str("pcie_port:none").is_err());
+        assert!(NicConfigCli::from_str("mmio_base=0x0a003c00:none").is_err());
+        assert!(NicConfigCli::from_str("mmio_gsiv=78:none").is_err());
+        assert!(
+            NicConfigCli::from_str("pcie_port=rp0:mmio_base=0x0a003c00:mmio_gsiv=78:none").is_err()
+        );
     }
 
     #[test]

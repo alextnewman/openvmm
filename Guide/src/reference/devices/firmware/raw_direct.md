@@ -13,7 +13,8 @@ For a raw image, OpenVMM:
 3. begins execution at the first byte of the loaded image;
 4. places the full hardware device tree at least 128 MiB into RAM, outside the
    image's early scratch space, and passes its address in `x0`; and
-5. enters at EL1 with the MMU disabled.
+5. uses the architectural virtual-timer interrupt, PPI 11 (INTID 27); and
+6. enters at EL1 with the MMU disabled.
 
 The default load and entry address is therefore `0x40080000`. Raw direct boot
 does not support a separate initrd.
@@ -53,8 +54,13 @@ addresses and interrupts. Device options use `mmio_base` for the explicit
 ```bash
 openvmm --kernel path/to/image.bin \
     --virtio-blk file:path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79 \
-    --virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77
+    --virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77 \
+    --virtio-net mmio_base=0x0a003c00:mmio_gsiv=78:consomme
 ```
 
 Fixed virtio-MMIO placement is limited to AArch64 direct boot and must fit
 below the 1 GiB RAM base. It is mutually exclusive with PCIe placement.
+OpenVMM emits each fixed transport as a `virtio,mmio` node in the generated
+device tree. These addresses are not implicit defaults; the example explicitly
+recreates three slots from QEMU's `virt` platform for a guest built against
+that platform contract.

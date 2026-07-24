@@ -58,6 +58,7 @@ pub struct KernelConfig<'a> {
     pub mem_layout: &'a MemoryLayout,
     pub isolation: Option<IsolationType>,
     pub image_format: openvmm_defs::config::DirectBootImageFormat,
+    pub fixed_virtio_mmio: &'a [openvmm_defs::config::VirtioMmioConfig],
 }
 
 /// The default SMBIOS identity for firmware-less Linux direct boot.
@@ -249,7 +250,6 @@ fn build_dt(
 
     const GIC_SPI: u32 = 0;
     const GIC_PPI: u32 = 1;
-    const IRQ_TYPE_LEVEL_LOW: u32 = 8;
     const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
     const IRQ_TYPE_EDGE_RISING: u32 = 1;
     /// VMBus PPI offset for the DT `interrupts` property.
@@ -409,12 +409,26 @@ fn build_dt(
     let virt_timer_ppi_offset = processor_topology.virt_timer_ppi() - 16;
     let timer = root_builder
         .start_node("timer")?
-        .add_str(p_compatible, "arm,armv8-timer")?
+        .add_str_array(p_compatible, &["arm,armv8-timer", "arm,armv7-timer"])?
         .add_u32(p_interrupt_parent, PHANDLE_GIC)?
-        .add_str(p_interrupt_names, "virt")?
         .add_u32_array(
             p_interrupts,
-            &[GIC_PPI, virt_timer_ppi_offset, IRQ_TYPE_LEVEL_LOW],
+            &[
+                // Keep the architectural timer ordering expected by
+                // startup-qemu-virt: secure, physical, virtual, hypervisor.
+                GIC_PPI,
+                13,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                14,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                virt_timer_ppi_offset,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                10,
+                IRQ_TYPE_LEVEL_HIGH,
+            ],
         )?
         .add_null(p_always_on)?;
     root_builder = timer.end_node()?;
@@ -514,6 +528,22 @@ fn build_dt(
             node = node.add_u32(p_linux_pci_probe_only, 1)?;
         }
         root_builder = node.end_node()?;
+    }
+
+    for mmio in cfg.fixed_virtio_mmio {
+        let name = format!("virtio_mmio@{:x}", mmio.address);
+        root_builder = root_builder
+            .start_node(name.as_ref())?
+            .add_str(p_compatible, "virtio,mmio")?
+            .add_u64_array(p_reg, &[mmio.address, 0x200])?
+            .add_u32(p_interrupt_parent, PHANDLE_GIC)?
+            .add_u32_array(
+                p_interrupts,
+                &[GIC_SPI, mmio.gsiv - 32, IRQ_TYPE_EDGE_RISING],
+            )?
+            .add_null(p_dma_coherent)?
+            .add_str(p_status, "okay")?
+            .end_node()?;
     }
 
     let mut soc = root_builder

@@ -737,8 +737,8 @@ async fn vm_config_from_command_line(
 
     let mut nic_index = 0;
     for cli_cfg in &opt.net {
-        if cli_cfg.pcie_port.is_some() {
-            anyhow::bail!("`--net` does not support PCIe");
+        if cli_cfg.pcie_port.is_some() || cli_cfg.mmio.is_some() {
+            anyhow::bail!("`--net` does not support PCIe or fixed virtio-MMIO placement");
         }
         let vport = parse_endpoint(cli_cfg, &mut nic_index, &mut resources)?;
         if cli_cfg.underhill {
@@ -781,6 +781,7 @@ async fn vm_config_from_command_line(
                 max_queues: None,
                 underhill: false,
                 pcie_port: None,
+                mmio: None,
             },
             &mut nic_index,
             &mut resources,
@@ -849,6 +850,9 @@ async fn vm_config_from_command_line(
     }
 
     for vport in &opt.mana {
+        if vport.mmio.is_some() {
+            anyhow::bail!("`--mana` does not support fixed virtio-MMIO placement");
+        }
         let vport = parse_endpoint(vport, &mut nic_index, &mut resources)?;
         let vport_array = match (vport.vtl as usize, vport.pcie_port) {
             (vtl, None) => {
@@ -1856,7 +1860,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, None, resource);
+            add_virtio_device(VirtioBusCli::Auto, cli_cfg.mmio, resource);
         }
     }
 

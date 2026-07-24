@@ -560,6 +560,7 @@ fn build_aarch64_topology(
     config: &ProcessorTopologyConfig,
     platform_info: &virt::PlatformInfo,
     smmu_count: usize,
+    virt_timer_ppi: u32,
 ) -> anyhow::Result<Aarch64TopologyResult> {
     use openvmm_defs::config::GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
@@ -701,7 +702,7 @@ fn build_aarch64_topology(
         gic_version,
         gic_msi,
         pmu_gsiv,
-        virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
+        virt_timer_ppi,
         gic_nr_irqs,
     };
 
@@ -764,6 +765,7 @@ struct LoadedVmInner {
     virtio_mmio_region: MemoryRange,
     #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_irq: u32,
+    fixed_virtio_mmio: Vec<openvmm_defs::config::VirtioMmioConfig>,
     /// Resolved chipset MMIO ranges.
     chipset_mmio: ChipsetMmioRanges,
     /// ((device, function), interrupt)
@@ -1014,13 +1016,32 @@ impl InitializedVm {
 
         #[cfg(guest_arch = "aarch64")]
         let (mut processor_topology, spi_layout) = {
+            const ARCHITECTURAL_VIRT_TIMER_PPI: u32 = 16 + 11;
+
+            let virt_timer_ppi = if matches!(
+                &cfg.load_mode,
+                LoadMode::Linux {
+                    image_format: openvmm_defs::config::DirectBootImageFormat::Raw,
+                    ..
+                }
+            ) {
+                // Firmware-less QEMU-compatible guests use the architectural
+                // virtual timer interrupt (PPI 11, INTID 27).
+                ARCHITECTURAL_VIRT_TIMER_PPI
+            } else {
+                openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI
+            };
             let smmu_count = cfg
                 .pcie_root_complexes
                 .iter()
                 .filter(|rc| matches!(rc.iommu, Some(PcieIommuConfig::Smmu { .. })))
                 .count();
-            let result =
-                build_aarch64_topology(&cfg.processor_topology, &platform_info, smmu_count)?;
+            let result = build_aarch64_topology(
+                &cfg.processor_topology,
+                &platform_info,
+                smmu_count,
+                virt_timer_ppi,
+            )?;
             (result.processor_topology, result.spi_layout)
         };
         #[cfg(not(guest_arch = "aarch64"))]
@@ -1434,6 +1455,15 @@ impl InitializedVm {
             igvm_file,
             driver_source,
         } = self;
+
+        let fixed_virtio_mmio = cfg
+            .virtio_devices
+            .iter()
+            .filter_map(|(bus, _)| match bus {
+                VirtioBus::MmioFixed(mmio) => Some(*mmio),
+                _ => None,
+            })
+            .collect();
 
         let mut resolver = ResourceResolver::new();
 
@@ -3038,6 +3068,7 @@ impl InitializedVm {
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
                 virtio_mmio_irq,
+                fixed_virtio_mmio,
                 chipset_mmio,
                 pci_legacy_interrupts,
                 igvm_file,
@@ -3212,6 +3243,7 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
                     image_format,
+                    fixed_virtio_mmio: &self.fixed_virtio_mmio,
                 };
                 super::vm_loaders::linux::load_linux_x86(&kernel_config, &self.gm, |gpa| {
                     let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
@@ -3252,6 +3284,7 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
                     image_format,
+                    fixed_virtio_mmio: &self.fixed_virtio_mmio,
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {

@@ -62,6 +62,7 @@ impl VpActor {
     pub(crate) fn remove_vcpu<E>(&self, remove: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         let mut published = self.vcpu.lock();
         *published = None;
+        self.park.lock().take();
         remove()
     }
 
@@ -242,5 +243,17 @@ mod tests {
 
         assert_eq!(fired(&c2), 1);
         assert_eq!(fired(&c1), 1);
+    }
+
+    #[test]
+    fn remove_vcpu_clears_parked_waker() {
+        let actor = VpActor::new();
+        let (waker, _) = counting();
+        let scan = actor.begin_scan();
+
+        assert_eq!(actor.try_park(scan, &waker, || true), ParkDecision::Parked);
+        actor.remove_vcpu(|| Ok::<_, ()>(())).unwrap();
+
+        assert!(actor.park.lock().is_none());
     }
 }

@@ -79,6 +79,20 @@ mod gicd {
             }
         }
 
+        /// Resets mutable Distributor state while preserving configured geometry.
+        pub fn reset(&self) {
+            let mut state = self.state.lock();
+            state.pending.fill(0);
+            state.active.fill(0);
+            state.group.fill(0);
+            state.enable.fill(0);
+            state.cfg.fill(0);
+            state.priority.fill(0);
+            state.route.fill(0);
+            state.enable_grp0 = false;
+            state.enable_grp1 = false;
+        }
+
         pub fn add_redistributor(&mut self, mpidr: u64, last: bool) -> Redistributor {
             let mpidr = mpidr & u64::from(MpidrEl1::AFFINITY_MASK);
             let (gicr, state) = Redistributor::new(self.gicr.len(), mpidr, last);
@@ -769,6 +783,18 @@ mod gicr {
                 },
                 shared,
             )
+        }
+
+        /// Resets mutable per-PE interrupt state while preserving PE identity.
+        pub fn reset(&mut self) {
+            self.shared.pending.store(0, Ordering::Relaxed);
+            let mut state = self.shared.mutable.lock();
+            state.active = 0;
+            state.group = 0;
+            state.enable = 0;
+            state.ppi_cfg = 0;
+            state.priority = [0; 8];
+            state.sleep = false;
         }
 
         pub fn raise(&mut self, intid: u32) {

@@ -335,6 +335,7 @@ impl virt::ResetPartition for HvfPartition {
     /// are re-applied afterward by the firmware reload (`set_initial_regs`), so
     /// this only needs to clear partition-level device/interrupt state.
     fn reset(&self) -> Result<(), Self::Error> {
+        self.inner.gicd.reset();
         self.inner.hv1.guest_os_id.store(0, Ordering::Relaxed);
         self.inner.partition_info_page.store(0, Ordering::Release);
         Ok(())
@@ -1511,6 +1512,7 @@ impl<'p> Processor for HvfProcessor<'p> {
     fn reset(&mut self) -> Result<(), impl std::error::Error + Send + Sync + 'static> {
         self.recreate_vcpu()?;
         self.set_reset_registers(None)?;
+        self.gicr.reset();
         self.hv1.reset();
         self.pmu = PmuState::default();
         self.crash_params = [0; 5];

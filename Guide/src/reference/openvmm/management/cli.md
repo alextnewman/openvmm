@@ -482,6 +482,15 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 --mana pcie_port=rp0:tap:tap0        # TAP is Linux-only
 ```
 
+`--mana` exposes the emulated MANA/GDMA NIC. Use `consomme` instead of `tap:tap0` for user-mode NAT on macOS, Linux, or Windows. Without `pcie_port=`, the device is attached through VPCI.
+
+Two optional device modes apply to explicitly requested `--mana` devices and are disabled by default:
+
+- `--mana-bm-hostmode`: present PCI physical-function ID `1414:00b9` and report bare-metal host mode, for exercising the guest driver's bare-metal-host paths.
+- `--mana-pf-caps`: expose a PF capability register block reporting the emulated device's resource limits. This cannot be combined with `--mana-bm-hostmode`.
+
+On AArch64, the GICv2m MSI path also accepts Hyper-V-compatible GICv3 distributor doorbells when configured by the platform topology. Both doorbells deliver SPI pulses rather than persistent line assertions.
+
 **Filesystems and other virtio devices** (colon-prefixed):
 `--virtio-fs`, `--virtio-fs-shmem`, `--virtio-9p`, `--virtio-pmem`
 

@@ -2863,6 +2863,7 @@ dependencies = [
  "gdma_resources",
  "guestmem",
  "inspect",
+ "mesh",
  "net_backend",
  "net_backend_resources",
  "parking_lot",
@@ -4477,6 +4478,7 @@ name = "mana_driver"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "build_info",
  "chipset_device",
  "futures",
@@ -5038,6 +5040,7 @@ dependencies = [
  "net_backend",
  "page_pool_alloc",
  "pal_async",
+ "parking_lot",
  "pci_core",
  "safeatomic",
  "test_with_tracing",
@@ -9627,6 +9630,7 @@ dependencies = [
  "memory_range",
  "open_enum",
  "parking_lot",
+ "pci_core",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",

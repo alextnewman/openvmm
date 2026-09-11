@@ -1322,6 +1322,8 @@ pub mod caps {
                 CONTROL_STATUS = 0x08,
                 INITIAL_TOTAL_VFS = 0x0C,
                 VF_OFFSET_STRIDE = 0x14,
+                SUPPORTED_PAGE_SIZES = 0x1C,
+                SYSTEM_PAGE_SIZE = 0x20,
                 VF_BAR0 = 0x24,
             }
         }

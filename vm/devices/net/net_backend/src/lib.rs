@@ -167,6 +167,8 @@ pub struct TxOffloadSupport {
     pub tso: bool,
     /// UDP segmentation offload (USO).
     pub uso: bool,
+    /// Encapsulated inner-header checksum and segmentation offloads.
+    pub encapsulation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +236,9 @@ pub trait Queue: Send + InspectMut {
 
     /// Posts transmits to the device.
     ///
-    /// Returns `Ok(false)` if the segments will complete asynchronously.
+    /// Returns whether accepted packets completed synchronously and the number
+    /// of segments accepted. A backend must only stop at a packet boundary; the
+    /// caller retains and may retry all unaccepted segments.
     fn tx_avail(
         &mut self,
         pool: &mut dyn BufferAccess,
@@ -244,6 +248,32 @@ pub trait Queue: Send + InspectMut {
     /// Polls the device for transmit completions.
     fn tx_poll(&mut self, pool: &mut dyn BufferAccess, done: &mut [TxId])
     -> Result<usize, TxError>;
+
+    /// Polls the device for transmit completions with per-packet status.
+    ///
+    /// Backends that only report successful completion IDs may use this default
+    /// implementation. Backends that can report packet-specific failures should
+    /// override it so frontends do not turn failed offloads into successful
+    /// completions.
+    fn tx_poll_with_status(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        done: &mut [TxCompletion],
+    ) -> Result<usize, TxError> {
+        let mut completed = 0;
+        for completion in done {
+            let mut id = [TxId(0)];
+            if self.tx_poll(pool, &mut id)? == 0 {
+                break;
+            }
+            *completion = TxCompletion {
+                id: id[0],
+                status: TxCompletionStatus::Success,
+            };
+            completed += 1;
+        }
+        Ok(completed)
+    }
 
     /// Get queue statistics
     fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {
@@ -415,6 +445,24 @@ impl RxChecksumState {
 #[repr(transparent)]
 pub struct TxId(pub u32);
 
+/// The outcome of one asynchronously completed transmit.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TxCompletionStatus {
+    /// The packet was transmitted successfully.
+    Success,
+    /// The backend rejected the packet's offload metadata.
+    InvalidOffload,
+    /// The backend reported another packet-specific transmit failure.
+    Failed,
+}
+
+/// A transmit completion and its packet-specific status.
+#[derive(Debug, Copy, Clone)]
+pub struct TxCompletion {
+    pub id: TxId,
+    pub status: TxCompletionStatus,
+}
+
 #[derive(Debug, Clone)]
 /// The segment type.
 pub enum TxSegmentType {
@@ -422,6 +470,21 @@ pub enum TxSegmentType {
     Head(TxMetadata),
     /// A packet continuation.
     Tail,
+}
+
+/// Explicit geometry for an encapsulated transmit offload.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TxEncapsulationMetadata {
+    /// Whether the outer packet carries IPv4.
+    pub outer_is_ipv4: bool,
+    /// Whether the outer packet carries IPv6.
+    pub outer_is_ipv6: bool,
+    /// Byte offset from the transmitted frame to the inner frame.
+    pub inner_frame_offset: u16,
+    /// Byte offset from the inner frame to its IP header.
+    pub inner_ip_rel_offset: u8,
+    /// Whether the inner TCP header contains options.
+    pub inner_tcp_options: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +518,8 @@ pub struct TxMetadata {
     /// is populated. Only applies when traffic is being sent over an L2 connection,
     /// so L3-only or above traffic will not use this option.
     pub vlan: Option<VlanMetadata>,
+    /// Explicit outer/inner geometry for an encapsulated offload.
+    pub encapsulation: Option<TxEncapsulationMetadata>,
 }
 
 /// Flags affecting transmit behavior.
@@ -502,6 +567,7 @@ impl Default for TxMetadata {
             transport_header_offset: 0,
             max_segment_size: 0,
             vlan: None,
+            encapsulation: None,
         }
     }
 }

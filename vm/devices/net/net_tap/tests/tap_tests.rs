@@ -574,6 +574,7 @@ mod tap_tests {
                 l4_len: 20,
                 transport_header_offset: 34,
                 max_segment_size: 1460,
+                encapsulation: None,
                 vlan: None,
             }),
             gpa: 0,

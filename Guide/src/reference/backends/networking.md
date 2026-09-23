@@ -73,6 +73,10 @@ for the full trait signatures and type definitions.
    `sync = true`), the frontend can immediately mark the descriptor
    done. Otherwise, it polls `tx_poll` later for async completions.
 
+`tx_avail` reports how many segments it accepted, stopping at a packet boundary. The frontend retains unaccepted packets for retry. Frontends that need packet-specific errors can use `tx_poll_with_status`; its default adapts successful completion IDs from `tx_poll`, while backends such as `net_mana` report invalid-offload and other failure statuses explicitly.
+
+Encapsulated checksum and segmentation requests carry outer/inner header geometry in `TxMetadata::encapsulation`. A backend advertises support through `TxOffloadSupport::encapsulation`. The GDMA frontend validates the OOB geometry and rejects unsupported encapsulated requests with a MANA TX error instead of completing them as successful transmits.
+
 ### Receive (host → guest)
 
 1. The frontend pre-populates the backend with receive buffers by
@@ -162,5 +166,4 @@ per entry and uses the RSS configuration to steer incoming packets
 to the appropriate queue. Each queue is driven independently by its
 own async task.
 
-Currently `netvsp` and `net_mana` support multi-queue; `virtio_net`
-is limited to a single queue pair.
+`netvsp`, `net_mana`, and the GDMA frontend support multiple queues; `virtio_net` is limited to a single queue pair. GDMA can also service guest queues through a single-queue backend, retaining guest RSS steering and receive-fence ordering. Live RSS changes preserve posted guest receive buffers, and optional RX completion coalescing batches their completions.

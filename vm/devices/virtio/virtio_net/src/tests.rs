@@ -1886,6 +1886,7 @@ async fn feature_negotiation_with_offloads(driver: DefaultDriver) {
             udp: true,
             tso: true,
             uso: true,
+            encapsulation: false,
         },
     };
 

@@ -7,29 +7,48 @@ use crate::GuestDmaMode;
 use crate::ManaEndpoint;
 use crate::ManaTestConfiguration;
 use crate::QueueStats;
+use async_trait::async_trait;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use gdma::VportConfig;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
+use guestmem::GuestMemory;
+use inspect::InspectMut;
 use inspect_counters::Counter;
 use mana_driver::mana::ManaDevice;
+use mana_driver::mana::RxConfig;
 use mesh::CancelContext;
 use mesh::CancelReason;
 use net_backend::BufferAccess;
 use net_backend::Endpoint;
+use net_backend::MultiQueueSupport;
+use net_backend::Queue;
 use net_backend::QueueConfig;
+use net_backend::RssConfig;
 use net_backend::RxId;
+use net_backend::TxCompletion;
+use net_backend::TxCompletionStatus;
 use net_backend::TxId;
+use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::VlanMetadata;
+use net_backend::linearize;
 use net_backend::loopback::LoopbackEndpoint;
+use net_backend::next_packet;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
+use parking_lot::Mutex;
 use pci_core::msi::MsiConnection;
+use std::collections::VecDeque;
 use std::future::poll_fn;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use test_with_tracing::test;
 use user_driver_emulated_mock::DeviceTestMemory;
 use user_driver_emulated_mock::EmulatedDevice;
+use vmcore::device_state::ChangeDeviceState;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -568,6 +587,7 @@ async fn test_vport_with_query_filter_state(driver: DefaultDriver) {
         pf_cap_flags3: 0,
         pf_cap_flags4: 0,
         max_num_vports: 1,
+        bm_hostmode: 0,
         reserved: 0,
         max_num_eqs: 64,
         adapter_mtu: 0,
@@ -594,6 +614,7 @@ async fn test_link_speed_default(driver: DefaultDriver) {
         pf_cap_flags3: 0,
         pf_cap_flags4: 0,
         max_num_vports: 1,
+        bm_hostmode: 0,
         reserved: 0,
         max_num_eqs: 64,
         adapter_mtu: 0,
@@ -644,6 +665,7 @@ async fn test_link_speed_default(driver: DefaultDriver) {
                 pf_cap_flags3: 0,
                 pf_cap_flags4: 0,
                 max_num_vports: 1,
+                bm_hostmode: 0,
                 reserved: 0,
                 max_num_eqs: 64,
                 adapter_mtu: 0,
@@ -688,6 +710,7 @@ async fn verify_link_speed_expected(driver: DefaultDriver, link_speed_mbps: u32)
         &mut ExternallyManagedMmioIntercepts,
         gdma::BnicConfig {
             adapter_link_speed_mbps: link_speed_mbps,
+            ..Default::default()
         },
     );
     let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
@@ -707,6 +730,7 @@ async fn verify_link_speed_expected(driver: DefaultDriver, link_speed_mbps: u32)
         pf_cap_flags3: 0,
         pf_cap_flags4: 0,
         max_num_vports: 1,
+        bm_hostmode: 0,
         reserved: 0,
         max_num_eqs: 64,
         adapter_mtu: 0,
@@ -958,6 +982,7 @@ async fn test_endpoint(
         pf_cap_flags3: 0,
         pf_cap_flags4: 0,
         max_num_vports: 1,
+        bm_hostmode: 0,
         reserved: 0,
         max_num_eqs: 64,
         adapter_mtu: 0,
@@ -1098,6 +1123,7 @@ use gdma_defs::CqeParams;
 use gdma_defs::bnic::ManaTxCompOob;
 use mana_driver::mana::ResourceArena;
 use page_pool_alloc::PagePoolAllocator;
+use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 
 type TestEmulatedDevice = EmulatedDevice<gdma::GdmaDevice, PagePoolAllocator>;
@@ -1132,6 +1158,7 @@ async fn new_test_queue(
         pf_cap_flags3: 0,
         pf_cap_flags4: 0,
         max_num_vports: 1,
+        bm_hostmode: 0,
         reserved: 0,
         max_num_eqs: 64,
         adapter_mtu: 0,
@@ -1147,6 +1174,70 @@ async fn new_test_queue(
     let (queue, _resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
 
     (queue, arena, endpoint)
+}
+
+#[test]
+fn tx_checksum_oob_derives_unspecified_transport_offset() {
+    for (is_ipv4, l3_len, expected_offset) in [(true, 20, 34), (false, 40, 54)] {
+        for udp in [false, true] {
+            let mut meta = net_backend::TxMetadata {
+                l2_len: 14,
+                l3_len,
+                ..Default::default()
+            };
+            meta.flags.set_is_ipv4(is_ipv4);
+            meta.flags.set_is_ipv6(!is_ipv4);
+            meta.flags.set_offload_tcp_checksum(!udp);
+            meta.flags.set_offload_udp_checksum(udp);
+
+            let (oob, short_format) = crate::build_tx_oob(&meta, 0, 0, 0);
+
+            assert!(short_format);
+            assert_eq!(
+                oob.s_oob.trans_off(),
+                expected_offset,
+                "is_ipv4={is_ipv4}, udp={udp}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tx_encapsulation_oob_matches_wire_layout() {
+    use crate::build_tx_oob;
+    use net_backend::TxEncapsulationMetadata;
+    use zerocopy::IntoBytes;
+
+    let mut meta = net_backend::TxMetadata {
+        transport_header_offset: 0x155,
+        encapsulation: Some(TxEncapsulationMetadata {
+            outer_is_ipv4: true,
+            outer_is_ipv6: false,
+            inner_frame_offset: 0x2aa,
+            inner_ip_rel_offset: 0x2b,
+            inner_tcp_options: true,
+        }),
+        vlan: Some(
+            VlanMetadata::new()
+                .with_priority(5)
+                .with_drop_eligible_indicator(true)
+                .with_vlan_id(0xabc),
+        ),
+        ..Default::default()
+    };
+    meta.flags.set_is_ipv6(true);
+    meta.flags.set_offload_tcp_checksum(true);
+
+    let (oob, short_format) = build_tx_oob(&meta, 0xa1b2, 0x1234, 0x456);
+
+    assert!(!short_format);
+    assert_eq!(
+        oob.as_bytes(),
+        &[
+            0x25, 0xb2, 0xa1, 0x00, 0x55, 0xd1, 0x48, 0x00, 0x0f, 0x00, 0xcd, 0xab, 0xaa, 0xae,
+            0x56, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
 }
 
 #[async_test]
@@ -1212,8 +1303,9 @@ async fn tx_cqe_invalid_oob_completes_packet(driver: DefaultDriver) {
     oob.cqe_hdr.set_cqe_type(CQE_TX_INVALID_OOB);
 
     // CQE_TX_INVALID_OOB logs an error but still pops posted_tx.
-    let result = queue.handle_tx_cqe(&oob, CqeParams::new(), 8);
-    assert_eq!(result.unwrap().0, 7);
+    let completion = queue.handle_tx_cqe(&oob, CqeParams::new(), 8).unwrap();
+    assert_eq!(completion.id.0, 7);
+    assert_eq!(completion.status, TxCompletionStatus::InvalidOffload);
     assert_eq!(queue.stats.tx_errors.get(), 1);
     assert!(queue.posted_tx.is_empty());
 
@@ -1238,8 +1330,9 @@ async fn tx_cqe_okay_completes_packet(driver: DefaultDriver) {
     let mut oob = ManaTxCompOob::new_zeroed();
     oob.cqe_hdr.set_cqe_type(CQE_TX_OKAY);
 
-    let result = queue.handle_tx_cqe(&oob, CqeParams::new(), 8);
-    assert_eq!(result.unwrap().0, 99);
+    let completion = queue.handle_tx_cqe(&oob, CqeParams::new(), 8).unwrap();
+    assert_eq!(completion.id.0, 99);
+    assert_eq!(completion.status, TxCompletionStatus::Success);
     assert_eq!(queue.stats.tx_packets.get(), 1);
     assert!(queue.posted_tx.is_empty());
 
@@ -1435,4 +1528,2938 @@ async fn test_vlan_mixed_batch(driver: DefaultDriver) {
             .drop_eligible_indicator(),
         false
     );
+}
+
+/// RX CQE coalescing: when the driver opts in (the `GDMA_MESSAGE_V2`
+/// `MANA_CONFIG_VPORT_RX` request with `cqe_coalescing_enable` set) the emulator
+/// packs up to `MANA_RXCOMP_OOB_NUM_PPI` receive completions that share
+/// identical OOB metadata into a single `CQE_RX_COALESCED_4`, and net_mana's
+/// `rx_poll` expands that one CQE back into the individual packets.
+///
+/// This drives four identical loopback packets through the real datapath and
+/// asserts that all four are delivered AND that the coalesced-packet counter
+/// advanced -- which is only possible if at least one CQE carried more than one
+/// packet. Without the coalescing emitter (one CQE per packet) the counter
+/// stays zero, so the `>= 2` assertion is a true regression guard.
+#[async_test]
+async fn rx_coalesced_cqe_delivers_batch(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 500;
+    const NUM_PACKETS: usize = 4;
+
+    // Build the full device stack directly (rather than via `new_test_queue`)
+    // so we can capture the payload memory and drive a concrete `ManaQueue`.
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_coalesce");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Opt into coalescing. This issues the V2 MANA_CONFIG_VPORT_RX request
+    // (cqe_coalescing_enable = 1) and starts the receive datapath to our single
+    // receive queue with coalescing armed.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: true,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers, then send all four packets in a single batch so the
+    // device reflects them through loopback before producing completions -- the
+    // condition under which the emulator coalesces.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    let mut pkt_builder = TxPacketBuilder::new();
+    for _ in 0..NUM_PACKETS {
+        build_tx_segments(PACKET_LEN, 1, false, &mut pkt_builder);
+    }
+    let data_to_send = pkt_builder.packet_data();
+    payload_mem.write_at(0, &data_to_send).unwrap();
+    queue.tx_avail(&mut pool, pkt_builder.segments()).unwrap();
+
+    // Poll until all four packets are received (or the deadline trips).
+    let mut rx_ids = [RxId(0); NUM_PACKETS];
+    let mut rx_n = 0;
+    let mut tx_done = [TxId(0); NUM_PACKETS];
+    let mut tx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        // GDMA errors surface as a TryRestart error here; ignore for polling.
+        tx_n += queue.tx_poll(&mut pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        if rx_n >= NUM_PACKETS {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, NUM_PACKETS, "all four packets must be delivered");
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        NUM_PACKETS as u64,
+        "rx_packets counts every delivered packet"
+    );
+    assert!(
+        queue.stats.rx_packets_coalesced.get() >= 2,
+        "coalescing must pack at least two packets into one CQE (got {})",
+        queue.stats.rx_packets_coalesced.get()
+    );
+
+    // Every delivered buffer must hold the exact bytes that were sent. Packets
+    // are consumed in receive-buffer post order, so packet i lands in RxId(i+1).
+    let mut offset = 0;
+    for (i, rx_id) in rx_ids.iter().take(rx_n).enumerate() {
+        assert_eq!(rx_id.0, (i + 1) as u32);
+        let buffer_size = pool.capacity(*rx_id) as u64;
+        let mut received = vec![0u8; PACKET_LEN];
+        payload_mem
+            .read_at(buffer_size * rx_id.0 as u64, &mut received)
+            .unwrap();
+        assert_eq!(
+            received,
+            data_to_send[offset..offset + PACKET_LEN],
+            "payload mismatch for {rx_id:?}"
+        );
+        offset += PACKET_LEN;
+    }
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// Live RSS reconfiguration must preserve the guest's already-posted receive
+/// buffer stream. A running vport keeps its receive queue -- and every buffer
+/// the guest has posted but the device has not yet completed -- across an
+/// in-place steering change (`MANA_CONFIG_VPORT_RX` re-asserting `rx_enable=TRUE`
+/// with `update_hashkey` / `update_indir_tab` set). The emulator briefly cycles
+/// its backend datapath to apply the new key/table, and it MUST carry those
+/// outstanding buffers onto the rebuilt datapath in FIFO post order. Discarding
+/// them (the original behavior) offsets every later completion against the
+/// guest's receive NBL queue, delivering each frame to the wrong buffer and
+/// silently breaking receive.
+///
+/// This drives a real loopback receive, performs a live re-steer while buffers
+/// are still outstanding (crucially without re-posting any), then drives two
+/// more receives and asserts they land in the next posted buffers in order with
+/// the exact bytes sent. That only holds if the outstanding buffer stream
+/// survived the reconfiguration -- with the buffers discarded the rebuilt
+/// datapath has nothing to receive into and the post-reconfig receives never
+/// arrive.
+#[async_test]
+async fn rss_reconfig_preserves_rx_buffer_stream(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 512;
+
+    // Supplying a hash key sets `update_hashkey` on the steering request, which
+    // is what makes the second `config_rx` a live reconfiguration (rather than a
+    // no-op) and thus exercises the buffer carry-over path.
+    const HASH_KEY: [u8; 40] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
+
+    // Build the full device stack directly so we can capture the payload memory
+    // and drive a concrete `ManaQueue` across a live steering change.
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rss_reconfig_rx");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Bring the receive datapath up: a fresh start with no RSS and no carried
+    // buffers.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post a batch of receive buffers exactly once. The test never re-posts, so
+    // every receive after the re-steer must be satisfied by a buffer that was
+    // still outstanding when the reconfiguration happened.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    // Sends the given loopback packets (payloads laid out contiguously from
+    // offset 0, one single-segment TX descriptor each), then polls until they
+    // are all received or a wall-clock budget expires. Returns the RxIds the
+    // packets landed in, in completion order. The wall-clock bound (rather than
+    // only the per-poll deadline) guarantees the test fails fast even if the
+    // datapath keeps signaling readiness without ever delivering the packets --
+    // the failure mode when the receive-buffer stream is not carried across a
+    // reconfiguration.
+    async fn loopback_recv(
+        queue: &mut ManaQueue<TestEmulatedDevice>,
+        pool: &mut net_backend::tests::Bufs,
+        payload_mem: &GuestMemory,
+        packets: &[Vec<u8>],
+    ) -> Vec<RxId> {
+        let mut builder = TxPacketBuilder::new();
+        let mut offset = 0u64;
+        for payload in packets {
+            payload_mem.write_at(offset, payload).unwrap();
+            build_tx_segments(payload.len(), 1, false, &mut builder);
+            offset += payload.len() as u64;
+        }
+        queue.tx_avail(&mut *pool, builder.segments()).unwrap();
+
+        let want = packets.len();
+        let mut rx_ids = vec![RxId(0); want];
+        let mut rx_n = 0;
+        let mut tx_done = vec![TxId(0); want];
+        let mut tx_n = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rx_n < want {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let mut context = CancelContext::new().with_timeout(Duration::from_secs(1));
+            match context
+                .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut *pool)))
+                .await
+            {
+                Err(CancelReason::DeadlineExceeded) => continue,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to poll queue ready");
+                    break;
+                }
+                _ => {}
+            }
+            rx_n += queue.rx_poll(&mut *pool, &mut rx_ids[rx_n..]).unwrap();
+            tx_n += queue.tx_poll(&mut *pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        }
+        rx_ids.truncate(rx_n);
+        rx_ids
+    }
+
+    // Receive #1, before the re-steer: lands in the first posted buffer.
+    let sent1: Vec<u8> = (0..PACKET_LEN).map(|i| (0x10 + i) as u8).collect();
+    let rx1 = loopback_recv(
+        &mut queue,
+        &mut pool,
+        &payload_mem,
+        std::slice::from_ref(&sent1),
+    )
+    .await;
+    assert_eq!(
+        rx1.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1],
+        "first receive must use the first buffer"
+    );
+    let mut got = vec![0u8; PACKET_LEN];
+    payload_mem
+        .read_at(2048 * rx1[0].0 as u64, &mut got)
+        .unwrap();
+    assert_eq!(got, sent1, "payload mismatch on the pre-reconfig receive");
+
+    // Live RSS reconfiguration: re-assert rx_enable=TRUE and push a new hash key
+    // WITHOUT bringing the vport down and WITHOUT re-posting receive buffers.
+    // This is the path that must carry the still-outstanding buffers (2..=16)
+    // across the datapath rebuild.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: Some(&HASH_KEY),
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    // Receives #2 and #3, after the re-steer: they must resume the carried
+    // buffer stream at the next posted buffer, in order, with the exact bytes
+    // sent. If the reconfiguration had discarded the outstanding buffers these
+    // receives would never arrive.
+    let sent2: Vec<u8> = (0..PACKET_LEN).map(|i| (0x80 + i) as u8).collect();
+    let sent3: Vec<u8> = (0..PACKET_LEN).map(|i| (0xC0 + i) as u8).collect();
+    let rx23 = loopback_recv(
+        &mut queue,
+        &mut pool,
+        &payload_mem,
+        &[sent2.clone(), sent3.clone()],
+    )
+    .await;
+    assert_eq!(
+        rx23.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![2, 3],
+        "post-reconfig receives must continue the carried buffer stream in FIFO order"
+    );
+    for (rx_id, expected) in rx23.iter().zip([&sent2, &sent3]) {
+        let mut got = vec![0u8; PACKET_LEN];
+        payload_mem
+            .read_at(2048 * rx_id.0 as u64, &mut got)
+            .unwrap();
+        assert_eq!(
+            &got, expected,
+            "payload mismatch on {rx_id:?} after reconfig"
+        );
+    }
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// Builds a minimal Ethernet + IPv4 + TCP frame for the published RSS test flow
+/// (66.9.149.187:2794 -> 161.142.100.80:1766), padded to `len` bytes.
+fn tcp_ipv4_frame(len: usize) -> Vec<u8> {
+    let mut frame = vec![
+        // Ethernet: dst MAC, src MAC, ethertype 0x0800.
+        0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00,
+        // IPv4 header (IHL=5, protocol 6 = TCP), src then dst address.
+        0x45, 0x00, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 66, 9, 149, 187, 161, 142, 100, 80,
+        // TCP source port 2794, destination port 1766.
+        0x0a, 0xea, 0x06, 0xe6,
+    ];
+    frame.resize(len, 0);
+    frame
+}
+
+/// RSS receive hashing (offload): when the driver enables RSS with a hash key,
+/// the device computes the Toeplitz hash over each received packet's flow tuple
+/// and reports it in the completion OOB. This drives a real TCP/IPv4 frame
+/// through the loopback datapath with RSS enabled end to end -- exercising the
+/// config_rx -> `rss_key` -> `write_data` hash wiring -- and asserts the device
+/// hashed it (the `rx_packets_hashed` counter advances). Without the device-side
+/// hash emitter the OOB hash type stays zero and the counter never moves, so the
+/// assertion is a true regression guard. The exact hash type/value is covered by
+/// the gdma-crate unit tests (`bnic::tests`, `rss::tests`).
+#[async_test]
+async fn rx_rss_hash_reported(driver: DefaultDriver) {
+    const FRAME_LEN: usize = 60;
+
+    // The Microsoft-standard RSS hash key (matches the published Toeplitz
+    // verification vectors).
+    const HASH_KEY: [u8; 40] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f,
+        0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30,
+        0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_rss_hash");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Enable RSS with the standard hash key. This issues MANA_CONFIG_VPORT_RX
+    // with rss_enable=TRUE plus the key, so the device arms receive-side hashing
+    // on the datapath to our single receive queue (no custom indirection table).
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(true),
+            hash_key: Some(&HASH_KEY),
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post a receive buffer, then transmit one real TCP/IPv4 frame; loopback
+    // reflects it into the receive path where the device hashes it.
+    queue.rx_avail(&mut pool, &[RxId(1)]);
+
+    let frame = tcp_ipv4_frame(FRAME_LEN);
+    payload_mem.write_at(0, &frame).unwrap();
+    let tx_metadata = net_backend::TxMetadata {
+        id: TxId(1),
+        segment_count: 1,
+        len: FRAME_LEN as u32,
+        l2_len: 14,
+        l3_len: 20,
+        l4_len: 20,
+        max_segment_size: 1460,
+        ..Default::default()
+    };
+    queue
+        .tx_avail(
+            &mut pool,
+            &[TxSegment {
+                ty: net_backend::TxSegmentType::Head(tx_metadata),
+                gpa: 0,
+                len: FRAME_LEN as u32,
+            }],
+        )
+        .unwrap();
+
+    // Poll until the frame is received (or the deadline trips).
+    let mut rx_ids = [RxId(0); 1];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        let mut tx_done = [TxId(0); 1];
+        let _ = queue.tx_poll(&mut pool, &mut tx_done).unwrap_or(0);
+        if rx_n >= 1 {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, 1, "the frame must be delivered");
+    assert_eq!(
+        queue.stats.rx_packets_hashed.get(),
+        1,
+        "the device must report an RSS hash for the received TCP/IPv4 frame"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// RX CQE coalescing live toggle: enabling coalescing on an already-running
+/// vport must take effect on the live datapath WITHOUT cycling it.
+///
+/// This models the `ethtool -C eth0 rx-frames 4` path. On a running port the
+/// driver re-issues `MANA_CONFIG_VPORT_RX` (`rx_enable=TRUE`) with
+/// `cqe_coalescing_enable=1` but `update_indir_tab=0` / `update_hashkey=0`, so
+/// the device must not rebuild the datapath (that would drop the live RSS
+/// table) -- it instead flips the coalescing flag the running receive tasks
+/// share. The test starts the datapath with coalescing OFF, toggles it ON via a
+/// second `config_rx` that carries no indirection table, then drives a batch and
+/// asserts it was coalesced. If the running task did not observe the toggle it
+/// would deliver one CQE per packet (coalesced counter stays zero), so the
+/// `>= 2` assertion is a true regression guard for the shared-flag behavior.
+#[async_test]
+async fn rx_coalescing_live_toggle_engages_without_rebuild(driver: DefaultDriver) {
+    const PACKET_LEN: usize = 500;
+    const NUM_PACKETS: usize = 4;
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_coalesce_toggle");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    // Start the receive datapath with coalescing OFF (the V1 request form). The
+    // device builds its receive task capturing the disabled flag.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    // Live toggle: re-issue config on the already-running vport with coalescing
+    // ON and no indirection table. This sends update_indir_tab=0 /
+    // update_hashkey=0, so the device must NOT rebuild the datapath -- it must
+    // flip the flag the running task already shares.
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: true,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers, then send all four packets in a single batch so the
+    // device reflects them through loopback before producing completions -- the
+    // condition under which the emulator coalesces.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    let mut pkt_builder = TxPacketBuilder::new();
+    for _ in 0..NUM_PACKETS {
+        build_tx_segments(PACKET_LEN, 1, false, &mut pkt_builder);
+    }
+    let data_to_send = pkt_builder.packet_data();
+    payload_mem.write_at(0, &data_to_send).unwrap();
+    queue.tx_avail(&mut pool, pkt_builder.segments()).unwrap();
+
+    // Poll until all four packets are received (or the deadline trips).
+    let mut rx_ids = [RxId(0); NUM_PACKETS];
+    let mut rx_n = 0;
+    let mut tx_done = [TxId(0); NUM_PACKETS];
+    let mut tx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        match context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+        {
+            Err(CancelReason::DeadlineExceeded) => break,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to poll queue ready");
+                break;
+            }
+            _ => {}
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        tx_n += queue.tx_poll(&mut pool, &mut tx_done[tx_n..]).unwrap_or(0);
+        if rx_n >= NUM_PACKETS {
+            break;
+        }
+    }
+
+    assert_eq!(rx_n, NUM_PACKETS, "all four packets must be delivered");
+    assert!(
+        queue.stats.rx_packets_coalesced.get() >= 2,
+        "the live coalescing toggle must engage on the running datapath \
+         (coalesced packets: {})",
+        queue.stats.rx_packets_coalesced.get()
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+/// Per-queue state inside the [`SteeringSwitch`].
+#[derive(Default)]
+struct SteeringQueueState {
+    /// Receive buffers the device has made available on this queue.
+    rx_avail: VecDeque<RxId>,
+    /// Packets steered to this queue, waiting for a receive buffer.
+    pending: VecDeque<(Vec<u8>, Option<VlanMetadata>)>,
+    /// Waker for the datapath task servicing this queue.
+    waker: Option<Waker>,
+}
+
+/// Shared state for the [`SteeringEndpoint`] test backend.
+///
+/// Models the PF / physical wire: it owns the resolved RSS indirection table
+/// and steers each transmitted frame onto a receive queue accordingly.
+struct SteeringSwitch {
+    /// Indirection table as resolved by the device: bucket -> receive queue
+    /// index. Recorded from the [`RssConfig`] handed to `get_queues`.
+    indir: Vec<u16>,
+    queues: Vec<SteeringQueueState>,
+}
+
+/// A test backend that steers transmitted frames to a receive queue chosen by
+/// the RSS indirection table, using the first packet byte as the hash bucket.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SteeringEndpoint {
+    switch: Arc<Mutex<SteeringSwitch>>,
+}
+
+impl SteeringEndpoint {
+    fn new(switch: Arc<Mutex<SteeringSwitch>>) -> Self {
+        Self { switch }
+    }
+}
+
+#[async_trait]
+impl Endpoint for SteeringEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "steering-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut switch = self.switch.lock();
+            switch.indir = rss
+                .map(|r| r.indirection_table.to_vec())
+                .unwrap_or_default();
+            switch.queues.clear();
+            switch.queues.resize_with(config.len(), Default::default);
+        }
+        for index in 0..config.len() {
+            queues.push(Box::new(SteeringQueue {
+                switch: self.switch.clone(),
+                index,
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 8,
+            indirection_table_size: 128,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SteeringQueue {
+    switch: Arc<Mutex<SteeringSwitch>>,
+    index: usize,
+}
+
+impl Queue for SteeringQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        let mut switch = self.switch.lock();
+        let q = &mut switch.queues[self.index];
+        if !q.pending.is_empty() && !q.rx_avail.is_empty() {
+            Poll::Ready(())
+        } else {
+            q.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        let mut switch = self.switch.lock();
+        switch.queues[self.index]
+            .rx_avail
+            .extend(done.iter().copied());
+    }
+
+    fn rx_poll(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let mut switch = self.switch.lock();
+        let mut n = 0;
+        while n < packets.len() {
+            let q = &mut switch.queues[self.index];
+            if q.pending.is_empty() || q.rx_avail.is_empty() {
+                break;
+            }
+            let rx_id = q.rx_avail.pop_front().unwrap();
+            let (data, vlan) = q.pending.pop_front().unwrap();
+            pool.write_packet(
+                rx_id,
+                &net_backend::RxMetadata {
+                    offset: 0,
+                    len: data.len(),
+                    vlan,
+                    ..Default::default()
+                },
+                &data,
+            );
+            packets[n] = rx_id;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        mut segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let mut sent = 0;
+        while !segments.is_empty() {
+            let (meta, _, _) = next_packet(segments);
+            let vlan = meta.vlan;
+            let before = segments.len();
+            let data = linearize(pool, &mut segments)?;
+            sent += before - segments.len();
+
+            let mut switch = self.switch.lock();
+            // Use the first packet byte as the hash bucket so tests can steer
+            // deterministically. With no indirection table, fall back to the
+            // transmitting queue (loopback).
+            let target = if switch.indir.is_empty() {
+                self.index
+            } else {
+                let bucket = data.first().copied().unwrap_or(0) as usize;
+                switch.indir[bucket % switch.indir.len()] as usize
+            };
+            let q = &mut switch.queues[target];
+            q.pending.push_back((data, vlan));
+            if let Some(waker) = q.waker.take() {
+                waker.wake();
+            }
+        }
+        Ok((true, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        Ok(0)
+    }
+}
+
+/// Drives every queue until a single steered receive lands, returning the index
+/// of the queue that received it. Panics on timeout.
+async fn poll_for_steered_rx(
+    queues: &mut [Box<dyn Queue>],
+    pool: &mut net_backend::tests::Bufs,
+) -> usize {
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| {
+                let mut ready = Poll::Pending;
+                for q in queues.iter_mut() {
+                    if q.poll_ready(cx, &mut *pool).is_ready() {
+                        ready = Poll::Ready(());
+                    }
+                }
+                ready
+            }))
+            .await
+            .is_err()
+        {
+            panic!("timed out waiting for steered receive");
+        }
+
+        for q in queues.iter_mut() {
+            let mut tx_done = [TxId(0); 4];
+            let _ = q.tx_poll(&mut *pool, &mut tx_done);
+        }
+
+        for (k, q) in queues.iter_mut().enumerate() {
+            let mut rx = [RxId(0)];
+            if q.rx_poll(&mut *pool, &mut rx).unwrap() > 0 {
+                return k;
+            }
+        }
+    }
+}
+
+/// Verifies that the device advertises multiple receive queues, translates the
+/// guest's RSS indirection table (work-queue object handles) back into receive
+/// queue indices, and steers each frame to the queue named by the table.
+#[async_test]
+async fn test_rss_steering_distributes_across_queues(driver: DefaultDriver) {
+    const NUM_QUEUES: usize = 4;
+    // Non-identity table so a mistranslation (e.g. identity) is caught:
+    // bucket b is steered to queue INDIR[b].
+    const INDIR: [u16; NUM_QUEUES] = [3, 2, 1, 0];
+
+    let pages = 256; // 1MB
+    let mem = DeviceTestMemory::new(pages * 2, true, "test_rss_steering");
+    let payload_mem = mem.payload_mem();
+
+    let switch = Arc::new(Mutex::new(SteeringSwitch {
+        indir: Vec::new(),
+        queues: Vec::new(),
+    }));
+
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(SteeringEndpoint::new(switch.clone())),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, NUM_QUEUES as u16, None)
+        .await
+        .unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+
+    let mut queues = Vec::new();
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+    let key = [0u8; 40];
+    endpoint
+        .get_queues(
+            (0..NUM_QUEUES)
+                .map(|_| QueueConfig {
+                    driver: Box::new(driver.clone()),
+                })
+                .collect(),
+            Some(&RssConfig {
+                key: &key,
+                indirection_table: &INDIR,
+                flags: 0,
+            }),
+            &mut queues,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queues.len(), NUM_QUEUES);
+
+    // The device must resolve the guest's handle-based indirection table back
+    // into receive queue indices before handing it to the backend.
+    assert_eq!(switch.lock().indir, INDIR.to_vec());
+
+    // Give each queue a disjoint range of receive buffer ids so the buffer that
+    // receives a frame identifies the queue it landed on. `Bufs` maps id ->
+    // payload offset id*2048; offset 0 is reserved as transmit scratch.
+    const BUFS_PER_QUEUE: u32 = 8;
+    for (q, queue) in queues.iter_mut().enumerate() {
+        let base = q as u32 * BUFS_PER_QUEUE + 1;
+        let ids: Vec<RxId> = (base..base + BUFS_PER_QUEUE).map(RxId).collect();
+        queue.rx_avail(&mut pool, &ids);
+    }
+
+    // For each bucket, transmit a one-segment frame whose first byte selects the
+    // bucket, always from queue 0, and confirm the device steers it onto the
+    // queue named by the indirection table.
+    for (bucket, &target_queue) in INDIR.iter().enumerate() {
+        let mut packet = vec![0u8; 64];
+        packet[0] = bucket as u8;
+        payload_mem.write_at(0, &packet).unwrap();
+
+        let seg = TxSegment {
+            ty: net_backend::TxSegmentType::Head(net_backend::TxMetadata {
+                id: TxId(1),
+                segment_count: 1,
+                len: packet.len() as u32,
+                ..Default::default()
+            }),
+            gpa: 0,
+            len: packet.len() as u32,
+        };
+        queues[0].tx_avail(&mut pool, &[seg]).unwrap();
+
+        let received_on = poll_for_steered_rx(&mut queues, &mut pool).await;
+        assert_eq!(
+            received_on, target_queue as usize,
+            "bucket {bucket} should steer to queue {target_queue}",
+        );
+    }
+
+    drop(queues);
+    endpoint.stop().await;
+}
+
+/// A single-queue loopback backend that completes transmits **asynchronously**
+/// and echoes the transmit id, modelling the `consomme` NAT backend whose state
+/// is single-owner (`tx_avail` returns `(false, ..)` and the completion, with
+/// the echoed transmit id, is reported later via `tx_poll`). `get_queues`
+/// returns an error if asked for more than one queue -- the real consomme
+/// backend asserts, which would panic the device's datapath thread; an error is
+/// used here so the failure is deterministic in a test.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct SingleQueueLoopbackEndpoint;
+
+#[async_trait]
+impl Endpoint for SingleQueueLoopbackEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "single-queue-loopback-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.len() == 1,
+            "single-queue backend asked for {} queues",
+            config.len()
+        );
+        queues.push(Box::new(AsyncLoopbackQueue::default()));
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 64,
+        }
+    }
+}
+
+/// Loopback queue that defers transmit completion to `tx_poll` and echoes the
+/// transmit id, exactly as the consomme backend does. This exercises the
+/// device's asynchronous transmit-completion path (`process_backend`), where the
+/// funnel must route the completion back to the send queue named by the echoed
+/// transmit id.
+#[derive(InspectMut, Default)]
+#[inspect(skip)]
+struct AsyncLoopbackQueue {
+    rx_avail: VecDeque<RxId>,
+    rx_done: VecDeque<RxId>,
+    tx_done: VecDeque<TxId>,
+}
+
+impl Queue for AsyncLoopbackQueue {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.rx_done.is_empty() && self.tx_done.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        self.rx_avail.extend(done);
+    }
+
+    fn rx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let n = packets.len().min(self.rx_done.len());
+        for (d, s) in packets.iter_mut().zip(self.rx_done.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        mut segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let mut sent = 0;
+        while !segments.is_empty() {
+            let (meta, _, _) = next_packet(segments);
+            let tx_id = meta.id;
+            let vlan = meta.vlan;
+            let before = segments.len();
+            let packet = linearize(pool, &mut segments)?;
+            sent += before - segments.len();
+            if let Some(rx_id) = self.rx_avail.pop_front() {
+                pool.write_packet(
+                    rx_id,
+                    &net_backend::RxMetadata {
+                        offset: 0,
+                        len: packet.len(),
+                        vlan,
+                        ..Default::default()
+                    },
+                    &packet,
+                );
+                self.rx_done.push_back(rx_id);
+            }
+            // Report the completion asynchronously (via `tx_poll`), echoing the
+            // transmit id, as consomme does.
+            self.tx_done.push_back(tx_id);
+        }
+        Ok((false, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        let n = done.len().min(self.tx_done.len());
+        for (d, s) in done.iter_mut().zip(self.tx_done.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+}
+
+/// The Windows VF driver creates one queue pair per CPU regardless of the
+/// per-vport `max_num_sq`/`max_num_rq` the device advertises, so it can create
+/// more queue pairs than a single-queue backend (like the `consomme` NAT
+/// backend) can service. Rather than requesting one backend queue per guest
+/// queue pair -- which a single-queue backend rejects (the real consomme
+/// backend panics its datapath thread) -- the device must funnel the guest's
+/// surplus queue pairs onto the backend's available queues.
+///
+/// This drives that funnel: two guest queue pairs against a single-queue
+/// loopback backend. It transmits from the *non-primary* send queue (queue 1)
+/// and asserts (a) the transmit completes on queue 1's own completion queue --
+/// proving the transmit was funneled onto the single backend queue and its
+/// completion routed back by the source send queue -- and (b) the looped-back
+/// packet is received on the primary receive queue (queue 0), where a
+/// single-backend-queue funnel delivers all receives.
+///
+/// Without the funnel the device requests two backend queues from the
+/// single-queue endpoint, `get_queues` fails, and `MANA_CONFIG_VPORT_RX` (hence
+/// `get_queues` below) errors -- a genuine regression guard.
+#[async_test]
+async fn funnel_multi_queue_onto_single_queue_backend(driver: DefaultDriver) {
+    let pages = 256; // 1MB
+    let mem = DeviceTestMemory::new(pages * 2, true, "funnel_multi_queue");
+    let payload_mem = mem.payload_mem();
+
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(SingleQueueLoopbackEndpoint),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 2, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+
+    // Create *two* queue pairs even though the backend advertises a single
+    // queue -- exactly what the Windows VF driver does. Without the funnel the
+    // device would ask the single-queue backend for two queues and this fails.
+    let mut queues = Vec::new();
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+    endpoint
+        .get_queues(
+            (0..2)
+                .map(|_| QueueConfig {
+                    driver: Box::new(driver.clone()),
+                })
+                .collect(),
+            None,
+            &mut queues,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queues.len(), 2);
+
+    // Post receive buffers on the *primary* receive queue (queue 0). With a
+    // single backend queue the funnel delivers every received packet there; the
+    // surplus queue's posted buffers stay idle.
+    queues[0].rx_avail(&mut pool, &(1..8u32).map(RxId).collect::<Vec<_>>());
+
+    // Transmit a one-segment frame from the *non-primary* send queue (queue 1).
+    let packet = {
+        let mut p = vec![0u8; 64];
+        p[0] = 0xb1;
+        p
+    };
+    payload_mem.write_at(0, &packet).unwrap();
+    let seg = TxSegment {
+        ty: net_backend::TxSegmentType::Head(net_backend::TxMetadata {
+            id: TxId(7),
+            segment_count: 1,
+            len: packet.len() as u32,
+            ..Default::default()
+        }),
+        gpa: 0,
+        len: packet.len() as u32,
+    };
+    queues[1].tx_avail(&mut pool, &[seg]).unwrap();
+
+    // Poll for the transmit completion on queue 1 and the looped-back receive on
+    // queue 0.
+    let mut tx_completed = false;
+    let mut rx_received: Option<RxId> = None;
+    let mut spurious_tx_on_primary = false;
+    loop {
+        let mut ctx = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if ctx
+            .until_cancelled(poll_fn(|cx| {
+                let mut ready = Poll::Pending;
+                for q in queues.iter_mut() {
+                    if q.poll_ready(cx, &mut pool).is_ready() {
+                        ready = Poll::Ready(());
+                    }
+                }
+                ready
+            }))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        let mut tx_done = [TxId(0); 4];
+        if queues[1].tx_poll(&mut pool, &mut tx_done).unwrap_or(0) > 0 {
+            tx_completed = true;
+        }
+        // The transmit came from queue 1, so its completion must not land on
+        // queue 0's completion queue.
+        if queues[0].tx_poll(&mut pool, &mut tx_done).unwrap_or(0) > 0 {
+            spurious_tx_on_primary = true;
+        }
+
+        let mut rx = [RxId(0)];
+        if queues[0].rx_poll(&mut pool, &mut rx).unwrap() > 0 {
+            rx_received = Some(rx[0]);
+        }
+
+        if tx_completed && rx_received.is_some() {
+            break;
+        }
+    }
+
+    assert!(
+        tx_completed,
+        "transmit from the non-primary send queue did not complete on its own completion queue"
+    );
+    assert!(
+        !spurious_tx_on_primary,
+        "transmit completion was misrouted to the primary send queue"
+    );
+    let rx_id =
+        rx_received.expect("looped-back packet was not delivered to the primary receive queue");
+
+    // Confirm the received bytes match what was transmitted from queue 1.
+    let buffer_size = pool.capacity(rx_id) as u64;
+    let mut received = vec![0u8; packet.len()];
+    payload_mem
+        .read_at(buffer_size * rx_id.0 as u64, &mut received)
+        .unwrap();
+    assert_eq!(received, packet);
+
+    drop(queues);
+    endpoint.stop().await;
+}
+
+/// (the emulator's receive task) can make progress while the test holds no
+/// pending future of its own.
+async fn run_executor_for(ms: u64) {
+    let mut ctx = CancelContext::new().with_timeout(Duration::from_millis(ms));
+    let _ = ctx.until_cancelled(std::future::pending::<()>()).await;
+}
+
+/// A `MANA_FENCE_RQ` is an ordering barrier, not a packet: the device posts a
+/// bare `CQE_RX_OBJECT_FENCE` that consumes no posted receive buffer. This test
+/// fences a receive object with buffers posted but no traffic, then asserts
+/// net_mana's `rx_poll` reports the fence (via the `rx_fence` counter) without
+/// delivering a packet and, crucially, without recording a receive error --
+/// which is what happens if the fence falls through to the catch-all CQE arm
+/// (it pops a `posted_rx` and increments `rx_errors`). That makes `rx_errors ==
+/// 0` a regression guard for the dedicated fence arm.
+#[async_test]
+async fn rx_fence_cqe_is_bare_completion(driver: DefaultDriver) {
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_fence_bare");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers so there is a non-empty posted_rx that the fence
+    // would (incorrectly) consume if it were treated as a packet completion.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+
+    // Fence the receive object. The device posts a single CQE_RX_OBJECT_FENCE.
+    endpoint
+        .vport
+        .fence_rq(resources.rxq.wq_obj())
+        .await
+        .unwrap();
+
+    // Drive the queue until the fence CQE is processed (or the deadline trips).
+    let mut rx_ids = [RxId(0); 8];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        let _ = queue.tx_poll(&mut pool, &mut [TxId(0); 1]);
+        if queue.stats.rx_fence.get() + queue.stats.rx_errors.get() >= 1 || rx_n > 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        queue.stats.rx_fence.get(),
+        1,
+        "the fence CQE must signal exactly one fence"
+    );
+    assert_eq!(rx_n, 0, "a fence carries no packet");
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        0,
+        "a fence delivers no packets"
+    );
+    assert_eq!(
+        queue.stats.rx_errors.get(),
+        0,
+        "a fence is a barrier, not a receive error"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
+}
+
+#[derive(Default)]
+struct TxRecordState {
+    metas: Vec<net_backend::TxMetadata>,
+    waker: Option<Waker>,
+    completion_waker: Option<Waker>,
+    completions_released: bool,
+    backend_polled: bool,
+    backend_poll_waker: Option<Waker>,
+    completion_status: Option<TxCompletionStatus>,
+    reverse_completions: bool,
+    submissions_blocked: bool,
+    submission_waiting: bool,
+    submission_ready_waker: Option<Waker>,
+    submission_waiting_waker: Option<Waker>,
+    restart_on_completion: bool,
+}
+
+#[derive(Clone, Default)]
+struct TxRecord {
+    state: Arc<Mutex<TxRecordState>>,
+}
+
+impl TxRecord {
+    fn push(&self, meta: net_backend::TxMetadata) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.metas.push(meta);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll_count(&self, cx: &mut Context<'_>, count: usize) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.metas.len() >= count {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn metas(&self) -> Vec<net_backend::TxMetadata> {
+        self.state.lock().metas.clone()
+    }
+
+    fn poll_backend_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let (poll, waker) = {
+            let mut state = self.state.lock();
+            state.backend_polled = true;
+            let poll = if state.completions_released {
+                Poll::Ready(())
+            } else {
+                state.completion_waker = Some(cx.waker().clone());
+                Poll::Pending
+            };
+            (poll, state.backend_poll_waker.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        poll
+    }
+
+    fn poll_backend_polled(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.backend_polled {
+            Poll::Ready(())
+        } else {
+            state.backend_poll_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn release_completions(&self) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.completions_released = true;
+            state.completion_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn set_completion_status(&self, status: TxCompletionStatus) {
+        self.state.lock().completion_status = Some(status);
+    }
+
+    fn completion_status(&self) -> TxCompletionStatus {
+        self.state
+            .lock()
+            .completion_status
+            .unwrap_or(TxCompletionStatus::Success)
+    }
+
+    fn set_reverse_completions(&self) {
+        self.state.lock().reverse_completions = true;
+    }
+
+    fn reverse_completions(&self) -> bool {
+        self.state.lock().reverse_completions
+    }
+
+    fn block_submissions(&self) {
+        self.state.lock().submissions_blocked = true;
+    }
+
+    fn release_submissions(&self) {
+        let waker = {
+            let mut state = self.state.lock();
+            state.submissions_blocked = false;
+            state.submission_ready_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn accept_submission(&self) -> bool {
+        let (accepted, waker) = {
+            let mut state = self.state.lock();
+            if state.submissions_blocked {
+                state.submission_waiting = true;
+                (false, state.submission_waiting_waker.take())
+            } else {
+                state.submission_waiting = false;
+                (true, None)
+            }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        accepted
+    }
+
+    fn poll_submission_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.submission_waiting && !state.submissions_blocked {
+            Poll::Ready(())
+        } else {
+            state.submission_ready_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn poll_submission_waiting(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.submission_waiting {
+            Poll::Ready(())
+        } else {
+            state.submission_waiting_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn restart_on_completion(&self) {
+        self.state.lock().restart_on_completion = true;
+    }
+
+    fn take_restart_on_completion(&self) -> bool {
+        let mut state = self.state.lock();
+        std::mem::take(&mut state.restart_on_completion)
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingEndpoint {
+    async_mode: bool,
+    supports_encapsulation: bool,
+    record: TxRecord,
+}
+
+#[async_trait]
+impl Endpoint for RecordingEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "tx-oob-recording-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        for _ in config {
+            queues.push(Box::new(RecordingQueue {
+                async_mode: self.async_mode,
+                record: self.record.clone(),
+                tx_done: VecDeque::new(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn tx_offload_support(&self) -> TxOffloadSupport {
+        TxOffloadSupport {
+            ipv4_header: true,
+            tcp: true,
+            udp: true,
+            tso: true,
+            uso: false,
+            encapsulation: self.supports_encapsulation,
+        }
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 64,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct RecordingQueue {
+    async_mode: bool,
+    record: TxRecord,
+    tx_done: VecDeque<TxId>,
+}
+
+impl Queue for RecordingQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.record.poll_submission_ready(cx).is_ready() {
+            Poll::Ready(())
+        } else if self.async_mode && !self.tx_done.is_empty() {
+            self.record.poll_backend_ready(cx)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, _done: &[RxId]) {}
+
+    fn rx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let Some(net_backend::TxSegmentType::Head(meta)) = segments.first().map(|s| &s.ty) else {
+            anyhow::bail!("transmit has no head segment");
+        };
+        if !self.record.accept_submission() {
+            return Ok((false, 0));
+        }
+        self.record.push(meta.clone());
+        if self.async_mode {
+            self.tx_done.push_back(meta.id);
+        }
+        Ok((!self.async_mode, segments.len()))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        let n = done.len().min(self.tx_done.len());
+        let reverse = self.record.reverse_completions();
+        for done in done.iter_mut().take(n) {
+            *done = if reverse {
+                self.tx_done.pop_back().unwrap()
+            } else {
+                self.tx_done.pop_front().unwrap()
+            };
+        }
+        Ok(n)
+    }
+
+    fn tx_poll_with_status(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        done: &mut [TxCompletion],
+    ) -> Result<usize, net_backend::TxError> {
+        if self.record.take_restart_on_completion() {
+            return Err(net_backend::TxError::TryRestart(anyhow::anyhow!(
+                "injected backend restart"
+            )));
+        }
+        let n = done.len().min(self.tx_done.len());
+        let status = self.record.completion_status();
+        let reverse = self.record.reverse_completions();
+        for done in done.iter_mut().take(n) {
+            let id = if reverse {
+                self.tx_done.pop_back().unwrap()
+            } else {
+                self.tx_done.pop_front().unwrap()
+            };
+            *done = TxCompletion { id, status };
+        }
+        Ok(n)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct RecordingHarnessConfig {
+    async_mode: bool,
+    supports_encapsulation: bool,
+    defer_completions: bool,
+}
+
+async fn new_recording_harness(
+    driver: &DefaultDriver,
+    config: RecordingHarnessConfig,
+) -> (
+    ManaQueue<TestEmulatedDevice>,
+    ResourceArena,
+    ManaEndpoint<TestEmulatedDevice>,
+    ManaDevice<TestEmulatedDevice>,
+    TxRecord,
+    Arc<Mutex<gdma::GdmaDevice>>,
+    GuestMemory,
+) {
+    let record = TxRecord::default();
+    if !config.defer_completions {
+        record.release_completions();
+    }
+    let mem = DeviceTestMemory::new(512, true, "tx oob test");
+    let guest_memory = mem.guest_memory();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        guest_memory.clone(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(RecordingEndpoint {
+                async_mode: config.async_mode,
+                supports_encapsulation: config.supports_encapsulation,
+                record: record.clone(),
+            }),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let device_inner = device.device().clone();
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let device = ManaDevice::new(driver, device, 1, 1, None).await.unwrap();
+    let vport = device.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+    let mut arena = ResourceArena::new();
+    let (queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    (
+        queue,
+        arena,
+        endpoint,
+        device,
+        record,
+        device_inner,
+        guest_memory,
+    )
+}
+
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the test executor is single-threaded and GdmaDevice::reset does not re-enter the device lock"
+)]
+async fn reset_recording_device(device: &Arc<Mutex<gdma::GdmaDevice>>) {
+    device.lock().reset().await;
+}
+
+fn post_raw_tx_wqe<T: zerocopy::IntoBytes + zerocopy::Immutable + zerocopy::KnownLayout>(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    oob: T,
+) -> u32 {
+    post_raw_tx_wqe_with_len(queue, oob, 512)
+}
+
+fn post_raw_tx_wqe_with_len<
+    T: zerocopy::IntoBytes + zerocopy::Immutable + zerocopy::KnownLayout,
+>(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    oob: T,
+    packet_len: u32,
+) -> u32 {
+    let wqe_offset = queue.tx_wq.get_tail();
+    let sge = gdma_defs::Sge {
+        address: 0,
+        mem_key: queue.mem_key,
+        size: packet_len,
+    };
+    queue.tx_wq.push(oob, [sge]).expect("TX WQ is full");
+    wqe_offset
+}
+
+fn encapsulated_tcp_packet(outer_ipv6: bool, inner_ipv6: bool) -> (Vec<u8>, u16, u16) {
+    let mut packet = vec![0; 12];
+    packet.extend_from_slice(if outer_ipv6 {
+        &[0x86, 0xdd]
+    } else {
+        &[0x08, 0x00]
+    });
+    if outer_ipv6 {
+        let mut outer = [0u8; 40];
+        outer[0] = 0x60;
+        outer[6] = 17;
+        packet.extend_from_slice(&outer);
+    } else {
+        let mut outer = [0u8; 20];
+        outer[0] = 0x45;
+        outer[9] = 17;
+        packet.extend_from_slice(&outer);
+    }
+    packet.extend_from_slice(&[0u8; 16]); // UDP + VXLAN.
+
+    let inner_frame_offset = packet.len() as u16;
+    packet.extend_from_slice(&[0u8; 12]);
+    packet.extend_from_slice(if inner_ipv6 {
+        &[0x86, 0xdd]
+    } else {
+        &[0x08, 0x00]
+    });
+    if inner_ipv6 {
+        let mut inner = [0u8; 40];
+        inner[0] = 0x60;
+        inner[6] = 6;
+        packet.extend_from_slice(&inner);
+    } else {
+        let mut inner = [0u8; 20];
+        inner[0] = 0x45;
+        inner[9] = 6;
+        packet.extend_from_slice(&inner);
+    }
+    let transport_offset = packet.len() as u16;
+    let mut tcp = [0u8; 20];
+    tcp[12] = 5 << 4;
+    packet.extend_from_slice(&tcp);
+    packet.extend_from_slice(&[0u8; 32]);
+    (packet, inner_frame_offset, transport_offset)
+}
+
+fn encapsulated_ipv6_tcp_packet_with_options() -> (Vec<u8>, u16, u16) {
+    let (mut packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    let inner_ip_offset = usize::from(inner_frame_offset) + 14;
+    packet[inner_ip_offset + 6] = 0;
+    packet.splice(
+        usize::from(transport_offset)..usize::from(transport_offset),
+        [6, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let transport_offset = transport_offset + 8;
+    packet[usize::from(transport_offset) + 12] = 6 << 4;
+    packet.splice(
+        usize::from(transport_offset) + 20..usize::from(transport_offset) + 20,
+        [1, 1, 1, 1],
+    );
+    (packet, inner_frame_offset, transport_offset)
+}
+
+fn encapsulated_tcp_oob(
+    outer_ipv6: bool,
+    inner_ipv6: bool,
+    inner_frame_offset: u16,
+    transport_offset: u16,
+) -> gdma_defs::bnic::ManaTxOob {
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+
+    let mut oob = gdma_defs::bnic::ManaTxOob::new_zeroed();
+    oob.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    oob.s_oob.set_is_outer_ipv4(!outer_ipv6);
+    oob.s_oob.set_is_outer_ipv6(outer_ipv6);
+    oob.s_oob.set_comp_tcp_csum(true);
+    oob.s_oob.set_trans_off(transport_offset);
+    oob.l_oob.set_is_encap(true);
+    oob.l_oob.set_inner_is_ipv6(inner_ipv6);
+    oob.l_oob.set_inner_frame_offset(inner_frame_offset);
+    oob.l_oob.set_inner_ip_rel_offset(14);
+    oob
+}
+
+async fn wait_for_tx_completions(
+    queue: &mut ManaQueue<TestEmulatedDevice>,
+    record: &TxRecord,
+    expected_metas: usize,
+    expected_completions: usize,
+) -> Vec<ManaTxCompOob> {
+    let mut completions = Vec::new();
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            loop {
+                while let Some(cqe) = queue.tx_cq.pop() {
+                    completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                if record.poll_count(cx, expected_metas).is_ready()
+                    && completions.len() >= expected_completions
+                {
+                    return Poll::Ready(());
+                }
+                if queue.interrupt.poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        }))
+        .await
+        .expect("timed out waiting for TX completion");
+    completions
+}
+
+async fn verify_tx_completion_suppression(driver: &DefaultDriver, async_mode: bool) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::MANA_CQE_COMPLETION;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            driver,
+            RecordingHarnessConfig {
+                async_mode,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+
+    let suppressed = ManaTxShortOob::new().with_suppress_txcqe_gen(true);
+    post_raw_tx_wqe(&mut queue, suppressed);
+    let completed_offset = post_raw_tx_wqe(&mut queue, ManaTxShortOob::new());
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 2, 1).await;
+    assert_eq!(record.metas().len(), 2);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.client_type(), MANA_CQE_COMPLETION);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        completed_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_completion_suppression_sync_is_cumulative(driver: DefaultDriver) {
+    verify_tx_completion_suppression(&driver, false).await;
+}
+
+#[async_test]
+async fn tx_completion_suppression_async_is_cumulative(driver: DefaultDriver) {
+    verify_tx_completion_suppression(&driver, true).await;
+}
+
+#[async_test]
+async fn tx_suppressed_backend_error_is_reported(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.set_completion_status(TxCompletionStatus::InvalidOffload);
+
+    post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_suppressed_backend_restart_disables_queue(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_GDMA_ERR;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.restart_on_completion();
+
+    let wqe_offset = post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_GDMA_ERR);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        wqe_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_backend_backpressure_does_not_complete_early(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    record.block_submissions();
+
+    let wqe_offset = post_raw_tx_wqe(&mut queue, ManaTxShortOob::new());
+    queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| record.poll_submission_waiting(cx)))
+        .await
+        .expect("timed out waiting for backend backpressure");
+    assert!(record.metas().is_empty());
+    assert!(
+        queue.tx_cq.pop().is_none(),
+        "backpressured TX completed before the backend accepted it"
+    );
+
+    record.release_submissions();
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        wqe_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_local_error_waits_for_prior_async_completion(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+    use gdma_defs::bnic::ManaTxOob;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: true,
+            },
+        )
+        .await;
+
+    post_raw_tx_wqe(
+        &mut queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    let mut invalid = ManaTxOob::new_zeroed();
+    invalid.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    invalid.s_oob.set_suppress_txcqe_gen(true);
+    invalid.s_oob.set_trans_off(60);
+    invalid.l_oob.set_is_encap(true);
+    invalid.l_oob.set_inner_frame_offset(50);
+    invalid.l_oob.set_inner_ip_rel_offset(14);
+    let invalid_offset = post_raw_tx_wqe(&mut queue, invalid);
+    queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if record.poll_count(cx, 1).is_ready() && record.poll_backend_polled(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+        .await
+        .expect("timed out waiting for deferred backend completion");
+    assert!(
+        queue.tx_cq.pop().is_none(),
+        "local error overtook an earlier asynchronous WQE"
+    );
+
+    record.release_completions();
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        invalid_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_async_completions_correlate_across_send_queues(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_OKAY;
+    use gdma_defs::bnic::ManaTxShortOob;
+
+    let (mut first_queue, mut arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: true,
+                supports_encapsulation: true,
+                defer_completions: true,
+            },
+        )
+        .await;
+    record.set_reverse_completions();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(false),
+            rss_enable: None,
+            hash_key: None,
+            default_rxobj: None,
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+    let (mut second_queue, second_resources) =
+        endpoint.new_queue(&tx_config, &mut arena, 1).await.unwrap();
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(second_resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    post_raw_tx_wqe(
+        &mut first_queue,
+        ManaTxShortOob::new().with_suppress_txcqe_gen(true),
+    );
+    let first_boundary = post_raw_tx_wqe(&mut first_queue, ManaTxShortOob::new());
+    let second_boundary = post_raw_tx_wqe(&mut second_queue, ManaTxShortOob::new());
+    first_queue.tx_wq.commit();
+    second_queue.tx_wq.commit();
+
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if record.poll_count(cx, 3).is_ready() && record.poll_backend_polled(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+        .await
+        .expect("timed out waiting for deferred multi-queue completions");
+    assert!(first_queue.tx_cq.pop().is_none());
+    assert!(second_queue.tx_cq.pop().is_none());
+
+    record.release_completions();
+    let mut first_completions = Vec::new();
+    let mut second_completions = Vec::new();
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            loop {
+                while let Some(cqe) = first_queue.tx_cq.pop() {
+                    first_completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                while let Some(cqe) = second_queue.tx_cq.pop() {
+                    second_completions.push(ManaTxCompOob::read_from_prefix(&cqe.data).unwrap().0);
+                }
+                if first_completions.len() == 1 && second_completions.len() == 1 {
+                    return Poll::Ready(());
+                }
+                let first_pending = first_queue.interrupt.poll(cx).is_pending();
+                let second_pending = second_queue.interrupt.poll(cx).is_pending();
+                if first_pending && second_pending {
+                    return Poll::Pending;
+                }
+            }
+        }))
+        .await
+        .expect("timed out waiting for multi-queue TX completions");
+
+    assert_eq!(first_completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        first_completions[0].offsets.tx_wqe_offset(),
+        first_boundary / WQE_ALIGNMENT as u32
+    );
+    assert_eq!(second_completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    assert_eq!(
+        second_completions[0].offsets.tx_wqe_offset(),
+        second_boundary / WQE_ALIGNMENT as u32
+    );
+
+    drop(first_queue);
+    drop(second_queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+async fn verify_inner_tx_geometry(driver: &DefaultDriver, inner_ipv6: bool) {
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let l3_len = if inner_ipv6 { 40 } else { 20 };
+    let outer_ipv6 = !inner_ipv6;
+    let (packet, inner_frame_offset, transport_offset) =
+        encapsulated_tcp_packet(outer_ipv6, inner_ipv6);
+    guest_memory.write_at(0, &packet).unwrap();
+    let oob = encapsulated_tcp_oob(outer_ipv6, inner_ipv6, inner_frame_offset, transport_offset);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    let metas = record.metas();
+    assert_eq!(metas.len(), 1);
+    let meta = &metas[0];
+    assert_eq!(meta.l2_len, (inner_frame_offset + 14) as u8);
+    assert_eq!(meta.l3_len, l3_len);
+    assert_eq!(meta.transport_header_offset, transport_offset);
+    assert_eq!(meta.flags.is_ipv4(), !inner_ipv6);
+    assert_eq!(meta.flags.is_ipv6(), inner_ipv6);
+    assert!(meta.flags.offload_tcp_checksum());
+    let encapsulation = meta.encapsulation.expect("encapsulation metadata");
+    assert_eq!(encapsulation.outer_is_ipv4, !outer_ipv6);
+    assert_eq!(encapsulation.outer_is_ipv6, outer_ipv6);
+    assert_eq!(encapsulation.inner_frame_offset, inner_frame_offset);
+    assert_eq!(encapsulation.inner_ip_rel_offset, 14);
+    assert!(!encapsulation.inner_tcp_options);
+    assert_eq!(completions.len(), 1);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_encapsulation_uses_inner_header_geometry(driver: DefaultDriver) {
+    verify_inner_tx_geometry(&driver, false).await;
+    verify_inner_tx_geometry(&driver, true).await;
+}
+
+#[async_test]
+async fn tx_encapsulation_accepts_ipv6_extensions_and_tcp_options(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_OKAY;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) =
+        encapsulated_ipv6_tcp_packet_with_options();
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    oob.l_oob.set_inner_tcp_opt(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 1, 1).await;
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_OKAY);
+    let metas = record.metas();
+    let meta = &metas[0];
+    assert_eq!(meta.l2_len, (inner_frame_offset + 14) as u8);
+    assert_eq!(meta.l3_len, 48);
+    assert_eq!(meta.transport_header_offset, transport_offset);
+    assert!(
+        meta.encapsulation
+            .expect("missing encapsulation metadata")
+            .inner_tcp_options
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn mana_endpoint_encapsulation_round_trips(driver: DefaultDriver) {
+    use net_backend::TxEncapsulationMetadata;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    guest_memory.write_at(0, &packet).unwrap();
+
+    let mut meta = net_backend::TxMetadata {
+        id: TxId(77),
+        segment_count: 1,
+        len: packet.len() as u32,
+        l2_len: (inner_frame_offset + 14).try_into().unwrap(),
+        l3_len: 40,
+        transport_header_offset: transport_offset,
+        encapsulation: Some(TxEncapsulationMetadata {
+            outer_is_ipv4: true,
+            outer_is_ipv6: false,
+            inner_frame_offset,
+            inner_ip_rel_offset: 14,
+            inner_tcp_options: false,
+        }),
+        ..Default::default()
+    };
+    meta.flags.set_is_ipv6(true);
+    meta.flags.set_offload_tcp_checksum(true);
+    let segment = TxSegment {
+        ty: net_backend::TxSegmentType::Head(meta.clone()),
+        gpa: 0,
+        len: packet.len() as u32,
+    };
+    let mut pool = net_backend::tests::Bufs::new(guest_memory);
+
+    assert_eq!(queue.tx_avail(&mut pool, &[segment]).unwrap(), (false, 1));
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| record.poll_count(cx, 1)))
+        .await
+        .expect("timed out waiting for MANA transmit");
+
+    let submitted = record.metas();
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0].encapsulation, meta.encapsulation);
+    assert_eq!(submitted[0].l2_len, meta.l2_len);
+    assert_eq!(submitted[0].l3_len, meta.l3_len);
+    assert_eq!(submitted[0].l4_len, meta.l4_len);
+    assert_eq!(
+        submitted[0].transport_header_offset,
+        meta.transport_header_offset
+    );
+    assert!(submitted[0].flags.is_ipv6());
+    assert!(submitted[0].flags.offload_tcp_checksum());
+
+    let mut completion = [TxCompletion {
+        id: TxId(0),
+        status: TxCompletionStatus::Failed,
+    }];
+    let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+    context
+        .until_cancelled(poll_fn(|cx| {
+            if queue.poll_ready(cx, &mut pool).is_pending() {
+                return Poll::Pending;
+            }
+            match queue.tx_poll_with_status(&mut pool, &mut completion) {
+                Ok(0) => Poll::Pending,
+                result => Poll::Ready(result),
+            }
+        }))
+        .await
+        .expect("timed out waiting for MANA completion")
+        .unwrap();
+    assert_eq!(completion[0].id.0, 77);
+    assert_eq!(completion[0].status, TxCompletionStatus::Success);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_encapsulation_rejects_unsupported_backend(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: false,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    oob.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 1).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_encapsulation_packet_returns_error(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, false);
+    guest_memory.write_at(0, &packet).unwrap();
+
+    let mut version_mismatch =
+        encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset);
+    version_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, version_mismatch, packet.len() as u32);
+
+    let mut protocol_mismatch =
+        encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    protocol_mismatch.s_oob.set_comp_tcp_csum(false);
+    protocol_mismatch.s_oob.set_comp_udp_csum(true);
+    protocol_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, protocol_mismatch, packet.len() as u32);
+
+    let mut truncated = encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    truncated.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, truncated, u32::from(transport_offset) + 10);
+
+    let mut tcp_options_mismatch =
+        encapsulated_tcp_oob(false, false, inner_frame_offset, transport_offset);
+    tcp_options_mismatch.s_oob.set_suppress_txcqe_gen(true);
+    tcp_options_mismatch.l_oob.set_inner_tcp_opt(true);
+    post_raw_tx_wqe_with_len(&mut queue, tcp_options_mismatch, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 4).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions.len(), 4);
+    for completion in completions {
+        assert_eq!(completion.cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    }
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_ipv6_extension_chain_returns_error(driver: DefaultDriver) {
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+    let (mut packet, inner_frame_offset, transport_offset) = encapsulated_tcp_packet(false, true);
+    let inner_ip_offset = usize::from(inner_frame_offset) + 14;
+    packet[inner_ip_offset + 6] = 0;
+    guest_memory.write_at(0, &packet).unwrap();
+    let mut oob = encapsulated_tcp_oob(false, true, inner_frame_offset, transport_offset + 4);
+    oob.s_oob.set_suppress_txcqe_gen(true);
+    post_raw_tx_wqe_with_len(&mut queue, oob, packet.len() as u32);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 1).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions[0].cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+#[async_test]
+async fn tx_invalid_encapsulation_geometry_returns_error(driver: DefaultDriver) {
+    use gdma_defs::WQE_ALIGNMENT;
+    use gdma_defs::bnic::CQE_TX_INVALID_OOB;
+    use gdma_defs::bnic::MANA_LONG_PKT_FMT;
+    use gdma_defs::bnic::ManaTxOob;
+
+    let (mut queue, arena, mut endpoint, device, record, device_inner, _guest_memory) =
+        new_recording_harness(
+            &driver,
+            RecordingHarnessConfig {
+                async_mode: false,
+                supports_encapsulation: true,
+                defer_completions: false,
+            },
+        )
+        .await;
+
+    let mut oversized = ManaTxOob::new_zeroed();
+    oversized.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    oversized.s_oob.set_comp_tcp_csum(true);
+    oversized.s_oob.set_suppress_txcqe_gen(true);
+    oversized.s_oob.set_trans_off(284);
+    oversized.l_oob.set_is_encap(true);
+    oversized.l_oob.set_inner_frame_offset(250);
+    oversized.l_oob.set_inner_ip_rel_offset(14);
+    let oversized_offset = post_raw_tx_wqe(&mut queue, oversized);
+
+    let mut reversed = ManaTxOob::new_zeroed();
+    reversed.s_oob.set_pkt_fmt(MANA_LONG_PKT_FMT);
+    reversed.s_oob.set_comp_tcp_csum(true);
+    reversed.s_oob.set_suppress_txcqe_gen(true);
+    reversed.s_oob.set_trans_off(60);
+    reversed.l_oob.set_is_encap(true);
+    reversed.l_oob.set_inner_frame_offset(50);
+    reversed.l_oob.set_inner_ip_rel_offset(14);
+    let reversed_offset = post_raw_tx_wqe(&mut queue, reversed);
+    queue.tx_wq.commit();
+
+    let completions = wait_for_tx_completions(&mut queue, &record, 0, 2).await;
+    assert!(record.metas().is_empty());
+    assert_eq!(completions.len(), 2);
+    for completion in &completions {
+        assert_eq!(completion.cqe_hdr.cqe_type(), CQE_TX_INVALID_OOB);
+    }
+    assert_eq!(
+        completions[0].offsets.tx_wqe_offset(),
+        oversized_offset / WQE_ALIGNMENT as u32
+    );
+    assert_eq!(
+        completions[1].offsets.tx_wqe_offset(),
+        reversed_offset / WQE_ALIGNMENT as u32
+    );
+
+    drop(queue);
+    endpoint.stop().await;
+    endpoint.vport.destroy(arena).await;
+    drop(endpoint);
+    reset_recording_device(&device_inner).await;
+    drop(device);
+}
+
+/// Backend state for [`FenceOrderEndpoint`]. Receive completions are injected
+/// by the test (via `staged`) rather than produced from transmitted frames, and
+/// -- unlike a loopback backend -- staging does NOT wake the device's receive
+/// task. That leaves staged receives "ready but unposted" until something else
+/// wakes the task, which is exactly the window a fence must not jump.
+#[derive(Default)]
+struct FenceOrderState {
+    /// Receive buffers the device has handed to the backend.
+    buffers: VecDeque<RxId>,
+    /// Number of identical packets staged to complete on the next poll.
+    staged: usize,
+    /// Bytes written into each completed receive buffer.
+    packet: Vec<u8>,
+    /// Waker registered by the device's receive task. The test never fires it,
+    /// so staging is silent.
+    waker: Option<Waker>,
+}
+
+/// A test backend whose receive completions are staged out-of-band by the test
+/// without waking the device's receive task, used to prove the fence is posted
+/// after in-flight receives.
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct FenceOrderEndpoint {
+    state: Arc<Mutex<FenceOrderState>>,
+}
+
+#[async_trait]
+impl Endpoint for FenceOrderEndpoint {
+    fn endpoint_type(&self) -> &'static str {
+        "fence-order-test"
+    }
+
+    async fn get_queues(
+        &mut self,
+        config: Vec<QueueConfig>,
+        _rss: Option<&RssConfig<'_>>,
+        queues: &mut Vec<Box<dyn Queue>>,
+    ) -> anyhow::Result<()> {
+        for _ in 0..config.len() {
+            queues.push(Box::new(FenceOrderQueue {
+                state: self.state.clone(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {}
+
+    fn is_ordered(&self) -> bool {
+        true
+    }
+
+    fn multiqueue_support(&self) -> MultiQueueSupport {
+        MultiQueueSupport {
+            max_queues: 1,
+            indirection_table_size: 128,
+        }
+    }
+}
+
+#[derive(InspectMut)]
+#[inspect(skip)]
+struct FenceOrderQueue {
+    state: Arc<Mutex<FenceOrderState>>,
+}
+
+impl Queue for FenceOrderQueue {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
+        let mut state = self.state.lock();
+        if state.staged > 0 && !state.buffers.is_empty() {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        self.state.lock().buffers.extend(done.iter().copied());
+    }
+
+    fn rx_poll(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
+        let mut state = self.state.lock();
+        let mut n = 0;
+        while n < packets.len() && state.staged > 0 && !state.buffers.is_empty() {
+            let rx_id = state.buffers.pop_front().unwrap();
+            let data = state.packet.clone();
+            pool.write_packet(
+                rx_id,
+                &net_backend::RxMetadata {
+                    offset: 0,
+                    len: data.len(),
+                    ..Default::default()
+                },
+                &data,
+            );
+            state.staged -= 1;
+            packets[n] = rx_id;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        segments: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
+        let sent = segments
+            .iter()
+            .filter(|s| matches!(s.ty, net_backend::TxSegmentType::Head(_)))
+            .count();
+        Ok((true, sent))
+    }
+
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _done: &mut [TxId],
+    ) -> Result<usize, net_backend::TxError> {
+        Ok(0)
+    }
+}
+
+/// The fence is a drain barrier: a `CQE_RX_OBJECT_FENCE` must be posted strictly
+/// after every receive completion the device has already produced for the
+/// queue. This stages four receives that are ready in the backend but not yet
+/// posted (and that do NOT wake the receive task), fences the queue, and asserts
+/// that by the time net_mana observes the fence it has already delivered all
+/// four packets. If the device posts the fence inline (the pre-barrier
+/// behavior) the receive task is never woken to drain the staged receives, so
+/// the fence is observed with zero packets delivered -- a true regression guard.
+#[async_test]
+async fn rx_fence_orders_after_inflight_receives(driver: DefaultDriver) {
+    const NUM_PACKETS: usize = 4;
+    const PACKET_LEN: usize = 64;
+
+    let state = Arc::new(Mutex::new(FenceOrderState {
+        packet: vec![0xAB; PACKET_LEN],
+        ..Default::default()
+    }));
+
+    let pages = 256;
+    let mem = DeviceTestMemory::new(pages * 2, true, "rx_fence_order");
+    let payload_mem = mem.payload_mem();
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(FenceOrderEndpoint {
+                state: state.clone(),
+            }),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        bm_hostmode: 0,
+        reserved: 0,
+        max_num_eqs: 64,
+        adapter_mtu: 0,
+        reserved2: 0,
+        adapter_link_speed_mbps: 0,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 1, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+    let tx_config = endpoint.vport.config_tx().await.unwrap();
+
+    let mut arena = ResourceArena::new();
+    let (mut queue, resources) = endpoint.new_queue(&tx_config, &mut arena, 0).await.unwrap();
+
+    endpoint
+        .vport
+        .config_rx(&RxConfig {
+            rx_enable: Some(true),
+            rss_enable: Some(false),
+            hash_key: None,
+            default_rxobj: Some(resources.rxq.wq_obj()),
+            indirection_table: None,
+            cqe_coalescing: false,
+        })
+        .await
+        .unwrap();
+
+    let mut pool = net_backend::tests::Bufs::new(payload_mem.clone());
+
+    // Post receive buffers and let the device's receive task drain them into the
+    // backend, so the backend can complete staged packets and the task is parked
+    // (poll_ready Pending) before we stage anything.
+    queue.rx_avail(&mut pool, &(1..=16u32).map(RxId).collect::<Vec<_>>());
+    let mut handed = 0;
+    for _ in 0..40 {
+        handed = state.lock().buffers.len();
+        if handed >= NUM_PACKETS {
+            break;
+        }
+        run_executor_for(25).await;
+    }
+    assert!(
+        handed >= NUM_PACKETS,
+        "device must hand at least {NUM_PACKETS} receive buffers to the backend (got {handed})"
+    );
+
+    // Stage the receives WITHOUT waking the receive task: they are now ready in
+    // the backend but unposted, the precise window the fence must not overtake.
+    state.lock().staged = NUM_PACKETS;
+
+    // Fence the queue. With the drain barrier the fence is routed through the
+    // receive task, which drains the staged receives before posting the fence.
+    endpoint
+        .vport
+        .fence_rq(resources.rxq.wq_obj())
+        .await
+        .unwrap();
+
+    // Drive the queue until the fence is observed, counting delivered packets.
+    let mut rx_ids = [RxId(0); NUM_PACKETS + 4];
+    let mut rx_n = 0;
+    loop {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        if context
+            .until_cancelled(poll_fn(|cx| queue.poll_ready(cx, &mut pool)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        rx_n += queue.rx_poll(&mut pool, &mut rx_ids[rx_n..]).unwrap();
+        if queue.stats.rx_fence.get() >= 1 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        queue.stats.rx_fence.get(),
+        1,
+        "the fence must be observed exactly once"
+    );
+    assert_eq!(
+        rx_n, NUM_PACKETS,
+        "every staged receive must be delivered before the fence is observed"
+    );
+    assert_eq!(
+        queue.stats.rx_packets.get(),
+        NUM_PACKETS as u64,
+        "all staged packets must be counted as received"
+    );
+    assert_eq!(
+        queue.stats.rx_errors.get(),
+        0,
+        "the fence path must not record a receive error"
+    );
+
+    drop(queue);
+    endpoint.vport.destroy(arena).await;
+    endpoint.stop().await;
 }

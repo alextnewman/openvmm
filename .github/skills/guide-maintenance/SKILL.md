@@ -140,4 +140,14 @@ Each row in the mapping table follows:
 - Code paths use repo-root-relative paths with trailing `/` for directories
 - Guide paths are relative to `Guide/src/`
 - Multiple Guide pages for one code path: comma-separated
+
+## MANA code owners
+
+| Code path | Guide page |
+|---|---|
+| `vm/devices/net/gdma/` | `reference/emulated/networking/mana.md` |
+| `vm/devices/net/gdma_contract/` | `reference/emulated/networking/mana.md` |
+| `vm/devices/net/gdma_resources/` | `reference/emulated/networking/mana.md` |
+
+Changes to the MANA examiner's rules, observation scope, evidence retention, or activation surface must reconcile the MANA page. CLI changes also update `reference/openvmm/management/cli.md`.
 - Use glob-style `*` in code paths for crate families (e.g., `nvme*/`)

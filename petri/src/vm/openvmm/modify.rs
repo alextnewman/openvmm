@@ -98,6 +98,8 @@ impl PetriVmConfigOpenVmm {
                 vtl: DeviceVtl::Vtl2,
                 instance_id: MANA_INSTANCE,
                 resource: GdmaDeviceHandle {
+                    protocol_monitor: false,
+                    pf_caps: false,
                     vports: vec![VportDefinition {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,
@@ -142,6 +144,8 @@ impl PetriVmConfigOpenVmm {
         self.config.pcie_devices.push(PcieDeviceConfig {
             port_name: port_name.to_string(),
             resource: GdmaDeviceHandle {
+                protocol_monitor: false,
+                pf_caps: false,
                 vports: vec![VportDefinition {
                     mac_address,
                     endpoint,
@@ -283,6 +287,8 @@ impl PetriVmConfigOpenVmm {
                 vtl: DeviceVtl::Vtl2,
                 instance_id: MANA_INSTANCE,
                 resource: GdmaDeviceHandle {
+                    protocol_monitor: false,
+                    pf_caps: false,
                     vports: vec![VportDefinition {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,

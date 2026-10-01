@@ -73,6 +73,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaDeviceHandle> for GdmaDeviceR
             vports,
             input.register_mmio,
             BnicConfig {
+                protocol_monitor: resource.protocol_monitor,
                 bm_hostmode,
                 pf_caps,
                 ..Default::default()

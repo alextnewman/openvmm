@@ -7,6 +7,7 @@
 mod bnic;
 mod dma;
 mod hwc;
+mod protocol;
 mod queues;
 pub mod resolver;
 mod rss;
@@ -21,6 +22,8 @@ use device_emulators::ReadWriteRequestType;
 use device_emulators::read_as_u32_chunks;
 use device_emulators::write_as_u32_chunks;
 use futures::FutureExt;
+use gdma_contract::Event;
+use gdma_contract::MmioSpace;
 use gdma_defs::CqEqDoorbellValue;
 use gdma_defs::DB_CQ;
 use gdma_defs::DB_EQ;
@@ -383,6 +386,7 @@ impl InspectMut for GdmaDevice {
             .field("bm_hostmode", self.pf_regs.is_some())
             .field("pf_caps", self.pf_cap_regs.is_some())
             .field("config", &self.config)
+            .field("protocol", &self.queues.protocol)
             .field("queues", &self.queues)
             .merge(&mut self.hwc);
     }
@@ -548,7 +552,8 @@ impl GdmaDevice {
             reserved5: 0,
         };
 
-        let queues = Arc::new(Queues::new(gm, driver_source.simple(), &msix));
+        let protocol = protocol::ProtocolObserver::new(bnic_config.protocol_monitor, 64);
+        let queues = Arc::new(Queues::new(gm, driver_source.simple(), &msix, protocol));
         let pf_cap_regs = pf_caps.then(|| build_pf_cap_regs(&queues));
 
         Self {
@@ -575,6 +580,11 @@ impl GdmaDevice {
         data.copy_from_slice(&self.regmap.as_bytes()[offset..offset + data.len()]);
     }
 
+    /// Returns the passive examiner's evidence, or `None` when it is disabled.
+    pub fn protocol_report(&self) -> Option<gdma_contract::Report> {
+        self.queues.protocol.report()
+    }
+
     fn read_shmem(&mut self, offset: usize, data: &mut [u8]) {
         // If there is a pending DESTROY_HWC request, then poll whether the HWC
         // task has stopped.
@@ -598,7 +608,8 @@ impl GdmaDevice {
             // asynchronous DESTROY_HWC instead of racing ahead and reading the
             // bare request header as if it were the response.
             let hdr = SmcProtoHdr::from(self.shmem.0[SHMEM_LEN / 4 - 1]).with_owner_is_pf(true);
-            self.shmem.0[SHMEM_LEN / 4 - 1] = hdr.into();
+            let header: u32 = hdr.into();
+            self.shmem.0[SHMEM_LEN / 4 - 1] = header;
             let status = match self.handle_smc() {
                 Ok(true) => 0,
                 Ok(false) => return,
@@ -616,7 +627,9 @@ impl GdmaDevice {
             .with_status(status)
             .with_is_response(true)
             .with_owner_is_pf(false);
-        self.shmem.0[SHMEM_LEN / 4 - 1] = hdr.into();
+        let header: u32 = hdr.into();
+        self.shmem.0[SHMEM_LEN / 4 - 1] = header;
+        self.queues.protocol.observe(Event::SmcResponse(header));
     }
 
     /// Returns Ok(false) if the operation should remain pending.
@@ -774,6 +787,19 @@ impl GdmaDevice {
 
     fn write_reg(&mut self, offset: usize, data: &[u8]) {
         let range = offset..offset + data.len();
+        if self.shmem_region.contains(&offset) {
+            self.queues.protocol.observe(Event::MmioWrite {
+                space: MmioSpace::SharedMemory,
+                offset: (offset - self.shmem_region.start) as u64,
+                data,
+            });
+        } else if DOORBELLS.contains(&offset) {
+            self.queues.protocol.observe(Event::MmioWrite {
+                space: MmioSpace::Doorbell,
+                offset: (offset - DOORBELLS.start) as u64,
+                data,
+            });
+        }
         if self.shmem_region.contains_range(&range) {
             let base = self.shmem_region.start;
             self.write_shmem(offset - base, data);

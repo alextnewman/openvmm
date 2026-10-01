@@ -30,6 +30,7 @@ safe_intrinsics.workspace = true
 async-trait.workspace = true
 chipset_device.workspace = true
 gdma.workspace = true
+gdma_contract.workspace = true
 net_backend.workspace = true
 pci_core.workspace = true
 test_with_tracing.workspace = true

@@ -108,6 +108,7 @@
       - [framebuffer]()
       - [input]()
   - [Emulated]()
+    - [MANA / GDMA](./reference/emulated/networking/mana.md)
     - [vTPM]()
     - [NVMe]()
       - [Overview](./reference/emulated/NVMe/overview.md)

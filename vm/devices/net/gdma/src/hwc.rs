@@ -306,6 +306,7 @@ impl HwControl {
             }
 
             let read = sqe.access(&queues.gm);
+            queues.protocol.request(&queues.gm, self.sq_id, self.rq_id);
             let hdr: GdmaReqHdr = read
                 .clone()
                 .read_plain()
@@ -405,6 +406,11 @@ impl HwControl {
             header_write
                 .write(resp.as_bytes())
                 .context("writing response message header")?;
+            queues.protocol.response(
+                &queues.gm,
+                self.rq_id,
+                (size_of_val(&resp) + response_len) as u64,
+            );
 
             let rx_oob = HwcRxOob {
                 wqe_addr_low_or_offset: rqe_offset,

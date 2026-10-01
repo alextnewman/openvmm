@@ -2717,6 +2717,7 @@ dependencies = [
  "chipset_device",
  "device_emulators",
  "futures",
+ "gdma_contract",
  "gdma_defs",
  "gdma_resources",
  "guestmem",
@@ -2729,12 +2730,20 @@ dependencies = [
  "pci_resources",
  "slab",
  "task_control",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
  "vm_resource",
  "vmcore",
  "zerocopy",
+]
+
+[[package]]
+name = "gdma_contract"
+version = "0.0.0"
+dependencies = [
+ "test_with_tracing",
 ]
 
 [[package]]
@@ -4267,6 +4276,7 @@ dependencies = [
  "chipset_device",
  "futures",
  "gdma",
+ "gdma_contract",
  "gdma_defs",
  "getrandom 0.4.2",
  "inspect",

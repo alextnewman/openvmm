@@ -15,6 +15,8 @@ use vm_resource::kind::PciDeviceHandleKind;
 /// A resource handle to a GDMA device.
 #[derive(MeshPayload)]
 pub struct GdmaDeviceHandle {
+    /// Enable passive protocol findings and per-rule observation coverage.
+    pub protocol_monitor: bool,
     /// The vports to instantiate on the NIC.
     pub vports: Vec<VportDefinition>,
     /// Present the device as a bare-metal physical function (PCI id

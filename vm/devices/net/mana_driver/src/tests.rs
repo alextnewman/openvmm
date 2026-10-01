@@ -95,7 +95,7 @@ use zerocopy::KnownLayout;
 async fn test_gdma(driver: DefaultDriver) {
     let mem = DeviceTestMemory::new(128, false, "test_gdma");
     let msi_conn = MsiConnection::new(AssignedBusRange::new(), 0);
-    let device = gdma::GdmaDevice::new(
+    let device = gdma::GdmaDevice::new_with_config(
         &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
         mem.guest_memory(),
         msi_conn.target(),
@@ -104,9 +104,14 @@ async fn test_gdma(driver: DefaultDriver) {
             endpoint: Box::new(NullEndpoint::new()),
         }],
         &mut ExternallyManagedMmioIntercepts,
+        gdma::BnicConfig {
+            protocol_monitor: true,
+            ..Default::default()
+        },
     );
     let dma_client = mem.dma_client();
     let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let examined_device = device.device().clone();
     let dma_client = device.dma_client();
     let buffer = dma_client.allocate_dma_buffer(6 * PAGE_SIZE).unwrap();
 
@@ -235,6 +240,64 @@ async fn test_gdma(driver: DefaultDriver) {
     .await
     .unwrap();
     arena.destroy(&mut gdma).await;
+
+    let mut arena = ResourceArena::new();
+    let refused_region = gdma
+        .create_dma_region(&mut arena, dev_id, buffer.subblock(0, PAGE_SIZE))
+        .await
+        .unwrap();
+    let refused: anyhow::Result<gdma_defs::GdmaCreateQueueResp> = gdma
+        .request(
+            GdmaRequestType::GDMA_CREATE_QUEUE.0,
+            dev_id,
+            gdma_defs::GdmaCreateQueueReq {
+                queue_type: GdmaQueueType::GDMA_EQ,
+                gdma_region: refused_region,
+                queue_size: PAGE_SIZE as u32,
+                eq_pci_msix_index: u32::MAX,
+                ..FromZeros::new_zeroed()
+            },
+        )
+        .await;
+    assert!(refused.is_err(), "unaddressable MSI-X target was admitted");
+    let refused: anyhow::Result<()> = gdma
+        .request(
+            GdmaRequestType::GDMA_CHANGE_MSIX_FOR_EQ.0,
+            dev_id,
+            gdma_defs::GdmaChangeMsixVectorIndexForEq {
+                queue_index: eq_id,
+                msix: u32::MAX,
+                ..FromZeros::new_zeroed()
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "unaddressable MSI-X re-route was admitted"
+    );
+    arena.destroy(&mut gdma).await;
+
+    let report = examined_device.lock().protocol_report().unwrap();
+    assert!(
+        report
+            .statistics
+            .iter()
+            .all(|stat| stat.guest_violations == 0 && stat.device_violations == 0),
+        "valid requester was accused: {:?}",
+        report.findings
+    );
+    for rule in [
+        gdma_contract::Rule::HwcInitialization,
+        gdma_contract::Rule::ResponseCorrelation,
+        gdma_contract::Rule::ResourceOwnership,
+        gdma_contract::Rule::WorkConsumption,
+    ] {
+        assert!(
+            report.statistics[rule as usize].satisfied != 0,
+            "unexercised rule {}",
+            rule.id()
+        );
+    }
 
     // Guest-provided queue IDs below the GDMA allocation range are invalid,
     // not indices into the queue arrays.

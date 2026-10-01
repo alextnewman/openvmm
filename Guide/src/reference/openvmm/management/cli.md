@@ -138,6 +138,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
   pidfile path will overwrite each other. Not written for short-lived utility
   modes such as `--write-saved-state-proto`.
 * `--nic`: Exposes a NIC using the Consomme user-mode NAT.
+* `--mana-protocol-monitor`: Enables passive examination of guest-driver
+  wire actions on explicitly configured `--mana` devices. Disabled by
+  default; it does not change command admission. Findings and per-rule
+  observation coverage appear in the device's inspector node. See
+  [MANA / GDMA protocol examination](../../emulated/networking/mana.md).
 * `--gfx`: Enable a graphical console over VNC (see below)
 * `--vnc-port <PORT>`: VNC server port (default: 5900)
 * `--vnc-listen <ADDRESS>`: VNC server bind address (default: `127.0.0.1`).

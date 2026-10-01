@@ -671,6 +671,7 @@ async fn vm_config_from_command_line(
                 (
                     vpci_instance_id,
                     GdmaDeviceHandle {
+                        protocol_monitor: false,
                         vports: Vec::new(),
                         bm_hostmode: false,
                         pf_caps: false,
@@ -773,6 +774,7 @@ async fn vm_config_from_command_line(
                         (
                             Guid::new_random(),
                             GdmaDeviceHandle {
+                                protocol_monitor: opt.mana_protocol_monitor,
                                 vports: Vec::new(),
                                 bm_hostmode: opt.mana_bm_hostmode,
                                 pf_caps: opt.mana_pf_caps,
@@ -786,6 +788,7 @@ async fn vm_config_from_command_line(
                 &mut pcie_mana_nics
                     .entry(pcie_port)
                     .or_insert(GdmaDeviceHandle {
+                        protocol_monitor: opt.mana_protocol_monitor,
                         vports: Vec::new(),
                         bm_hostmode: opt.mana_bm_hostmode,
                         pf_caps: opt.mana_pf_caps,

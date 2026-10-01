@@ -331,6 +331,8 @@ impl BufferAccess for GuestBuffers {
 /// Configuration for the emulated BNIC device.
 #[derive(Default)]
 pub struct BnicConfig {
+    /// Enable the passive, independently implemented GDMA protocol examiner.
+    pub protocol_monitor: bool,
     /// Adapter link speed in megabits per second.
     pub adapter_link_speed_mbps: u32,
     /// Present the device as a bare-metal physical function: report

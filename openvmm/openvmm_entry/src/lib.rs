@@ -32,6 +32,7 @@ use cli_args::DiskCliKind;
 use cli_args::EfiDiagnosticsLogLevelCli;
 use cli_args::EndpointConfigCli;
 use cli_args::IgvmPersonalityCli;
+use cli_args::KernelFormatCli;
 use cli_args::NicConfigCli;
 use cli_args::ProvisionVmgs;
 use cli_args::SerialConfigCli;
@@ -107,7 +108,6 @@ use sparse_mmap::alloc_shared_memory;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::io;
 #[cfg(unix)]
 use std::io::IsTerminal;
@@ -415,6 +415,54 @@ async fn vm_config_from_command_line(
         opt.com4.as_ref().is_some_and(|c| c.debugger_mode),
     ];
 
+    let serial_mmio_base_aliases = [
+        opt.com1.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com2.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com3.as_ref().and_then(|config| config.mmio_base_alias),
+        opt.com4.as_ref().and_then(|config| config.mmio_base_alias),
+    ];
+
+    #[cfg(not(guest_arch = "aarch64"))]
+    anyhow::ensure!(
+        serial_mmio_base_aliases.iter().all(Option::is_none),
+        "`mmio_base_alias` is only supported for AArch64 PL011 serial devices"
+    );
+
+    #[cfg(guest_arch = "aarch64")]
+    {
+        anyhow::ensure!(
+            serial_mmio_base_aliases[2..].iter().all(Option::is_none),
+            "`mmio_base_alias` is only supported on com1 and com2"
+        );
+        anyhow::ensure!(
+            serial_mmio_base_aliases.iter().all(Option::is_none)
+                || (uefi.is_none() && !opt.pcat && opt.igvm.is_none()),
+            "`mmio_base_alias` is only supported with direct boot"
+        );
+
+        let serial_options = [opt.com1.as_ref(), opt.com2.as_ref()];
+        let mut used_bases = Vec::new();
+        for (port_index, alias) in serial_mmio_base_aliases[..2].iter().copied().enumerate() {
+            let Some(base) = alias else {
+                continue;
+            };
+            anyhow::ensure!(
+                serial_options[port_index]
+                    .is_some_and(|config| !matches!(&config.backend, SerialConfigCli::None)),
+                "cannot add an MMIO alias for a disabled serial port"
+            );
+            anyhow::ensure!(
+                base.checked_add(0x1000).is_some_and(|end| end <= 1 << 30),
+                "serial MMIO aliases must fit below the 1 GiB direct-boot RAM base"
+            );
+            anyhow::ensure!(
+                !used_bases.contains(&base),
+                "serial MMIO alias {base:#x} was specified more than once"
+            );
+            used_bases.push(base);
+        }
+    }
+
     let serial0_cfg = setup_serial(
         "com1",
         opt.com1
@@ -596,6 +644,7 @@ async fn vm_config_from_command_line(
         underhill,
         ref pcie_port,
         ref serial,
+        mmio,
         ref controller,
         nsid,
         lun,
@@ -604,6 +653,9 @@ async fn vm_config_from_command_line(
     {
         if serial.is_some() {
             anyhow::bail!("`serial` is only supported by `--virtio-blk`");
+        }
+        if mmio.is_some() {
+            anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
         }
         if controller.is_none() && underhill.is_none() && relay.is_none() {
             tracing::warn!(
@@ -704,6 +756,7 @@ async fn vm_config_from_command_line(
         underhill,
         ref pcie_port,
         ref serial,
+        mmio,
         controller: _,
         nsid: _,
         lun: _,
@@ -712,6 +765,9 @@ async fn vm_config_from_command_line(
     {
         if serial.is_some() {
             anyhow::bail!("`serial` is only supported by `--virtio-blk`");
+        }
+        if mmio.is_some() {
+            anyhow::bail!("`mmio_base` and `mmio_gsiv` are only valid with --virtio-blk");
         }
         let target = if let Some(port) = pcie_port {
             storage_builder::DiskLocation::Named {
@@ -735,6 +791,7 @@ async fn vm_config_from_command_line(
         ref underhill,
         ref pcie_port,
         ref serial,
+        mmio,
         controller: _,
         nsid: _,
         lun: _,
@@ -752,6 +809,7 @@ async fn vm_config_from_command_line(
                 storage_builder::DiskLocation::VirtioBlk {
                     pcie_port: pcie_port.clone(),
                     serial: serial.clone(),
+                    mmio: mmio.map(Into::into),
                 },
                 kind,
                 is_dvd,
@@ -779,8 +837,8 @@ async fn vm_config_from_command_line(
 
     let mut nic_index = 0;
     for cli_cfg in &opt.net {
-        if cli_cfg.pcie_port.is_some() {
-            anyhow::bail!("`--net` does not support PCIe");
+        if cli_cfg.pcie_port.is_some() || cli_cfg.mmio.is_some() {
+            anyhow::bail!("`--net` does not support PCIe or fixed virtio-MMIO placement");
         }
         let vport = parse_endpoint(cli_cfg, &mut nic_index, &mut resources)?;
         if cli_cfg.underhill {
@@ -794,7 +852,16 @@ async fn vm_config_from_command_line(
                     subordinate_instance_id: None,
                     max_sub_channels: None,
                 });
-                (vpci_instance_id, GdmaDeviceHandle { vports: Vec::new() })
+                (
+                    vpci_instance_id,
+                    GdmaDeviceHandle {
+                        protocol_monitor: false,
+                        conformance_scenario: None,
+                        vports: Vec::new(),
+                        bm_hostmode: false,
+                        pf_caps: false,
+                    },
+                )
             });
             mana.1.vports.push(VportDefinition {
                 mac_address: vport.mac_address,
@@ -816,6 +883,7 @@ async fn vm_config_from_command_line(
                 max_queues: None,
                 underhill: false,
                 pcie_port: None,
+                mmio: None,
             },
             &mut nic_index,
             &mut resources,
@@ -884,12 +952,24 @@ async fn vm_config_from_command_line(
     }
 
     for vport in &opt.mana {
+        if vport.mmio.is_some() {
+            anyhow::bail!("`--mana` does not support fixed virtio-MMIO placement");
+        }
         let vport = parse_endpoint(vport, &mut nic_index, &mut resources)?;
         let vport_array = match (vport.vtl as usize, vport.pcie_port) {
             (vtl, None) => {
                 &mut vpci_mana_nics[vtl]
                     .get_or_insert_with(|| {
-                        (Guid::new_random(), GdmaDeviceHandle { vports: Vec::new() })
+                        (
+                            Guid::new_random(),
+                            GdmaDeviceHandle {
+                                protocol_monitor: opt.mana_protocol_monitor,
+                                conformance_scenario: opt.mana_conformance_scenario,
+                                vports: Vec::new(),
+                                bm_hostmode: opt.mana_bm_hostmode,
+                                pf_caps: opt.mana_pf_caps,
+                            },
+                        )
                     })
                     .1
                     .vports
@@ -897,7 +977,13 @@ async fn vm_config_from_command_line(
             (0, Some(pcie_port)) => {
                 &mut pcie_mana_nics
                     .entry(pcie_port)
-                    .or_insert(GdmaDeviceHandle { vports: Vec::new() })
+                    .or_insert(GdmaDeviceHandle {
+                        protocol_monitor: opt.mana_protocol_monitor,
+                        conformance_scenario: opt.mana_conformance_scenario,
+                        vports: Vec::new(),
+                        bm_hostmode: opt.mana_bm_hostmode,
+                        pf_caps: opt.mana_pf_caps,
+                    })
                     .vports
             }
             _ => anyhow::bail!("PCIe NICs only supported to VTL0"),
@@ -1237,6 +1323,12 @@ async fn vm_config_from_command_line(
         || serial2_cfg.is_some()
         || serial3_cfg.is_some();
 
+    #[cfg(guest_arch = "aarch64")]
+    let serial_pl011_mmio_aliases: [Vec<u64>; 2] = [
+        serial_mmio_base_aliases[0].into_iter().collect(),
+        serial_mmio_base_aliases[1].into_iter().collect(),
+    ];
+
     let has_com3 = serial2_cfg.is_some();
 
     let mut chipset = VmManifestBuilder::new(base_chipset_type(opt), arch);
@@ -1251,6 +1343,13 @@ async fn vm_config_from_command_line(
         chipset = chipset.with_serial([serial0_cfg, serial1_cfg, serial2_cfg, serial3_cfg]);
     }
     chipset = chipset.with_serial_debugger_mode(com_debugger_mode);
+    #[cfg(guest_arch = "aarch64")]
+    if serial_pl011_mmio_aliases
+        .iter()
+        .any(|aliases| !aliases.is_empty())
+    {
+        chipset = chipset.with_serial_pl011_mmio_aliases(serial_pl011_mmio_aliases);
+    }
     if opt.battery {
         let (tx, rx) = mesh::channel();
         tx.send(HostBatteryUpdate::default_present());
@@ -1478,36 +1577,76 @@ async fn vm_config_from_command_line(
             force_firmware_version: *force_firmware_version,
         };
     } else {
-        // Linux Direct
-        let mut cmdline = "panic=-1 debug".to_string();
-
-        with_hv = opt.hv;
-        if with_hv && opt.pcie_root_complex.is_empty() {
-            cmdline += " pci=off";
-        }
-
-        if !console_str.is_empty() {
-            let _ = write!(&mut cmdline, " console={}", console_str);
-        }
-
-        if opt.gfx {
-            cmdline += " console=tty";
-        }
-        for extra in &opt.cmdline {
-            let _ = write!(&mut cmdline, " {}", extra);
-        }
-
-        let kernel = fs_err::File::open(
+        let mut kernel = fs_err::File::open(
             (opt.kernel.0)
                 .as_ref()
-                .context("must provide kernel when booting with linux direct")?,
+                .context("must provide an image when using direct boot")?,
         )
         .context("failed to open kernel")?;
-        let initrd = (opt.initrd.0)
+        let image_format = match opt.kernel_format {
+            KernelFormatCli::Auto if arch == MachineArch::Aarch64 => {
+                if loader::linux::is_arm64_image(&mut kernel)
+                    .context("failed to detect direct-boot image format")?
+                {
+                    openvmm_defs::config::DirectBootImageFormat::Linux
+                } else {
+                    openvmm_defs::config::DirectBootImageFormat::Raw
+                }
+            }
+            KernelFormatCli::Auto | KernelFormatCli::Linux => {
+                openvmm_defs::config::DirectBootImageFormat::Linux
+            }
+            KernelFormatCli::Raw => openvmm_defs::config::DirectBootImageFormat::Raw,
+        };
+        anyhow::ensure!(
+            arch != MachineArch::X86_64
+                || image_format != openvmm_defs::config::DirectBootImageFormat::Raw,
+            "raw direct-boot images are not supported on x86_64"
+        );
+
+        anyhow::ensure!(
+            image_format != openvmm_defs::config::DirectBootImageFormat::Raw
+                || opt.initrd.is_none(),
+            "raw direct boot does not support an initrd"
+        );
+        let initrd_path = if image_format == openvmm_defs::config::DirectBootImageFormat::Linux {
+            opt.initrd
+                .clone()
+                .or_else(cli_args::default_linux_direct_initrd)
+        } else {
+            None
+        };
+        let initrd = initrd_path
             .as_ref()
             .map(fs_err::File::open)
             .transpose()
             .context("failed to open initrd")?;
+
+        let mut cmdline = String::new();
+        let mut push_arg = |arg: &str| {
+            if !cmdline.is_empty() {
+                cmdline.push(' ');
+            }
+            cmdline.push_str(arg);
+        };
+
+        with_hv = opt.hv;
+        if image_format == openvmm_defs::config::DirectBootImageFormat::Linux {
+            push_arg("panic=-1");
+            push_arg("debug");
+            if with_hv && opt.pcie_root_complex.is_empty() {
+                push_arg("pci=off");
+            }
+            if !console_str.is_empty() {
+                push_arg(&format!("console={console_str}"));
+            }
+            if opt.gfx {
+                push_arg("console=tty");
+            }
+        }
+        for extra in &opt.cmdline {
+            push_arg(extra);
+        }
 
         load_mode = LoadMode::Linux {
             kernel: kernel.into(),
@@ -1521,7 +1660,10 @@ async fn vm_config_from_command_line(
             } else {
                 openvmm_defs::config::LinuxIsolationConfig::None
             },
-            boot_mode: if opt.device_tree {
+            image_format,
+            boot_mode: if opt.device_tree
+                || image_format == openvmm_defs::config::DirectBootImageFormat::Raw
+            {
                 openvmm_defs::config::LinuxDirectBootMode::DeviceTree
             } else {
                 openvmm_defs::config::LinuxDirectBootMode::Acpi
@@ -1788,6 +1930,7 @@ async fn vm_config_from_command_line(
                     openvmm_defs::config::GicMsiConfig::V2m { spi_count: None }
                 }
             },
+            virt_timer_gsiv: opt.virt_timer_gsiv,
         },
     );
     #[cfg(guest_arch = "x86_64")]
@@ -1848,21 +1991,17 @@ async fn vm_config_from_command_line(
     }
 
     let mut virtio_devices = Vec::new();
-    let mut add_virtio_device =
-        |bus, resource: Resource<VirtioDeviceHandle>, pcie_devices: &mut Vec<_>| match bus {
-            VirtioBusCli::Auto => {
-                // Use VPCI when possible (currently only on Windows and macOS due
-                // to KVM backend limitations).
-                if with_hv && (cfg!(windows) || cfg!(target_os = "macos")) {
-                    vpci_devices.push(VpciDeviceConfig {
-                        vtl: DeviceVtl::Vtl0,
-                        instance_id: Guid::new_random(),
-                        resource: VirtioPciDeviceHandle(resource).into_resource(),
-                        vnode: None,
-                    });
-                } else {
-                    virtio_devices.push((VirtioBus::Pci, resource));
-                }
+    let mut add_virtio_device = |bus,
+                                 mmio: Option<cli_args::FixedVirtioMmioCli>,
+                                 resource: Resource<VirtioDeviceHandle>,
+                                 pcie_devices: &mut Vec<_>| {
+        if let Some(mmio) = mmio {
+            virtio_devices.push((VirtioBus::MmioFixed(mmio.into()), resource));
+            return;
+        }
+        match bus {
+            VirtioBusCli::Auto if !(with_hv && (cfg!(windows) || cfg!(target_os = "macos"))) => {
+                virtio_devices.push((VirtioBus::Pci, resource));
             }
             VirtioBusCli::Mmio => virtio_devices.push((VirtioBus::Mmio, resource)),
             VirtioBusCli::Pci => virtio_devices.push((VirtioBus::Pci, resource)),
@@ -1870,13 +2009,14 @@ async fn vm_config_from_command_line(
                 port_name,
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             }),
-            VirtioBusCli::Vpci => vpci_devices.push(VpciDeviceConfig {
+            VirtioBusCli::Auto | VirtioBusCli::Vpci => vpci_devices.push(VpciDeviceConfig {
                 vtl: DeviceVtl::Vtl0,
                 instance_id: Guid::new_random(),
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
                 vnode: None,
             }),
-        };
+        }
+    };
 
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
@@ -1895,7 +2035,12 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource, &mut pcie_devices);
+            add_virtio_device(
+                VirtioBusCli::Auto,
+                cli_cfg.mmio,
+                resource,
+                &mut pcie_devices,
+            );
         }
     }
 
@@ -1914,7 +2059,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_fs_bus.clone(), resource, &mut pcie_devices);
+            add_virtio_device(opt.virtio_fs_bus.clone(), None, resource, &mut pcie_devices);
         }
     }
 
@@ -1932,7 +2077,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_fs_bus.clone(), resource, &mut pcie_devices);
+            add_virtio_device(opt.virtio_fs_bus.clone(), None, resource, &mut pcie_devices);
         }
     }
 
@@ -1949,7 +2094,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource, &mut pcie_devices);
+            add_virtio_device(VirtioBusCli::Auto, None, resource, &mut pcie_devices);
         }
     }
 
@@ -1964,20 +2109,22 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource, &mut pcie_devices);
+            add_virtio_device(VirtioBusCli::Auto, None, resource, &mut pcie_devices);
         }
     }
 
-    if opt.virtio_rng {
+    if let Some(rng) = &opt.virtio_rng {
+        let (bus, pcie_port, mmio) =
+            rng.resolve_legacy_options(&opt.virtio_rng_bus, opt.virtio_rng_pcie_port.as_deref())?;
         let resource: Resource<VirtioDeviceHandle> =
             virtio_resources::rng::VirtioRngHandle.into_resource();
-        if let Some(pcie_port) = &opt.virtio_rng_pcie_port {
+        if let Some(pcie_port) = pcie_port {
             pcie_devices.push(PcieDeviceConfig {
-                port_name: pcie_port.clone(),
+                port_name: pcie_port,
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(opt.virtio_rng_bus.clone(), resource, &mut pcie_devices);
+            add_virtio_device(bus, mmio, resource, &mut pcie_devices);
         }
     }
 
@@ -1990,7 +2137,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource, &mut pcie_devices);
+            add_virtio_device(VirtioBusCli::Auto, None, resource, &mut pcie_devices);
         }
     }
 
@@ -2043,7 +2190,7 @@ async fn vm_config_from_command_line(
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
             });
         } else {
-            add_virtio_device(VirtioBusCli::Auto, resource, &mut pcie_devices);
+            add_virtio_device(VirtioBusCli::Auto, None, resource, &mut pcie_devices);
         }
     }
 
@@ -2059,7 +2206,7 @@ async fn vm_config_from_command_line(
             listener,
         }
         .into_resource();
-        add_virtio_device(virtio_vsock_bus.clone(), resource, &mut pcie_devices);
+        add_virtio_device(virtio_vsock_bus.clone(), None, resource, &mut pcie_devices);
     }
 
     #[cfg(target_os = "linux")]
@@ -2072,7 +2219,7 @@ async fn vm_config_from_command_line(
             .into();
         let resource =
             virtio_resources::vsock::VirtioVsockVhostHandle { vhost, guest_cid }.into_resource();
-        add_virtio_device(virtio_vsock_bus, resource, &mut pcie_devices);
+        add_virtio_device(virtio_vsock_bus, None, resource, &mut pcie_devices);
     }
 
     #[cfg(target_os = "linux")]
@@ -3372,6 +3519,8 @@ mod tests {
                 "openvmm",
                 "--kernel",
                 kernel_path.to_str().unwrap(),
+                "--kernel-format",
+                "linux",
                 "--initrd",
                 initrd_path.to_str().unwrap(),
                 "--virtio-vsock-path",
@@ -3406,6 +3555,8 @@ mod tests {
                 "openvmm",
                 "--kernel",
                 kernel_path.to_str().unwrap(),
+                "--kernel-format",
+                "linux",
                 "--initrd",
                 initrd_path.to_str().unwrap(),
                 "--virtio-fs",
@@ -3447,6 +3598,8 @@ mod tests {
                 "openvmm",
                 "--kernel",
                 kernel_path.to_str().unwrap(),
+                "--kernel-format",
+                "linux",
                 "--initrd",
                 initrd_path.to_str().unwrap(),
                 "--virtio-fs",
@@ -3481,6 +3634,8 @@ mod tests {
                 "openvmm",
                 "--kernel",
                 kernel_path.to_str().unwrap(),
+                "--kernel-format",
+                "linux",
                 "--initrd",
                 initrd_path.to_str().unwrap(),
                 "--nvme-pci",

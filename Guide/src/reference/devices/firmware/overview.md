@@ -8,6 +8,7 @@ firmware requirements and guest OS compatibility:
 | **UEFI** | x86_64, AArch64 | [mu_msvm](./mu_msvm_uefi.md) | Windows, modern Linux, full UEFI environment |
 | **PCAT BIOS** | x86_64 | [Hyper-V PCAT BIOS](./pcat_bios.md) | Legacy OS, Gen1-style boot |
 | **Linux Direct** | x86_64, AArch64 | None (VMM is the bootloader) | [Fast Linux boot](./linux_direct.md), development, testing |
+| **Raw Direct** | AArch64 | None (VMM is the bootloader) | [Opaque executable images](./raw_direct.md), non-Linux startup programs |
 | **IGVM** | x86_64, AArch64 | Packaged in IGVM file | OpenHCL paravisor, confidential VMs |
 
 The boot mode is selected by which `--kernel`, `--uefi`, `--pcat`, or

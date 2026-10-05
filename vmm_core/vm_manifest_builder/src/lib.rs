@@ -73,6 +73,7 @@ pub struct VmManifestBuilder {
     ty: BaseChipsetType,
     arch: MachineArch,
     serial: Option<[Option<Resource<SerialBackendHandle>>; 4]>,
+    serial_pl011_mmio_aliases: [Vec<u64>; 2],
     serial_wait_for_rts: bool,
     serial_debugger_mode: [bool; 4],
     proxy_vga: bool,
@@ -250,6 +251,7 @@ fn serial_16550_devices(
 fn serial_pl011_devices(
     debugger_mode: [bool; 4],
     backends: [Option<Resource<SerialBackendHandle>>; 4],
+    mmio_aliases: [Vec<u64>; 2],
 ) -> Result<[SerialPl011DeviceHandle; 2], ErrorInner> {
     const PL011_SERIAL0_BASE: u64 = 0xEFFEC000;
     const PL011_SERIAL0_IRQ: u32 = 1;
@@ -260,16 +262,19 @@ fn serial_pl011_devices(
     if backend2.is_some() || backend3.is_some() {
         return Err(ErrorInner::UnsupportedSerialCount);
     }
+    let [mmio_aliases0, mmio_aliases1] = mmio_aliases;
 
     Ok([
         SerialPl011DeviceHandle {
             base: PL011_SERIAL0_BASE,
+            mmio_aliases: mmio_aliases0,
             irq: PL011_SERIAL0_IRQ,
             io: backend0.unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
             debugger_mode: debugger_mode[0],
         },
         SerialPl011DeviceHandle {
             base: PL011_SERIAL1_BASE,
+            mmio_aliases: mmio_aliases1,
             irq: PL011_SERIAL1_IRQ,
             io: backend1.unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
             debugger_mode: debugger_mode[1],
@@ -286,6 +291,7 @@ impl VmManifestBuilder {
             ty,
             arch,
             serial: None,
+            serial_pl011_mmio_aliases: [Vec::new(), Vec::new()],
             serial_wait_for_rts: false,
             serial_debugger_mode: [false; 4],
             proxy_vga: false,
@@ -312,6 +318,12 @@ impl VmManifestBuilder {
     /// For ARM64 VMs, only two serial ports are supported.
     pub fn with_serial(mut self, serial: [Option<Resource<SerialBackendHandle>>; 4]) -> Self {
         self.serial = Some(serial);
+        self
+    }
+
+    /// Add MMIO aliases for the two ARM64 PL011 serial ports.
+    pub fn with_serial_pl011_mmio_aliases(mut self, aliases: [Vec<u64>; 2]) -> Self {
+        self.serial_pl011_mmio_aliases = aliases;
         self
     }
 
@@ -542,6 +554,7 @@ impl VmManifestBuilder {
                         self.serial_debugger_mode,
                         true,
                         self.serial,
+                        self.serial_pl011_mmio_aliases,
                     )?
                     .attach_missing_arch_ports(self.arch, false);
                 if let Some(recv) = self.battery_status_recv {
@@ -587,6 +600,7 @@ impl VmManifestBuilder {
                         self.serial_debugger_mode,
                         false,
                         self.serial,
+                        self.serial_pl011_mmio_aliases,
                     )?
                     .attach_missing_arch_ports(self.arch, false)
                     // Linux probes legacy PCI configuration ports even when
@@ -626,6 +640,7 @@ impl VmManifestBuilder {
                         self.serial_debugger_mode,
                         true,
                         self.serial,
+                        self.serial_pl011_mmio_aliases,
                     )?
                     .attach_missing_arch_ports(self.arch, true);
                 if let Some(recv) = self.battery_status_recv {
@@ -655,6 +670,7 @@ impl VmManifestBuilder {
                     self.serial_debugger_mode,
                     false,
                     self.serial,
+                    self.serial_pl011_mmio_aliases,
                 )?;
                 if let Some(recv) = self.battery_status_recv {
                     result.attach_battery(self.arch, recv);
@@ -895,6 +911,7 @@ impl VmChipsetResult {
         debugger_mode: [bool; 4],
         register_missing: bool,
         serial: Option<[Option<Resource<SerialBackendHandle>>; 4]>,
+        pl011_mmio_aliases: [Vec<u64>; 2],
     ) -> Result<&mut Self, ErrorInner> {
         if let Some(serial) = serial {
             match arch {
@@ -905,7 +922,7 @@ impl VmChipsetResult {
                     if wait_for_rts {
                         return Err(ErrorInner::WaitForRtsNotSupported);
                     }
-                    self.attach_serial_pl011(debugger_mode, serial)?;
+                    self.attach_serial_pl011(debugger_mode, serial, pl011_mmio_aliases)?;
                 }
             }
         } else if register_missing && arch == MachineArch::X86_64 {
@@ -955,8 +972,9 @@ impl VmChipsetResult {
         &mut self,
         debugger_mode: [bool; 4],
         backends: [Option<Resource<SerialBackendHandle>>; 4],
+        mmio_aliases: [Vec<u64>; 2],
     ) -> Result<&mut Self, ErrorInner> {
-        let [serial0, serial1] = serial_pl011_devices(debugger_mode, backends)?;
+        let [serial0, serial1] = serial_pl011_devices(debugger_mode, backends, mmio_aliases)?;
         self.chipset_devices.extend([
             ChipsetDeviceHandle {
                 name: "com1".to_string(),
@@ -1128,7 +1146,9 @@ mod tests {
         let serial_16550 = serial_16550_devices(false, [false; 4], no_serial_backends());
         assert!(serial_16550.iter().all(|handle| !handle.debugger_mode));
 
-        let serial_pl011 = serial_pl011_devices([false; 4], no_serial_backends()).unwrap();
+        let serial_pl011 =
+            serial_pl011_devices([false; 4], no_serial_backends(), [Vec::new(), Vec::new()])
+                .unwrap();
         assert!(serial_pl011.iter().all(|handle| !handle.debugger_mode));
     }
 
@@ -1144,8 +1164,12 @@ mod tests {
         );
 
         // PL011 uses the first two entries independently.
-        let serial_pl011 =
-            serial_pl011_devices([true, false, false, false], no_serial_backends()).unwrap();
+        let serial_pl011 = serial_pl011_devices(
+            [true, false, false, false],
+            no_serial_backends(),
+            [Vec::new(), Vec::new()],
+        )
+        .unwrap();
         assert_eq!(
             serial_pl011.map(|handle| handle.debugger_mode),
             [true, false]

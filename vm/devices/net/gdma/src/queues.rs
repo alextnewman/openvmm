@@ -2,6 +2,12 @@
 // Licensed under the MIT License.
 
 use crate::dma::DmaRegion;
+use crate::protocol::ProtocolObserver;
+use gdma_contract::Event;
+use gdma_contract::QueueDescriptor;
+use gdma_contract::QueueKey;
+use gdma_contract::QueueKind;
+use gdma_contract::Rule;
 use gdma_defs::CqEqDoorbellValue;
 use gdma_defs::Cqe;
 use gdma_defs::CqeParams;
@@ -66,6 +72,8 @@ pub enum QueueAllocError {
     InvalidLen,
     #[error("out of queues")]
     NoMoreQueues,
+    #[error("invalid MSI-X index {0}")]
+    InvalidMsix(u32),
 }
 
 impl<T: IntoBytes + Immutable + KnownLayout> CqEq<T> {
@@ -95,26 +103,46 @@ impl<T: IntoBytes + Immutable + KnownLayout> CqEq<T> {
         ((self.tail >> self.shift) & OWNER_MASK) as u8
     }
 
-    fn post(&mut self, gm: &GuestMemory, entry: &T) -> bool {
+    fn post(
+        &mut self,
+        gm: &GuestMemory,
+        entry: &T,
+        protocol: &ProtocolObserver,
+        key: QueueKey,
+    ) -> bool {
         let offset = (self.tail & (self.cap - 1)) as usize * size_of::<T>();
         let mut range = self.region.range();
         range.skip(offset);
         let mut writer = range.writer(gm);
-        let (entry, last) = entry.as_bytes().split_at(entry.as_bytes().len() - 1);
+        let raw = entry.as_bytes();
+        let (entry, last) = raw.split_at(raw.len() - 1);
         if let Err(err) = writer.write(entry) {
-            tracing::warn!(
+            tracelimit::warn_ratelimited!(
                 err = &err as &dyn std::error::Error,
                 "failed to write entry"
             );
+            protocol.observe(Event::ObservationUnavailable(Rule::CompletionStorage));
+            return false;
         }
         // Write the final byte last after a release fence to ensure that the
         // guest sees the entire entry before the owner count is updated.
         std::sync::atomic::fence(Release);
         if let Err(err) = writer.write(last) {
-            tracing::warn!(err = &err as &dyn std::error::Error, "failed to write last");
+            tracelimit::warn_ratelimited!(
+                err = &err as &dyn std::error::Error,
+                "failed to write last"
+            );
+            protocol.observe(Event::ObservationUnavailable(Rule::CompletionStorage));
+            return false;
         }
         // Ensure the write is flushed before sending the interrupt.
         std::sync::atomic::fence(Release);
+        protocol.observe(Event::Completion {
+            queue: key,
+            entry: raw,
+            body_written: true,
+            owner_written: true,
+        });
         let new_tail = self.tail.wrapping_add(1);
         self.tail = new_tail;
         std::mem::take(&mut self.armed)
@@ -207,7 +235,13 @@ impl Wq {
         })
     }
 
-    fn poll_wqe(&mut self, gm: &GuestMemory, cx: &mut Context<'_>) -> Poll<(u32, Wqe)> {
+    fn poll_wqe(
+        &mut self,
+        gm: &GuestMemory,
+        cx: &mut Context<'_>,
+        protocol: &ProtocolObserver,
+        key: QueueKey,
+    ) -> Poll<(u32, Wqe)> {
         if self.head == self.tail {
             self.waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -222,14 +256,31 @@ impl Wq {
         let header: WqeHeader = match reader.read_plain() {
             Ok(header) => header,
             Err(err) => {
-                tracing::warn!(error = &err as &dyn std::error::Error, "wqe read error");
+                tracelimit::warn_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "wqe read error"
+                );
+                protocol.observe(Event::ObservationUnavailable(Rule::WorkDescriptor));
                 return Poll::Pending;
             }
         };
 
+        protocol.observe(Event::WorkHeader {
+            queue: key,
+            position: head,
+            header: header.as_bytes(),
+        });
+        let mut snapshot = self.region.range();
+        snapshot.skip((head & (self.cap - 1)) as usize + 8);
+        protocol.descriptor(
+            key,
+            header.as_bytes(),
+            snapshot.reader(gm),
+            self.available(),
+        );
         let total_len = header.total_len();
         if total_len > size_of::<Wqe>() || total_len > self.available() as usize {
-            tracing::warn!(total_len, available = self.available(), "invalid wqe");
+            tracelimit::warn_ratelimited!(total_len, available = self.available(), "invalid wqe");
             return Poll::Pending;
         }
 
@@ -239,11 +290,17 @@ impl Wq {
         };
 
         if let Err(err) = reader.read(&mut wqe.data[..wqe.header.data_len()]) {
-            tracing::warn!(error = &err as &dyn std::error::Error, "wqe read error");
+            tracelimit::warn_ratelimited!(error = &err as &dyn std::error::Error, "wqe read error");
+            protocol.observe(Event::ObservationUnavailable(Rule::WorkDescriptor));
             return Poll::Pending;
         }
 
         self.head = head.wrapping_add(total_len as u32);
+        protocol.observe(Event::WorkConsumed {
+            queue: key,
+            position: head,
+            bytes: total_len as u32,
+        });
         Poll::Ready((head, wqe))
     }
 
@@ -255,10 +312,7 @@ impl Wq {
         let old_len = self.available();
         assert!(old_len <= self.cap);
         let new_len = val.wrapping_sub(self.head);
-        if self.head.is_multiple_of(WQE_ALIGNMENT as u32)
-            && new_len > old_len
-            && new_len <= self.cap
-        {
+        if val.is_multiple_of(WQE_ALIGNMENT as u32) && new_len > old_len && new_len <= self.cap {
             self.tail = val;
             self.waker.take()
         } else {
@@ -270,6 +324,8 @@ impl Wq {
 pub struct Queues {
     pub gm: GuestMemory,
     pub driver: VmTaskDriver,
+    pub(crate) protocol: ProtocolObserver,
+    pub(crate) scenario: crate::conformance::DeviceScenario,
     sqs: Vec<Mutex<Option<Wq>>>,
     rqs: Vec<Mutex<Option<Wq>>>,
     cqs: Vec<Mutex<Option<Cq>>>,
@@ -313,18 +369,36 @@ impl Inspect for Queues {
 #[error("queue {0} not found")]
 pub struct QueueNotFound(u32);
 
+#[derive(Debug, Error)]
+pub enum QueueUpdateError {
+    #[error(transparent)]
+    NotFound(#[from] QueueNotFound),
+    #[error("invalid MSI-X index {0}")]
+    InvalidMsix(u32),
+}
+
 impl Queues {
-    pub fn new(gm: GuestMemory, driver: VmTaskDriver, msix: &MsixEmulator) -> Self {
+    pub fn new(
+        gm: GuestMemory,
+        driver: VmTaskDriver,
+        msix: &MsixEmulator,
+        protocol: ProtocolObserver,
+        scenario: Option<gdma_resources::ConformanceScenario>,
+    ) -> Self {
         let msis = (0..64)
             .map(|index| msix.interrupt(index).unwrap())
             .collect();
         Self {
             gm,
             driver,
+            protocol,
+            scenario: crate::conformance::DeviceScenario::new(scenario),
             sqs: [(); 64].map(|_| Mutex::new(None)).into(),
             rqs: [(); 64].map(|_| Mutex::new(None)).into(),
             cqs: [(); 128].map(|_| Mutex::new(None)).into(),
-            eqs: [(); 64].map(|_| Mutex::new(None)).into(),
+            eqs: (0..scenario.map_or(64, |scenario| scenario.max_eqs()))
+                .map(|_| Mutex::new(None))
+                .collect(),
             msis,
         }
     }
@@ -346,12 +420,27 @@ impl Queues {
     }
 
     pub fn alloc_wq(&self, is_send: bool, region: DmaRegion) -> Result<u32, QueueAllocError> {
+        let bytes = region.len() as u64;
         let wqs = if is_send { &self.sqs } else { &self.rqs };
         for (i, wq) in wqs.iter().enumerate() {
             let mut wq = wq.lock();
             if wq.is_none() {
                 *wq = Some(Wq::new(region)?);
-                return Ok((i + ID_OFFSET) as u32);
+                let id = (i + ID_OFFSET) as u32;
+                self.protocol.observe(Event::QueueBound(QueueDescriptor {
+                    key: QueueKey {
+                        kind: if is_send {
+                            QueueKind::Sq
+                        } else {
+                            QueueKind::Rq
+                        },
+                        id,
+                    },
+                    bytes,
+                    parent_eq: None,
+                    msix: None,
+                }));
+                return Ok(id);
             }
         }
         Err(QueueAllocError::NoMoreQueues)
@@ -359,13 +448,24 @@ impl Queues {
 
     pub fn free_wq(&self, is_send: bool, id: u32) -> Result<(), QueueNotFound> {
         let wqs = if is_send { &self.sqs } else { &self.rqs };
-        wqs.get(id as usize - ID_OFFSET)
-            .and_then(|q| q.lock().take())
+        let index = (id as usize)
+            .checked_sub(ID_OFFSET)
             .ok_or(QueueNotFound(id))?;
+        let mut queue = wqs.get(index).ok_or(QueueNotFound(id))?.lock();
+        queue.take().ok_or(QueueNotFound(id))?;
+        self.protocol.observe(Event::QueueReleased(QueueKey {
+            kind: if is_send {
+                QueueKind::Sq
+            } else {
+                QueueKind::Rq
+            },
+            id,
+        }));
         Ok(())
     }
 
     pub fn alloc_cq(&self, region: DmaRegion, eq_id: u32) -> Result<u32, QueueAllocError> {
+        let bytes = region.len() as u64;
         for (i, cq) in self.cqs.iter().enumerate() {
             let mut cq = cq.lock();
             if cq.is_none() {
@@ -373,21 +473,60 @@ impl Queues {
                     q: CqEq::new(region)?,
                     eq_id,
                 });
-                return Ok((i + ID_OFFSET) as u32);
+                let id = (i + ID_OFFSET) as u32;
+                self.protocol.observe(Event::QueueBound(QueueDescriptor {
+                    key: QueueKey {
+                        kind: QueueKind::Cq,
+                        id,
+                    },
+                    bytes,
+                    parent_eq: Some(eq_id),
+                    msix: None,
+                }));
+                return Ok(id);
             }
         }
         Err(QueueAllocError::NoMoreQueues)
     }
 
-    pub fn free_cq(&self, cq_id: u32) -> Result<(), QueueNotFound> {
-        self.cqs
-            .get(cq_id as usize - ID_OFFSET)
-            .and_then(|q| q.lock().take())
+    pub fn free_wq_cq(&self, is_send: bool, wq_id: u32, cq_id: u32) -> Result<(), QueueNotFound> {
+        let wqs = if is_send { &self.sqs } else { &self.rqs };
+        let wq_index = (wq_id as usize)
+            .checked_sub(ID_OFFSET)
+            .ok_or(QueueNotFound(wq_id))?;
+        let cq_index = (cq_id as usize)
+            .checked_sub(ID_OFFSET)
             .ok_or(QueueNotFound(cq_id))?;
+        let mut wq = wqs.get(wq_index).ok_or(QueueNotFound(wq_id))?.lock();
+        let mut cq = self.cqs.get(cq_index).ok_or(QueueNotFound(cq_id))?.lock();
+        if wq.is_none() {
+            return Err(QueueNotFound(wq_id));
+        }
+        if cq.is_none() {
+            return Err(QueueNotFound(cq_id));
+        }
+        *wq = None;
+        *cq = None;
+        self.protocol.observe(Event::QueueReleased(QueueKey {
+            kind: if is_send {
+                QueueKind::Sq
+            } else {
+                QueueKind::Rq
+            },
+            id: wq_id,
+        }));
+        self.protocol.observe(Event::QueueReleased(QueueKey {
+            kind: QueueKind::Cq,
+            id: cq_id,
+        }));
         Ok(())
     }
 
     pub fn alloc_eq(&self, region: DmaRegion, msix: u32) -> Result<u32, QueueAllocError> {
+        if self.msis.get(msix as usize).is_none() {
+            return Err(QueueAllocError::InvalidMsix(msix));
+        }
+        let bytes = region.len() as u64;
         for (i, eq) in self.eqs.iter().enumerate() {
             let mut eq = eq.lock();
             if eq.is_none() {
@@ -395,28 +534,68 @@ impl Queues {
                     q: CqEq::new(region)?,
                     msix,
                 });
-                return Ok((i + ID_OFFSET) as u32);
+                let id = (i + ID_OFFSET) as u32;
+                self.protocol.observe(Event::QueueBound(QueueDescriptor {
+                    key: QueueKey {
+                        kind: QueueKind::Eq,
+                        id,
+                    },
+                    bytes,
+                    parent_eq: None,
+                    msix: Some(msix),
+                }));
+                return Ok(id);
             }
         }
         Err(QueueAllocError::NoMoreQueues)
     }
 
-    pub fn update_eq_msix(&self, eq_id: u32, msix: u32) -> Result<(), QueueNotFound> {
+    pub fn update_eq_msix(&self, eq_id: u32, msix: u32) -> Result<(), QueueUpdateError> {
+        if self.msis.get(msix as usize).is_none() {
+            return Err(QueueUpdateError::InvalidMsix(msix));
+        }
         self.eq(eq_id)
             .map(|mut eq| {
                 eq.msix = msix;
                 Some(eq_id)
             })
             .ok_or(QueueNotFound(eq_id))?;
+        self.protocol.observe(Event::EqRoute { id: eq_id, msix });
         Ok(())
     }
 
     pub fn free_eq(&self, eq_id: u32) -> Result<(), QueueNotFound> {
-        self.eqs
-            .get(eq_id as usize - ID_OFFSET)
-            .and_then(|q| q.lock().take())
+        let index = (eq_id as usize)
+            .checked_sub(ID_OFFSET)
             .ok_or(QueueNotFound(eq_id))?;
+        let mut queue = self.eqs.get(index).ok_or(QueueNotFound(eq_id))?.lock();
+        queue.take().ok_or(QueueNotFound(eq_id))?;
+        self.protocol.observe(Event::QueueReleased(QueueKey {
+            kind: QueueKind::Eq,
+            id: eq_id,
+        }));
         Ok(())
+    }
+
+    /// Clears all queue allocations, returning the engine to its initial state.
+    ///
+    /// Used when the device is reset so that a subsequent HW channel
+    /// establishment starts from a clean slate, even if the guest never
+    /// released the queues it previously allocated.
+    pub fn reset(&self) {
+        for sq in &self.sqs {
+            *sq.lock() = None;
+        }
+        for rq in &self.rqs {
+            *rq.lock() = None;
+        }
+        for cq in &self.cqs {
+            *cq.lock() = None;
+        }
+        for eq in &self.eqs {
+            *eq.lock() = None;
+        }
+        self.protocol.observe(Event::Reset);
     }
 
     fn sq(&self, sq_id: u32) -> Option<MappedMutexGuard<'_, Wq>> {
@@ -469,7 +648,16 @@ impl Queues {
                     .with_owner_count(cq.q.owner_count()),
             };
             cqe.data[..data.len()].copy_from_slice(data);
-            cq.q.post(&self.gm, &cqe).then_some(cq.eq_id)
+            cq.q.post(
+                &self.gm,
+                &cqe,
+                &self.protocol,
+                QueueKey {
+                    kind: QueueKind::Cq,
+                    id: cq_id,
+                },
+            )
+            .then_some(cq.eq_id)
         });
 
         if let Some(eq_id) = post_to_eq {
@@ -487,7 +675,16 @@ impl Queues {
                     .with_owner_count(eq.q.owner_count()),
             };
             eqe.data[..data.len()].copy_from_slice(data);
-            eq.q.post(&self.gm, &eqe).then_some(eq.msix)
+            eq.q.post(
+                &self.gm,
+                &eqe,
+                &self.protocol,
+                QueueKey {
+                    kind: QueueKind::Eq,
+                    id: eq_id,
+                },
+            )
+            .then_some(eq.msix)
         });
 
         if let Some(msix) = post_msi {
@@ -497,8 +694,20 @@ impl Queues {
     }
 
     pub fn poll_sq(&self, sq_id: u32, cx: &mut Context<'_>) -> Poll<Wqe> {
+        self.poll_sq_with_offset(sq_id, cx).map(|(_, wqe)| wqe)
+    }
+
+    pub fn poll_sq_with_offset(&self, sq_id: u32, cx: &mut Context<'_>) -> Poll<(u32, Wqe)> {
         if let Some(mut sq) = self.sq(sq_id) {
-            sq.poll_wqe(&self.gm, cx).map(|x| x.1)
+            sq.poll_wqe(
+                &self.gm,
+                cx,
+                &self.protocol,
+                QueueKey {
+                    kind: QueueKind::Sq,
+                    id: sq_id,
+                },
+            )
         } else {
             Poll::Pending
         }
@@ -506,7 +715,15 @@ impl Queues {
 
     pub fn poll_rq(&self, rq_id: u32, cx: &mut Context<'_>) -> Poll<(u32, Wqe)> {
         if let Some(mut rq) = self.rq(rq_id) {
-            rq.poll_wqe(&self.gm, cx)
+            rq.poll_wqe(
+                &self.gm,
+                cx,
+                &self.protocol,
+                QueueKey {
+                    kind: QueueKind::Rq,
+                    id: rq_id,
+                },
+            )
         } else {
             Poll::Pending
         }
@@ -548,5 +765,51 @@ impl Queues {
             tracing::trace!(eq_id, msix, "interrupt on eq doorbell");
             self.msis[msix as usize].deliver();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn unaligned_work_tail_does_not_publish() {
+        let region = DmaRegion::new(vec![0], 0, 4096).unwrap();
+        let mut queue = Wq::new(region).unwrap();
+        queue.doorbell(1);
+        assert_eq!(queue.tail, 0);
+        queue.doorbell(33);
+        assert_eq!(queue.tail, 0);
+        queue.doorbell(32);
+        assert_eq!(queue.tail, 32);
+    }
+
+    #[test]
+    fn failed_completion_store_does_not_advance_or_fire() {
+        let gm = GuestMemory::allocate(4096);
+        let region = DmaRegion::new(vec![0x10000], 0, 4096).unwrap();
+        let mut queue = CqEq::<Eqe>::new(region).unwrap();
+        let protocol = ProtocolObserver::new(true, 64);
+        let key = QueueKey {
+            kind: QueueKind::Eq,
+            id: 24,
+        };
+        protocol.observe(Event::QueueBound(QueueDescriptor {
+            key,
+            bytes: 4096,
+            parent_eq: None,
+            msix: Some(0),
+        }));
+        let before = queue.tail;
+        assert!(!queue.post(&gm, &Eqe::new_zeroed(), &protocol, key));
+        assert_eq!(queue.tail, before);
+        assert!(queue.armed);
+        let report = protocol.report().unwrap();
+        assert_eq!(
+            report.statistics[Rule::CompletionStorage as usize].inconclusive,
+            1
+        );
+        assert!(report.findings.is_empty());
     }
 }

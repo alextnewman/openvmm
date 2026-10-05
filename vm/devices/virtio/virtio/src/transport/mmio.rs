@@ -13,6 +13,7 @@ use crate::spec::VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE;
 use crate::spec::VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER;
 use crate::spec::mmio::VirtioMmioRegister;
 use chipset_device::ChipsetDevice;
+use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use chipset_device::io::deferred::defer_read;
 use chipset_device::io::deferred::defer_write;
@@ -84,8 +85,7 @@ impl TransportOps for MmioTransport {
     }
 
     fn doorbell_region(&mut self) -> Option<(u64, u32)> {
-        let base = (*self.fixed_mmio_region.1.start() & !0xfff)
-            + VirtioMmioRegister::QUEUE_NOTIFY.0 as u64;
+        let base = *self.fixed_mmio_region.1.start() + VirtioMmioRegister::QUEUE_NOTIFY.0 as u64;
         Some((base, 4))
     }
 }
@@ -115,6 +115,15 @@ impl VirtioMmioDevice {
         mmio_gpa: u64,
         mmio_len: u64,
     ) -> std::io::Result<Self> {
+        if mmio_len == 0 || mmio_len > u16::MAX.into() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "virtio-mmio region length must fit in a non-empty u16 range",
+            ));
+        }
+        let mmio_end = mmio_gpa
+            .checked_add(mmio_len - 1)
+            .ok_or_else(|| std::io::Error::other("virtio-mmio region overflows the GPA space"))?;
         let traits = device.traits();
         let interrupt_state = Arc::new(Mutex::new(InterruptState {
             interrupt,
@@ -126,7 +135,7 @@ impl VirtioMmioDevice {
         Ok(Self {
             core,
             mmio: MmioTransport {
-                fixed_mmio_region: ("virtio-chipset", mmio_gpa..=(mmio_gpa + mmio_len - 1)),
+                fixed_mmio_region: ("virtio-chipset", mmio_gpa..=mmio_end),
                 device_id: traits.device_id.0 as u32,
                 vendor_id: 0x1af4,
                 interrupt_state,
@@ -137,13 +146,21 @@ impl VirtioMmioDevice {
     /// Synchronous transport register read for tests.
     #[cfg(test)]
     pub(crate) fn read_u32(&mut self, address: u64) -> u32 {
-        self.read_u32_local((address & 0xfff) as u16)
+        self.read_u32_local(self.register_offset(address).expect("address is in range"))
     }
 
     /// Synchronous transport register write for tests.
     #[cfg(test)]
     pub(crate) fn write_u32(&mut self, address: u64, val: u32) {
-        self.write_u32_local((address & 0xfff) as u16, val);
+        self.write_u32_local(
+            self.register_offset(address).expect("address is in range"),
+            val,
+        );
+    }
+
+    fn register_offset(&self, address: u64) -> Option<u16> {
+        let offset = address.checked_sub(*self.mmio.fixed_mmio_region.1.start())?;
+        offset.try_into().ok()
     }
 
     /// Read a transport register as a u32.
@@ -332,7 +349,10 @@ impl VirtioMmioDevice {
                     deferred,
                 } => {
                     let mut buf = vec![0u8; len];
-                    self.read_transport((address & 0xfff) as u16, &mut buf);
+                    let offset = self
+                        .register_offset(address)
+                        .expect("stalled MMIO read address is in range");
+                    self.read_transport(offset, &mut buf);
                     deferred.complete(&buf);
                 }
                 StalledIo::Write {
@@ -341,7 +361,10 @@ impl VirtioMmioDevice {
                     len,
                     deferred,
                 } => {
-                    self.write_transport((address & 0xfff) as u16, &data[..len]);
+                    let offset = self
+                        .register_offset(address)
+                        .expect("stalled MMIO write address is in range");
+                    self.write_transport(offset, &data[..len]);
                     if self.core.state.is_busy() {
                         self.core.pending_status_deferred = Some(deferred);
                         break;
@@ -457,7 +480,9 @@ mod saved_state {
 
 impl MmioIntercept for VirtioMmioDevice {
     fn mmio_read(&mut self, address: u64, data: &mut [u8]) -> IoResult {
-        let offset = (address & 0xfff) as u16;
+        let Some(offset) = self.register_offset(address) else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
         if offset >= VirtioMmioRegister::CONFIG.0 {
             return defer_config_read(
                 &self.core.device_sender,
@@ -480,7 +505,9 @@ impl MmioIntercept for VirtioMmioDevice {
     }
 
     fn mmio_write(&mut self, address: u64, data: &[u8]) -> IoResult {
-        let offset = (address & 0xfff) as u16;
+        let Some(offset) = self.register_offset(address) else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
         if offset >= VirtioMmioRegister::CONFIG.0 {
             return defer_config_write(
                 &self.core.device_sender,

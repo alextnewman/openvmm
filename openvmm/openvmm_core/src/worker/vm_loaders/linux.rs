@@ -29,6 +29,12 @@ pub enum Error {
     InitRd(#[source] std::io::Error),
     #[error("linux loader error")]
     Loader(#[source] loader::linux::Error),
+    #[error("raw image loader error")]
+    RawLoader(#[source] loader::raw::Error),
+    #[error("raw direct boot does not support an initrd")]
+    RawImageWithInitrd,
+    #[error("raw image load address overflowed")]
+    RawImageLoadAddressOverflow,
     #[error("device tree error")]
     Dt(#[source] DtError),
     #[error("failed to write EFI/ACPI tables to guest memory")]
@@ -53,6 +59,8 @@ pub struct KernelConfig<'a> {
     pub mem_layout: &'a MemoryLayout,
     pub isolation: KernelIsolationConfig,
     pub smbios: &'a openvmm_defs::config::SmbiosConfig,
+    pub image_format: openvmm_defs::config::DirectBootImageFormat,
+    pub fixed_virtio_mmio: &'a [openvmm_defs::config::VirtioMmioConfig],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -356,7 +364,6 @@ fn build_dt(
 
     const GIC_SPI: u32 = 0;
     const GIC_PPI: u32 = 1;
-    const IRQ_TYPE_LEVEL_LOW: u32 = 8;
     const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
     const IRQ_TYPE_EDGE_RISING: u32 = 1;
     /// VMBus PPI offset for the DT `interrupts` property.
@@ -516,12 +523,26 @@ fn build_dt(
     let virt_timer_ppi_offset = processor_topology.virt_timer_ppi() - 16;
     let timer = root_builder
         .start_node("timer")?
-        .add_str(p_compatible, "arm,armv8-timer")?
+        .add_str_array(p_compatible, &["arm,armv8-timer", "arm,armv7-timer"])?
         .add_u32(p_interrupt_parent, PHANDLE_GIC)?
-        .add_str(p_interrupt_names, "virt")?
         .add_u32_array(
             p_interrupts,
-            &[GIC_PPI, virt_timer_ppi_offset, IRQ_TYPE_LEVEL_LOW],
+            &[
+                // Keep the architectural timer ordering expected by
+                // startup-qemu-virt: secure, physical, virtual, hypervisor.
+                GIC_PPI,
+                13,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                14,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                virt_timer_ppi_offset,
+                IRQ_TYPE_LEVEL_HIGH,
+                GIC_PPI,
+                10,
+                IRQ_TYPE_LEVEL_HIGH,
+            ],
         )?
         .add_null(p_always_on)?;
     root_builder = timer.end_node()?;
@@ -623,6 +644,22 @@ fn build_dt(
         root_builder = node.end_node()?;
     }
 
+    for mmio in cfg.fixed_virtio_mmio {
+        let name = format!("virtio_mmio@{:x}", mmio.address);
+        root_builder = root_builder
+            .start_node(name.as_ref())?
+            .add_str(p_compatible, "virtio,mmio")?
+            .add_u64_array(p_reg, &[mmio.address, 0x200])?
+            .add_u32(p_interrupt_parent, PHANDLE_GIC)?
+            .add_u32_array(
+                p_interrupts,
+                &[GIC_SPI, mmio.gsiv - 32, IRQ_TYPE_EDGE_RISING],
+            )?
+            .add_null(p_dma_coherent)?
+            .add_str(p_status, "okay")?
+            .end_node()?;
+    }
+
     let mut soc = root_builder
         .start_node("openvmm")?
         .add_str(p_compatible, "simple-bus")?
@@ -683,15 +720,18 @@ fn build_dt(
 
     root_builder = soc.end_node()?;
 
-    let mut chosen = root_builder
-        .start_node("chosen")?
-        .add_str(p_bootargs, cfg.cmdline)?;
-    chosen = chosen.add_u64(p_initrd_start, initrd_start)?;
-    chosen = chosen.add_u64(p_initrd_end, initrd_end)?;
+    let mut chosen = root_builder.start_node("chosen")?;
+    if !cfg.cmdline.is_empty() {
+        chosen = chosen.add_str(p_bootargs, cfg.cmdline)?;
+    }
+    if initrd_start < initrd_end {
+        chosen = chosen.add_u64(p_initrd_start, initrd_start)?;
+        chosen = chosen.add_u64(p_initrd_end, initrd_end)?;
+    }
     if enable_serial {
         chosen = chosen.add_str(
             p_stdout_path,
-            format!("/hvlite/uart@{PL011_SERIAL0_BASE:x}").as_str(),
+            format!("/openvmm/uart@{PL011_SERIAL0_BASE:x}").as_str(),
         )?;
     }
 
@@ -985,7 +1025,7 @@ fn build_stub_dt(
 }
 
 #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
-pub fn load_linux_arm64(
+pub fn load_direct_arm64(
     cfg: &KernelConfig<'_>,
     gm: &GuestMemory,
     enable_serial: bool,
@@ -997,6 +1037,69 @@ pub fn load_linux_arm64(
 ) -> Result<InitialLoad<Aarch64Register>, Error> {
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
     let mut kernel_file = cfg.kernel;
+
+    let image_format = match cfg.image_format {
+        openvmm_defs::config::DirectBootImageFormat::Auto => {
+            if loader::linux::is_arm64_image(&mut kernel_file).map_err(Error::Loader)? {
+                openvmm_defs::config::DirectBootImageFormat::Linux
+            } else {
+                openvmm_defs::config::DirectBootImageFormat::Raw
+            }
+        }
+        image_format => image_format,
+    };
+    tracing::info!(?image_format, "selected AArch64 direct-boot image format");
+
+    let mem_start = cfg
+        .mem_layout
+        .ram()
+        .first()
+        .expect("must be at least one ram range")
+        .range
+        .start();
+
+    if image_format == openvmm_defs::config::DirectBootImageFormat::Raw {
+        if cfg.initrd.is_some() {
+            return Err(Error::RawImageWithInitrd);
+        }
+
+        tracing::info!("using full device tree for raw AArch64 direct boot");
+        let device_tree = build_dt(
+            cfg,
+            gm,
+            enable_serial,
+            processor_topology,
+            pcie_host_bridges,
+            smmu_configs,
+            chipset_mmio.low,
+            chipset_mmio.high,
+            0,
+            0,
+        )
+        .map_err(|e| Error::Dt(DtError(e)))?;
+        let load_address = mem_start
+            .checked_add(loader::raw::AARCH64_DEFAULT_LOAD_OFFSET)
+            .ok_or(Error::RawImageLoadAddressOverflow)?;
+        let device_tree_min_address = mem_start
+            .checked_add(loader::raw::AARCH64_DEFAULT_DTB_OFFSET)
+            .ok_or(Error::RawImageLoadAddressOverflow)?;
+        let load_info = loader::raw::load_arm64(
+            &mut loader,
+            &mut kernel_file,
+            load_address,
+            Some(&device_tree),
+            device_tree_min_address,
+        )
+        .map_err(Error::RawLoader)?;
+        loader::linux::set_direct_boot_registers_arm64_for_entry(
+            &mut loader,
+            load_info.entrypoint,
+            load_info.dtb.as_ref().map(|dtb| dtb.start),
+        )
+        .map_err(Error::Loader)?;
+
+        return Ok(loader.initial_regs_and_page_imports());
+    }
 
     let (mut initrd_reader, initrd_size) = if let Some(mut initrd_file) = cfg.initrd.as_ref() {
         initrd_file.rewind().map_err(Error::InitRd)?;
@@ -1015,13 +1118,6 @@ pub fn load_linux_arm64(
     //
     // Place the initrd at the bottom of guest memory + 16MB, and set the
     // minimum kernel address above it, aligned to the next 2MB boundary.
-    let mem_start = cfg
-        .mem_layout
-        .ram()
-        .first()
-        .expect("must be at least one ram range")
-        .range
-        .start();
     const INITRD_OFFSET: u64 = 16 << 20; // 16 MB
     let initrd_start: u64 = mem_start + INITRD_OFFSET;
     let initrd_end: u64 = initrd_start + initrd_size;

@@ -135,6 +135,17 @@ pub enum LinuxIsolationConfig {
     },
 }
 
+/// How a direct-boot image should be interpreted.
+#[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectBootImageFormat {
+    /// Detect a Linux ARM64 Image header and otherwise load an AArch64 image raw.
+    Auto,
+    /// Require a Linux kernel image.
+    Linux,
+    /// Load the image as an opaque flat binary.
+    Raw,
+}
+
 #[derive(MeshPayload, Debug)]
 pub enum LoadMode {
     Linux {
@@ -146,6 +157,7 @@ pub enum LoadMode {
         boot_mode: LinuxDirectBootMode,
         // Boxed to keep the `Linux` variant from dominating `LoadMode`'s size.
         smbios: Box<SmbiosConfig>,
+        image_format: DirectBootImageFormat,
     },
     Uefi {
         firmware: File,
@@ -427,6 +439,7 @@ pub struct Aarch64TopologyConfig {
     pub gic_config: Option<GicConfig>,
     pub pmu_gsiv: PmuGsivConfig,
     pub gic_msi: GicMsiConfig,
+    pub virt_timer_gsiv: Option<u32>,
 }
 
 /// GIC configuration for the virtual machine.
@@ -578,7 +591,16 @@ pub enum PcatBootDevice {
 #[derive(Eq, PartialEq, Debug, Copy, Clone, MeshPayload)]
 pub enum VirtioBus {
     Mmio,
+    MmioFixed(VirtioMmioConfig),
     Pci,
+}
+
+#[derive(Eq, PartialEq, Debug, Copy, Clone, MeshPayload)]
+pub struct VirtioMmioConfig {
+    /// Guest-physical base of the 0x200-byte virtio-mmio register window.
+    pub address: u64,
+    /// Full GIC interrupt ID.
+    pub gsiv: u32,
 }
 
 /// Policy for the partition when mapping VTL0 memory late.

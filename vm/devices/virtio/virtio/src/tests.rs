@@ -1716,6 +1716,58 @@ async fn verify_chipset_config(driver: DefaultDriver) {
 }
 
 #[async_test]
+async fn verify_non_page_aligned_mmio_base(driver: DefaultDriver) {
+    const MMIO_BASE: u64 = 0x0a00_3e00;
+
+    let test_mem = VirtioTestMemoryAccess::new();
+    let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(TestDevice::new(
+            &driver_source,
+            DeviceTraits {
+                device_id: VirtioDeviceType::CONSOLE,
+                max_queues: 1,
+                device_register_length: 0,
+                ..Default::default()
+            },
+            None,
+        )),
+        &driver_source.simple(),
+        GuestMemory::new("test", test_mem.clone()),
+        LineInterrupt::detached(),
+        Some(doorbell_registration),
+        MMIO_BASE,
+        0x200,
+    )
+    .unwrap();
+
+    assert_eq!(dev.read_u32(MMIO_BASE), u32::from_le_bytes(*b"virt"));
+    assert_eq!(dev.read_u32(MMIO_BASE + 4), 2);
+    assert_eq!(
+        dev.get_static_regions(),
+        &[("virtio-chipset", MMIO_BASE..=MMIO_BASE + 0x1ff)]
+    );
+
+    dev.write_u32(MMIO_BASE + 0x70, VIRTIO_ACKNOWLEDGE);
+    dev.write_u32(MMIO_BASE + 0x70, VIRTIO_DRIVER);
+    dev.write_u32(MMIO_BASE + 0x24, 1);
+    dev.write_u32(MMIO_BASE + 0x20, VIRTIO_F_VERSION_1);
+    dev.write_u32(MMIO_BASE + 0x70, VIRTIO_FEATURES_OK);
+    dev.write_u32(MMIO_BASE + 0x70, VIRTIO_DRIVER_OK);
+    yield_and_poll_device(&mut dev).await;
+
+    assert_eq!(
+        test_mem
+            .installed_doorbells()
+            .iter()
+            .map(|doorbell| doorbell.address)
+            .collect::<Vec<_>>(),
+        [MMIO_BASE + 0x50]
+    );
+}
+
+#[async_test]
 async fn verify_pci_config(driver: DefaultDriver) {
     let mut pci_test_device =
         VirtioPciTestDevice::new(&driver, 1, &VirtioTestMemoryAccess::new(), None);
@@ -3174,7 +3226,11 @@ async fn verify_device_queue_simple_inner(
     .unwrap();
 
     guest.setup_chipset_device(&mut dev, features).await;
-
+    assert!(!target.is_high(0));
+    assert_eq!(
+        take_mmio_interrupt_status(&mut dev, VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE),
+        0
+    );
     guest.add_to_avail_queue(0);
     // notify device
     dev.write_u32(80, 0);
@@ -3256,7 +3312,11 @@ async fn verify_device_multi_queue_inner(
     )
     .unwrap();
     guest.setup_chipset_device(&mut dev, features).await;
-
+    assert!(!target.is_high(0));
+    assert_eq!(
+        take_mmio_interrupt_status(&mut dev, VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE),
+        0
+    );
     for i in 0..num_queues {
         guest.add_to_avail_queue(i);
         // notify device

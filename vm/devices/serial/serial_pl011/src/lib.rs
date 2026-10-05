@@ -66,7 +66,7 @@ pub struct SerialPl011 {
     #[inspect(skip)]
     debug_name: String,
     #[inspect(skip)]
-    mmio_region: (&'static str, RangeInclusive<u64>),
+    mmio_regions: Vec<(&'static str, RangeInclusive<u64>)>,
     /// Don't transmit until the guest sets RTS. This exists here for symmetry
     /// with the 16550 emulator, but it's not useful because this device is
     /// enumerated as an SBSA UART, which does not support the RTS bit (a full
@@ -165,6 +165,9 @@ pub enum ConfigurationError {
     /// The provided base address was not aligned to the register bank width.
     #[error("unaligned base address: {0}")]
     UnalignedBaseAddress(u64),
+    /// The same MMIO base address was specified more than once.
+    #[error("duplicate MMIO base address: {0:#x}")]
+    DuplicateMmioBase(u64),
     /// The specified register with was invalid.
     #[error("invalid register width: {0}")]
     InvalidRegisterWidth(u8),
@@ -173,8 +176,8 @@ pub enum ConfigurationError {
 impl SerialPl011 {
     /// Returns a new emulator instance.
     ///
-    /// `debug_name` is used to improve tracing statements. `base` is the base
-    /// IO port and will be used for an IO region spanning 8 bytes.
+    /// `debug_name` is used to improve tracing statements. `base` is the
+    /// primary base of the 4 KiB MMIO register region.
     pub fn new(
         debug_name: String,
         base: u64,
@@ -182,13 +185,52 @@ impl SerialPl011 {
         io: Box<dyn SerialIo>,
         debugger_poll_timer: Option<PolledTimer>,
     ) -> Result<Self, ConfigurationError> {
-        if base & (REGISTERS_SIZE - 1) != 0 {
-            return Err(ConfigurationError::UnalignedBaseAddress(base));
+        Self::new_with_mmio_aliases(
+            debug_name,
+            base,
+            Vec::new(),
+            interrupt,
+            io,
+            debugger_poll_timer,
+        )
+    }
+
+    /// Returns a new emulator instance with additional MMIO base addresses.
+    pub fn new_with_mmio_aliases(
+        debug_name: String,
+        base: u64,
+        mmio_aliases: Vec<u64>,
+        interrupt: LineInterrupt,
+        io: Box<dyn SerialIo>,
+        debugger_poll_timer: Option<PolledTimer>,
+    ) -> Result<Self, ConfigurationError> {
+        let mut mmio_bases = Vec::with_capacity(1 + mmio_aliases.len());
+        for base in std::iter::once(base).chain(mmio_aliases) {
+            if base & (REGISTERS_SIZE - 1) != 0 {
+                return Err(ConfigurationError::UnalignedBaseAddress(base));
+            }
+            if mmio_bases.contains(&base) {
+                return Err(ConfigurationError::DuplicateMmioBase(base));
+            }
+            mmio_bases.push(base);
         }
 
         let mut this = Self {
             debug_name,
-            mmio_region: ("registers", base..=base + (REGISTERS_SIZE - 1)),
+            mmio_regions: mmio_bases
+                .into_iter()
+                .enumerate()
+                .map(|(index, base)| {
+                    (
+                        if index == 0 {
+                            "registers"
+                        } else {
+                            "registers-alias"
+                        },
+                        base..=base + (REGISTERS_SIZE - 1),
+                    )
+                })
+                .collect(),
             wait_for_rts: false,
             state: State::new(io.is_connected()),
             interrupt,
@@ -843,7 +885,7 @@ impl MmioIntercept for SerialPl011 {
     }
 
     fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u64>)] {
-        std::slice::from_ref(&self.mmio_region)
+        &self.mmio_regions
     }
 }
 
@@ -1391,6 +1433,66 @@ mod tests {
             Register::UARTCR,
             UARTCR_RXE | UARTCR_TXE | UARTCR_UARTEN,
         );
+    }
+
+    #[test]
+    fn test_mmio_aliases_share_device_state() {
+        const ALIAS_BASE: u64 = 0x0900_0000;
+
+        let serial_io = SerialIoMock::new();
+        let mut serial = SerialPl011::new_with_mmio_aliases(
+            "com1".to_string(),
+            PL011_SERIAL0_BASE,
+            vec![ALIAS_BASE],
+            LineInterrupt::detached(),
+            Box::new(serial_io),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serial.get_static_regions(),
+            &[
+                (
+                    "registers",
+                    PL011_SERIAL0_BASE..=PL011_SERIAL0_BASE + REGISTERS_SIZE - 1
+                ),
+                (
+                    "registers-alias",
+                    ALIAS_BASE..=ALIAS_BASE + REGISTERS_SIZE - 1
+                ),
+            ]
+        );
+
+        write(&mut serial, Register::UARTIMSC, 0x123);
+        let mut data = [0; 2];
+        serial
+            .mmio_read(ALIAS_BASE + u64::from(Register::UARTIMSC.0), &mut data)
+            .unwrap();
+        assert_eq!(u16::from_ne_bytes(data), 0x123);
+    }
+
+    #[test]
+    fn test_mmio_aliases_reject_invalid_bases() {
+        let make = |aliases| {
+            SerialPl011::new_with_mmio_aliases(
+                "com1".to_string(),
+                PL011_SERIAL0_BASE,
+                aliases,
+                LineInterrupt::detached(),
+                Box::new(SerialIoMock::new()),
+                None,
+            )
+        };
+
+        assert!(matches!(
+            make(vec![PL011_SERIAL0_BASE]),
+            Err(ConfigurationError::DuplicateMmioBase(PL011_SERIAL0_BASE))
+        ));
+        assert!(matches!(
+            make(vec![0x0900_0001]),
+            Err(ConfigurationError::UnalignedBaseAddress(0x0900_0001))
+        ));
     }
 
     #[async_test]

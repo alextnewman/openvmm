@@ -132,9 +132,29 @@ pub struct GicV2mInfo {
     /// Physical base address of the guest-visible v2m MSI frame.
     #[cfg_attr(feature = "inspect", inspect(hex))]
     pub frame_base: u64,
+    /// Optional GICv3 distributor doorbell accepted for Hyper-V-compatible
+    /// message-based SPIs.
+    ///
+    /// This does not imply that `GICD_TYPER.MBIS` is advertised. Hyper-V keeps
+    /// that bit clear, while ACPI guests such as FreeBSD discover this path from
+    /// the Hyper-V platform contract.
+    pub mbi: Option<GicMbiInfo>,
     /// First GIC interrupt ID in the SPI range owned by this frame.
     pub spi_base: u32,
     /// Number of SPIs owned by this frame.
+    pub spi_count: u32,
+}
+
+/// Hyper-V-compatible GICv3 Message Based Interrupt parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "inspect", derive(inspect::Inspect))]
+pub struct GicMbiInfo {
+    /// Physical base address of the GICv3 distributor.
+    #[cfg_attr(feature = "inspect", inspect(hex))]
+    pub base: u64,
+    /// First GIC interrupt ID available for direct MBI delivery.
+    pub spi_base: u32,
+    /// Number of SPIs available for direct MBI delivery.
     pub spi_count: u32,
 }
 

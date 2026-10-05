@@ -290,6 +290,7 @@ underhill_config = { path = "vm/devices/get/underhill_config" }
 missing_dev = { path = "vm/devices/missing_dev" }
 missing_dev_resources = { path = "vm/devices/missing_dev_resources" }
 gdma = { path = "vm/devices/net/gdma" }
+gdma_contract = { path = "vm/devices/net/gdma_contract" }
 gdma_defs = { path = "vm/devices/net/gdma_defs" }
 gdma_resources = { path = "vm/devices/net/gdma_resources" }
 linux_net_bindings = { path = "vm/devices/net/linux_net_bindings" }

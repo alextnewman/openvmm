@@ -19,6 +19,10 @@ describes the source definitions.
   `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the
   product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--mana-conformance-scenario <NAME>`: Explicit MANA device behavior for two-sided conformance experiments. Requires `--mana` and `--mana-protocol-monitor`; accepted names are `baseline`, `constrained-eqs`, `short-stat-error`, and `bad-correlation`. Ordinary device behavior remains unchanged when the option is absent. See [MANA protocol examination](../../emulated/networking/mana.md) for the actual controls and evidence boundaries.
+
+* `--virt-timer-gsiv <GSIV>`: Select the full GIC INTID for the AArch64
+  virtual timer. Defaults to 20; QEMU `virt` uses 27.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:
@@ -176,6 +180,11 @@ describes the source definitions.
 * `--tpm [VERSION]`: Add a vTPM device. Supported versions are `138` and
   `185`; a bare `--tpm` uses version `185`. The dotted forms `1.38` and `1.85`
   are also accepted.
+
+* `--kernel <FILE>`: Direct-boot an executable image.
+* `--kernel-format <auto|linux|raw>`: Select direct-boot image handling.
+  AArch64 `auto` recognizes Linux `Image` headers and otherwise uses raw
+  loading. Raw loading is not supported on x86_64.
 * `--vmbus-scsi id=<name>[,sub_channels=<N>][,vtl2]`: Creates a
   named VMBus SCSI controller. Use with `--disk ...,on=<name>` to
   attach disks.
@@ -245,6 +254,11 @@ describes the source definitions.
   pidfile path will overwrite each other. Not written for short-lived utility
   modes such as `--write-saved-state-proto`.
 * `--nic`: Exposes a NIC using the Consomme user-mode NAT.
+* `--mana-protocol-monitor`: Enables passive examination of guest-driver
+  wire actions on explicitly configured `--mana` devices. Disabled by
+  default; it does not change command admission. Findings and per-rule
+  observation coverage appear in the device's inspector node. See
+  [MANA / GDMA protocol examination](../../emulated/networking/mana.md).
 * `--gfx`: Enable a graphical console over VNC (see below)
 * `--vnc-port <PORT>`: VNC server port (default: 5900)
 * `--vnc-listen <ADDRESS>`: VNC server bind address (default: `127.0.0.1`).
@@ -264,8 +278,7 @@ describes the source definitions.
   `pcie:PORT`, and `vpci`. Defaults to `auto`. A `pcie_port` prefix on either
   device option overrides this setting. Each PCIe port may be assigned to only
   one device, whether selected by `pcie:PORT` or a `pcie_port` prefix.
-* `--virtio-rng`: Add a virtio entropy (RNG) device, exposing `/dev/hwrng` in the Linux guest.
-  The guest kernel must have `CONFIG_HW_RANDOM_VIRTIO` enabled.
+* `--virtio-rng [OPTIONS]`: Add a virtio entropy (RNG) device, exposing `/dev/hwrng` in the Linux guest. Inline options include `bus=auto|mmio|pci|pcie:PORT|vpci`, `pcie_port=<PORT>`, or paired `mmio_base=<ADDRESS>,mmio_gsiv=<GSIV>`. The guest kernel must have `CONFIG_HW_RANDOM_VIRTIO` enabled. Standalone transport options remain accepted; contradictory inline and standalone settings are rejected.
 * `--virtio-rng-bus <BUS>`: Select the bus for the virtio-rng device. Accepted
   values are `auto`, `mmio`, `pci`, `pcie:PORT`, and `vpci`. Defaults to
   `auto`. `--virtio-rng-pcie-port` overrides this option.
@@ -285,6 +298,7 @@ describes the source definitions.
   guest RAM (the default memory backing). It uses identity-mapped DMA and
   does not support a non-identity virtual IOMMU. It conflicts with
   `--virtio-vsock-path`.
+
 * `--vhost-user <SOCKET_PATH>,type=<TYPE>[,tag=<NAME>][,num_queues=<N>][,queue_size=<N>][,pcie_port=<PORT>]`: Attach a
   vhost-user device backed by an external process over a Unix socket (Linux
   only). The backend process must already be listening on `SOCKET_PATH`.
@@ -316,6 +330,11 @@ Serial devices can be configured to appear as different devices inside the guest
   dropped bytes with its own retransmission. Debugger mode is chosen
   independently per COM port, so one port can talk to WinDbg while another
   behaves normally.
+  Append `mmio_base_alias=<ADDRESS>` to `--com1` or `--com2` to add a
+  4 KiB-aligned MMIO alias for that AArch64 PL011 device in a direct-boot VM,
+  for example `--com1 console,mmio_base_alias=0x09000000`. The alias maps the
+  same device state, backend, and interrupt and is not advertised in firmware
+  tables.
 * `--virtio-console <BACKEND>`: Expose a virtio console device (appears as
   `/dev/hvc0` inside the guest).
 
@@ -501,6 +520,20 @@ PCIe root port. The syntax varies slightly between device types:
 The optional `serial` value accepts 1-20 printable ASCII bytes except commas
 and brackets. If omitted, OpenVMM uses the disk ID or `openvmm-virtio-blk`.
 
+An AArch64 direct-boot guest can instead use an explicitly placed
+virtio-MMIO transport. `mmio_gsiv` is the full GIC interrupt ID:
+
+```sh
+--virtio-blk file:/path/to/disk.raw,mmio_base=0x0a003e00,mmio_gsiv=79
+--virtio-rng mmio_base=0x0a003a00,mmio_gsiv=77
+--virtio-net mmio_base=0x0a003c00:mmio_gsiv=78:consomme
+```
+
+The fixed transport uses a 0x200-byte register window and must fit below the
+direct-boot RAM base. It is mutually exclusive with `pcie_port` and is emitted
+in the generated device tree. The addresses above are explicit QEMU `virt`
+compatibility placements, not OpenVMM defaults.
+
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
 ```sh
@@ -515,9 +548,19 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 
 ```sh
 --virtio-net pcie_port=rp0:tap:tap0  # TAP is Linux-only
+--virtio-net mmio_base=0x0a003c00:mmio_gsiv=78:consomme
 --net pcie_port=rp0:consomme
 --mana pcie_port=rp0:tap:tap0        # TAP is Linux-only
 ```
+
+`--mana` exposes the emulated MANA/GDMA NIC. Use `consomme` instead of `tap:tap0` for user-mode NAT on macOS, Linux, or Windows. Without `pcie_port=`, the device is attached through VPCI.
+
+Two optional device modes apply to explicitly requested `--mana` devices and are disabled by default:
+
+- `--mana-bm-hostmode`: present PCI physical-function ID `1414:00b9` and report bare-metal host mode, for exercising the guest driver's bare-metal-host paths.
+- `--mana-pf-caps`: expose a PF capability register block reporting the emulated device's resource limits. This cannot be combined with `--mana-bm-hostmode`.
+
+On AArch64, the GICv2m MSI path also accepts Hyper-V-compatible GICv3 distributor doorbells when configured by the platform topology. Both doorbells deliver SPI pulses rather than persistent line assertions.
 
 **Filesystems and other virtio devices** (colon-prefixed):
 `--virtio-fs`, `--virtio-fs-shmem`, `--virtio-9p`, `--virtio-pmem`
@@ -529,10 +572,11 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 --virtio-pmem pcie_port=rp0:/path/to/file
 ```
 
-For `--virtio-rng` and `--virtio-console`, use their separate PCIe port flags:
+For virtio-rng, append the PCIe port to its device options. Virtio-console
+continues to use its separate PCIe port flag:
 
 ```sh
---virtio-rng --virtio-rng-pcie-port rp0
+--virtio-rng pcie_port=rp0
 --virtio-console console --virtio-console-pcie-port rp0
 ```
 

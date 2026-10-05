@@ -107,3 +107,13 @@ grep -r "crate_name" Guide/src/
 # Find placeholder topics (empty links) in SUMMARY.md
 grep '()\s*$' Guide/src/SUMMARY.md
 ```
+
+## MANA code owners
+
+| Code path | Guide page |
+|---|---|
+| `vm/devices/net/gdma/` | `reference/emulated/networking/mana.md` |
+| `vm/devices/net/gdma_contract/` | `reference/emulated/networking/mana.md` |
+| `vm/devices/net/gdma_resources/` | `reference/emulated/networking/mana.md` |
+
+Changes to the MANA examiner's rules, observation scope, evidence retention, or activation surface must reconcile the MANA page. CLI changes also update `reference/openvmm/management/cli.md`.

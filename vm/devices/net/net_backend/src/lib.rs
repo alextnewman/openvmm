@@ -204,7 +204,9 @@ pub trait Queue: Send + InspectMut {
 
     /// Posts transmits to the device.
     ///
-    /// Returns `Ok(false)` if the segments will complete asynchronously.
+    /// Returns whether accepted packets completed synchronously and the number
+    /// of segments accepted. A backend must only stop at a packet boundary; the
+    /// caller retains and may retry all unaccepted segments.
     fn tx_avail(
         &mut self,
         pool: &mut dyn BufferAccess,
@@ -214,6 +216,32 @@ pub trait Queue: Send + InspectMut {
     /// Polls the device for transmit completions.
     fn tx_poll(&mut self, pool: &mut dyn BufferAccess, done: &mut [TxId])
     -> Result<usize, TxError>;
+
+    /// Polls the device for transmit completions with per-packet status.
+    ///
+    /// Backends that only report successful completion IDs may use this default
+    /// implementation. Backends that can report packet-specific failures should
+    /// override it so frontends do not turn failed offloads into successful
+    /// completions.
+    fn tx_poll_with_status(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        done: &mut [TxCompletion],
+    ) -> Result<usize, TxError> {
+        let mut completed = 0;
+        for completion in done {
+            let mut id = [TxId(0)];
+            if self.tx_poll(pool, &mut id)? == 0 {
+                break;
+            }
+            *completion = TxCompletion {
+                id: id[0],
+                status: TxCompletionStatus::Success,
+            };
+            completed += 1;
+        }
+        Ok(completed)
+    }
 
     /// Get queue statistics
     fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {

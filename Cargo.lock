@@ -2872,23 +2872,34 @@ dependencies = [
  "chipset_device",
  "device_emulators",
  "futures",
+ "gdma_contract",
  "gdma_defs",
  "gdma_resources",
  "guestmem",
  "inspect",
+ "mesh",
  "net_backend",
  "net_backend_resources",
  "parking_lot",
  "pci_core",
  "pci_resources",
+ "serde_json",
  "slab",
  "task_control",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
  "vm_resource",
  "vmcore",
  "zerocopy",
+]
+
+[[package]]
+name = "gdma_contract"
+version = "0.0.0"
+dependencies = [
+ "test_with_tracing",
 ]
 
 [[package]]
@@ -4540,10 +4551,12 @@ name = "mana_driver"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "build_info",
  "chipset_device",
  "futures",
  "gdma",
+ "gdma_contract",
  "gdma_defs",
  "getrandom 0.4.2",
  "inspect",
@@ -5108,6 +5121,7 @@ dependencies = [
  "net_backend",
  "page_pool_alloc",
  "pal_async",
+ "parking_lot",
  "pci_core",
  "safeatomic",
  "test_with_tracing",
@@ -6032,6 +6046,7 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
+ "loader",
  "memory_range",
  "mesh",
  "mesh_process",
@@ -9772,6 +9787,7 @@ dependencies = [
  "memory_range",
  "open_enum",
  "parking_lot",
+ "pci_core",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",

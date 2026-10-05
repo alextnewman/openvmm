@@ -74,6 +74,8 @@ hostfwd=<proto>:[<hostaddr>]:<hostport>-[<guestaddr>]:<guestport>
 | `guestaddr` | Currently ignored — traffic always forwards to the guest IP |
 | `guestport` | Guest port to forward to |
 
+UDP forwarding retains the virtual-to-real remote endpoint for an inbound flow and sends the guest's reply through the same bound host listener. Connected UDP clients therefore receive the reply from the advertised forwarding port, not an unrelated outbound NAT port. Return paths share the configured UDP idle timeout and have a bounded per-listener peer table; exhausted tracking drops new inbound flows with a diagnostic instead of publishing a flow whose reply endpoint cannot be preserved.
+
 Multiple forwards can be specified with commas:
 
 ```bash

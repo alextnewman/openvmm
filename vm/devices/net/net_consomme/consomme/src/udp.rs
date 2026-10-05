@@ -60,6 +60,8 @@ use std::time::Instant;
 
 use crate::DNS_PORT;
 
+const MAX_FORWARD_PEERS: usize = 1024;
+
 #[cfg(unix)]
 use crate::unix as platform;
 #[cfg(windows)]
@@ -103,7 +105,16 @@ struct UdpListener {
     host_addr: SocketAddr,
     /// The guest port to forward received packets to.
     guest_port: u16,
+    #[inspect(skip)]
+    return_paths: HashMap<SocketAddr, ForwardPeer>,
+    #[inspect(skip)]
+    gso_size: Option<u16>,
     stats: Stats,
+}
+
+struct ForwardPeer {
+    host_address: SocketAddr,
+    last_activity: Instant,
 }
 
 #[derive(InspectMut)]
@@ -127,6 +138,7 @@ struct Stats {
     tx_dropped: Counter,
     tx_errors: Counter,
     rx_packets: Counter,
+    rx_dropped: Counter,
 }
 
 impl UdpConnection {
@@ -213,6 +225,44 @@ impl UdpConnection {
 }
 
 impl UdpListener {
+    fn reply_to_forwarded_peer(
+        &mut self,
+        virtual_peer: SocketAddr,
+        payload: &[u8],
+        gso: Option<u16>,
+    ) -> Option<Result<(), DropReason>> {
+        let peer = self.return_paths.get_mut(&virtual_peer)?;
+        let Some(socket) = self.socket.as_ref() else {
+            return Some(Err(DropReason::Io(std::io::Error::new(
+                ErrorKind::NotConnected,
+                "UDP forward listener is not bound",
+            ))));
+        };
+        let socket = socket.get();
+        if self.gso_size != gso {
+            if let Err(error) = platform::set_udp_gso_size(socket, gso.unwrap_or(0)) {
+                return Some(Err(DropReason::Io(error)));
+            }
+            self.gso_size = gso;
+        }
+        let result = platform::send_to(socket, payload, &peer.host_address, gso);
+        Some(match result {
+            Ok(_) => {
+                peer.last_activity = Instant::now();
+                self.stats.tx_packets.increment();
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                self.stats.tx_dropped.increment();
+                Err(DropReason::SendBufferFull)
+            }
+            Err(error) => {
+                self.stats.tx_errors.increment();
+                Err(DropReason::Io(error))
+            }
+        })
+    }
+
     fn poll_listener(
         &mut self,
         cx: &mut Context<'_>,
@@ -239,6 +289,7 @@ impl UdpListener {
                     .recv_from(&mut eth.payload_mut()[header_offset..])
             }) {
                 Poll::Ready(Ok((n, mut other_addr))) => {
+                    let host_address = other_addr;
                     // Check if this connection originated from the same guest in order to adjust
                     // the port in the crafted packet to match the guest value.
                     if state.params.is_local_address(&other_addr) {
@@ -257,6 +308,25 @@ impl UdpListener {
                     ) else {
                         continue;
                     };
+                    if self.return_paths.len() >= MAX_FORWARD_PEERS
+                        && !self.return_paths.contains_key(&ft.src)
+                    {
+                        self.stats.rx_dropped.increment();
+                        tracelimit::warn_ratelimited!(
+                            guest_port = self.guest_port,
+                            "UDP forward peer tracking budget exhausted",
+                        );
+                        continue;
+                    }
+                    // A reply must use this bound host port, not a fresh
+                    // outbound NAT socket that a connected UDP peer rejects.
+                    self.return_paths.insert(
+                        ft.src,
+                        ForwardPeer {
+                            host_address,
+                            last_activity: Instant::now(),
+                        },
+                    );
                     tracing::trace!(
                         ?other_addr,
                         guest_port = self.guest_port,
@@ -313,6 +383,9 @@ impl<T: Client> Access<'_, T> {
         });
 
         for listener in self.inner.udp.listeners.values_mut() {
+            listener
+                .return_paths
+                .retain(|_, peer| now.duration_since(peer.last_activity) <= timeout);
             listener.poll_listener(
                 cx,
                 &mut self.inner.state,
@@ -453,6 +526,14 @@ impl<T: Client> Access<'_, T> {
             }
         };
 
+        let forward_key = PortForwardKey::from_socket_addr(guest_addr, guest_addr.port());
+        if let Some(listener) = self.inner.udp.listeners.get_mut(&forward_key)
+            && let Some(result) =
+                listener.reply_to_forwarded_peer(dst_sock_addr, udp_packet.payload(), checksum.gso)
+        {
+            return result;
+        }
+
         // Resolve virtual mapped addresses back to the real host address.
         let mut dst_sock_addr = self.inner.state.resolve_destination(&dst_sock_addr);
         if self.inner.state.params.is_local_address(&dst_sock_addr) {
@@ -586,6 +667,8 @@ impl<T: Client> Access<'_, T> {
                 socket: Some(socket),
                 host_addr,
                 guest_port,
+                return_paths: HashMap::new(),
+                gso_size: None,
                 stats: Default::default(),
             },
         );
@@ -941,7 +1024,8 @@ mod tests {
 
         // Send a UDP packet to the listener from another socket.
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender.send_to(b"hello", host_addr).unwrap();
+        sender.connect(host_addr).unwrap();
+        sender.send(b"hello").unwrap();
 
         // Poll until the forwarded packet arrives (the first poll registers
         // interest, subsequent polls receive the data).
@@ -966,8 +1050,8 @@ mod tests {
         }
 
         // Verify the packet targets the guest IP and the correct guest port.
-        let packets = packets.lock();
-        let pkt = &packets[0];
+        let packet = packets.lock()[0].clone();
+        let pkt = &packet;
         let eth = EthernetFrame::new_unchecked(pkt.as_slice());
         let ipv4 = Ipv4Packet::new_unchecked(eth.payload());
         let udp = UdpPacket::new_unchecked(ipv4.payload());
@@ -976,6 +1060,33 @@ mod tests {
             guest_port,
             "forwarded packet should target the guest port"
         );
+        let virtual_peer: Ipv4Address = ipv4.src_addr();
+        let peer_port = udp.src_port();
+        let params = access.inner.state.params.clone();
+        let reply = b"reply";
+        let mut buffer =
+            vec![0; ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN + reply.len()];
+        buffer[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN..].copy_from_slice(reply);
+        let length = build_udp_packet(
+            &mut EthernetFrame::new_unchecked(&mut buffer[..]),
+            IpAddress::Ipv4(params.client_ip),
+            IpAddress::Ipv4(virtual_peer),
+            guest_port,
+            peer_port,
+            reply.len(),
+            params.client_mac,
+            params.gateway_mac,
+        );
+        access
+            .send(&buffer[..length], &ChecksumState::NONE)
+            .unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut received = [0; 32];
+        let count = sender.recv(&mut received).unwrap();
+        assert_eq!(&received[..count], reply);
+        assert_eq!(sender.peer_addr().unwrap(), host_addr);
     }
 
     #[pal_async::async_test]
@@ -1007,6 +1118,41 @@ mod tests {
         assert!(
             matches!(err, BindError::PortAlreadyBound(_)),
             "error should be PortAlreadyBound"
+        );
+    }
+
+    #[pal_async::async_test]
+    async fn test_udp_forward_peer_timeout_does_not_retain_stale_return_endpoints(
+        driver: DefaultDriver,
+    ) {
+        let driver = Arc::new(driver);
+        let mut consomme = create_consomme_with_timeout(Duration::from_millis(100));
+        let mut client = TestClient::new(driver);
+        let socket = Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        socket
+            .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let mut access = consomme.access(&mut client);
+        access.bind_udp_port(socket, 5555).unwrap();
+        let listener = access
+            .inner
+            .udp
+            .listeners
+            .get_mut(&PortForwardKey::new(IpVersion::Ipv4, 5555))
+            .unwrap();
+        listener.return_paths.insert(
+            "10.0.0.254:40000".parse().unwrap(),
+            ForwardPeer {
+                host_address: "127.0.0.1:40000".parse().unwrap(),
+                last_activity: Instant::now() - Duration::from_millis(150),
+            },
+        );
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        access.poll(&mut cx);
+        assert!(
+            access.inner.udp.listeners[&PortForwardKey::new(IpVersion::Ipv4, 5555)]
+                .return_paths
+                .is_empty()
         );
     }
 

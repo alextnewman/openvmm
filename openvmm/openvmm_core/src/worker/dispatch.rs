@@ -565,6 +565,7 @@ impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
                     None => PmuGsivConfig::Disabled,
                 },
                 gic_msi: Default::default(),
+                virt_timer_gsiv: Some(self.virt_timer_ppi()),
             })),
         }
     }
@@ -585,9 +586,12 @@ fn build_aarch64_topology(
     use openvmm_defs::config::GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
     use vm_topology::processor::aarch64::GicItsInfo;
+    use vm_topology::processor::aarch64::GicMbiInfo;
     use vm_topology::processor::aarch64::GicMsiController;
     use vm_topology::processor::aarch64::GicV2mInfo;
 
+    // FreeBSD's Hyper-V ACPI path allocates distributor-backed MSIs from SPI 64.
+    const HYPERV_GIC_MBI_SPI_BASE: u32 = 64;
     const DEFAULT_GIC_V2M_SPI_COUNT: u32 = 64;
 
     let arch = match &config.arch {
@@ -595,6 +599,13 @@ fn build_aarch64_topology(
         Some(ArchTopologyConfig::Aarch64(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
+    let virt_timer_ppi = arch
+        .virt_timer_gsiv
+        .unwrap_or(openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI);
+    anyhow::ensure!(
+        (16..32).contains(&virt_timer_ppi),
+        "virtual timer GSIV {virt_timer_ppi} is not a GIC PPI"
+    );
 
     let pmu_gsiv = match arch.pmu_gsiv {
         PmuGsivConfig::Disabled => None,
@@ -692,8 +703,16 @@ fn build_aarch64_topology(
 
     // Build the GIC MSI controller from resolved SPIs.
     let gic_msi = if let Some(count) = v2m_spi_count {
+        // FreeBSD's Hyper-V path derives the MBI limit from GICD_TYPER, so this
+        // range must extend through the final SPI advertised by the GIC.
+        let mbi = (!is_gicv2 && gic_nr_irqs > HYPERV_GIC_MBI_SPI_BASE).then_some(GicMbiInfo {
+            base: gic_distributor_base,
+            spi_base: HYPERV_GIC_MBI_SPI_BASE,
+            spi_count: gic_nr_irqs - HYPERV_GIC_MBI_SPI_BASE,
+        });
         GicMsiController::V2m(GicV2mInfo {
             frame_base: openvmm_defs::config::DEFAULT_GIC_V2M_MSI_FRAME_BASE,
+            mbi,
             spi_base: spi_layout
                 .v2m_spi_base
                 .expect("v2m base must be allocated when v2m_spi_count is Some"),
@@ -710,7 +729,7 @@ fn build_aarch64_topology(
         gic_version,
         gic_msi,
         pmu_gsiv,
-        virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
+        virt_timer_ppi,
         gic_nr_irqs,
     };
 
@@ -790,6 +809,7 @@ mod tests {
             cmdline: String::new(),
             enable_serial: false,
             isolation,
+            image_format: openvmm_defs::config::DirectBootImageFormat::Linux,
             boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
             smbios: Box::default(),
         }
@@ -920,6 +940,7 @@ struct LoadedVmInner {
     virtio_mmio_region: MemoryRange,
     #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_irq: u32,
+    fixed_virtio_mmio: Vec<openvmm_defs::config::VirtioMmioConfig>,
     /// Resolved chipset MMIO ranges.
     chipset_mmio: ChipsetMmioRanges,
     /// ((device, function), interrupt)
@@ -1292,7 +1313,7 @@ impl InitializedVm {
             .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
             .count();
 
-        // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
+        // On aarch64 direct boot, start RAM at 1 GiB to avoid the low GPA
         // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
         // doorbell in IOVA space. Without this gap, iommufd identity-mapped DMA
         // for passthrough devices fails because it cannot allocate IOVAs in
@@ -1310,6 +1331,53 @@ impl InitializedVm {
             } else {
                 0
             };
+
+        #[cfg(not(guest_arch = "aarch64"))]
+        if cfg
+            .virtio_devices
+            .iter()
+            .any(|(bus, _)| matches!(bus, VirtioBus::MmioFixed(_)))
+        {
+            anyhow::bail!("fixed virtio-mmio placement is only supported on aarch64");
+        }
+
+        #[cfg(guest_arch = "aarch64")]
+        {
+            const VIRTIO_MMIO_FIXED_SIZE: u64 = 0x200;
+            let mut fixed_ranges = Vec::new();
+            for (bus, _) in &cfg.virtio_devices {
+                let VirtioBus::MmioFixed(mmio) = bus else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    mmio.address.is_multiple_of(VIRTIO_MMIO_FIXED_SIZE),
+                    "fixed virtio-mmio address {:#x} is not 0x200-byte aligned",
+                    mmio.address
+                );
+                let end = mmio
+                    .address
+                    .checked_add(VIRTIO_MMIO_FIXED_SIZE)
+                    .context("fixed virtio-mmio range overflows the GPA space")?;
+                anyhow::ensure!(
+                    ram_start_address != 0 && end <= ram_start_address,
+                    "fixed virtio-mmio range {:#x}..{end:#x} must fit below the direct-boot RAM base",
+                    mmio.address
+                );
+                anyhow::ensure!(
+                    (32..processor_topology.gic_nr_irqs()).contains(&mmio.gsiv),
+                    "fixed virtio-mmio GSIV {} is outside the configured GIC SPI range",
+                    mmio.gsiv
+                );
+                let range = mmio.address..end;
+                anyhow::ensure!(
+                    fixed_ranges.iter().all(|existing: &std::ops::Range<u64>| {
+                        existing.end <= range.start || range.end <= existing.start
+                    }),
+                    "fixed virtio-mmio range {range:#x?} overlaps another fixed virtio-mmio device"
+                );
+                fixed_ranges.push(range);
+            }
+        }
 
         let vtl2_framebuffer_size = if cfg.vtl2_gfx {
             cfg.framebuffer
@@ -1620,6 +1688,15 @@ impl InitializedVm {
             igvm_file,
             driver_source,
         } = self;
+
+        let fixed_virtio_mmio = cfg
+            .virtio_devices
+            .iter()
+            .filter_map(|(bus, _)| match bus {
+                VirtioBus::MmioFixed(mmio) => Some(*mmio),
+                _ => None,
+            })
+            .collect();
 
         let mut resolver = ResourceResolver::new();
 
@@ -3078,6 +3155,26 @@ impl InitializedVm {
                         )
                     })?;
                 }
+                VirtioBus::MmioFixed(mmio) => {
+                    const GIC_SPI_BASE: u32 = 32;
+                    let irq = mmio
+                        .gsiv
+                        .checked_sub(GIC_SPI_BASE)
+                        .context("fixed virtio-mmio GSIV is not a GIC SPI")?;
+                    let id = format!("{id}-{}", mmio.address);
+                    let gm = gm.clone();
+                    chipset_builder.arc_mutex_device(id).try_add(|services| {
+                        VirtioMmioDevice::new(
+                            device.0,
+                            &driver_source.simple(),
+                            gm,
+                            services.new_line(IRQ_LINE_SET, "interrupt", irq),
+                            partition.clone().into_doorbell_registration(Vtl::Vtl0),
+                            mmio.address,
+                            0x200,
+                        )
+                    })?;
+                }
                 VirtioBus::Pci => {
                     let pci_inta_line = pci_inta_line.context("missing PCI INT#A line")?;
 
@@ -3212,6 +3309,7 @@ impl InitializedVm {
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
                 virtio_mmio_irq,
+                fixed_virtio_mmio,
                 chipset_mmio,
                 pci_legacy_interrupts,
                 igvm_file,
@@ -3370,7 +3468,11 @@ impl LoadedVmInner {
                 isolation,
                 boot_mode,
                 ref smbios,
+                image_format,
             } => {
+                if image_format == openvmm_defs::config::DirectBootImageFormat::Raw {
+                    anyhow::bail!("raw direct-boot images are not supported on x86_64");
+                }
                 match boot_mode {
                     openvmm_defs::config::LinuxDirectBootMode::DeviceTree => {
                         anyhow::bail!("device tree boot mode is not supported on x86_64");
@@ -3411,6 +3513,8 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation,
                     smbios,
+                    image_format,
+                    fixed_virtio_mmio: &self.fixed_virtio_mmio,
                 };
                 super::vm_loaders::linux::load_linux_x86(
                     &kernel_config,
@@ -3448,6 +3552,7 @@ impl LoadedVmInner {
                 isolation,
                 boot_mode,
                 ref smbios,
+                image_format,
             } => {
                 use openvmm_defs::config::LinuxDirectBootMode;
 
@@ -3461,6 +3566,8 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation: super::vm_loaders::linux::KernelIsolationConfig::None,
                     smbios,
+                    image_format,
+                    fixed_virtio_mmio: &self.fixed_virtio_mmio,
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
@@ -3484,7 +3591,7 @@ impl LoadedVmInner {
                         IommuDevices::Smmu(devices) => &devices.configs,
                         IommuDevices::None => &[],
                     };
-                super::vm_loaders::linux::load_linux_arm64(
+                super::vm_loaders::linux::load_direct_arm64(
                     &kernel_config,
                     &self.gm,
                     enable_serial,

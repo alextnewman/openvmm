@@ -125,10 +125,14 @@ impl PetriVmConfigOpenVmm {
                 vtl: DeviceVtl::Vtl2,
                 instance_id: MANA_INSTANCE,
                 resource: GdmaDeviceHandle {
+                    protocol_monitor: false,
+                    conformance_scenario: None,
+                    pf_caps: false,
                     vports: vec![VportDefinition {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,
                     }],
+                    bm_hostmode: false,
                 }
                 .into_resource(),
                 vnode: None,
@@ -193,7 +197,14 @@ impl PetriVmConfigOpenVmm {
         self.config.vpci_devices.push(VpciDeviceConfig {
             vtl: DeviceVtl::Vtl2,
             instance_id,
-            resource: GdmaDeviceHandle { vports }.into_resource(),
+            resource: GdmaDeviceHandle {
+                protocol_monitor: false,
+                conformance_scenario: None,
+                pf_caps: false,
+                bm_hostmode: false,
+                vports,
+            }
+            .into_resource(),
             vnode: None,
         });
         vtl2_settings.dynamic.as_mut().unwrap().nic_devices.push(
@@ -218,10 +229,14 @@ impl PetriVmConfigOpenVmm {
         self.config.pcie_devices.push(PcieDeviceConfig {
             port_name: port_name.to_string(),
             resource: GdmaDeviceHandle {
+                protocol_monitor: false,
+                conformance_scenario: None,
+                pf_caps: false,
                 vports: vec![VportDefinition {
                     mac_address,
                     endpoint,
                 }],
+                bm_hostmode: false,
             }
             .into_resource(),
         });
@@ -366,10 +381,15 @@ impl PetriVmConfigOpenVmm {
                 vtl: DeviceVtl::Vtl2,
                 instance_id: MANA_INSTANCE,
                 resource: GdmaDeviceHandle {
+                    protocol_monitor: false,
+                    conformance_scenario: None,
+                    pf_caps: false,
                     vports: vec![VportDefinition {
                         mac_address: NIC_MAC_ADDRESS,
                         endpoint,
                     }],
+                    bm_hostmode: false,
+                    pf_caps: false,
                 }
                 .into_resource(),
                 vnode: None,

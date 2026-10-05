@@ -932,6 +932,7 @@ impl VmService {
                         cmdline: boot.kernel_cmdline,
                         enable_serial: true,
                         isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                        image_format: openvmm_defs::config::DirectBootImageFormat::Linux,
                         boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                         smbios,
                     },

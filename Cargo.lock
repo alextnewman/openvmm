@@ -9777,8 +9777,10 @@ name = "virt_hvf"
 version = "0.0.0"
 dependencies = [
  "aarch64defs",
+ "aarch64emu",
  "anyhow",
  "build_rs_guest_arch",
+ "cc",
  "guestmem",
  "hv1_emulator",
  "hv1_hypercall",
@@ -9788,10 +9790,12 @@ dependencies = [
  "open_enum",
  "parking_lot",
  "pci_core",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
  "virt",
+ "virt_support_aarch64emu",
  "virt_support_gic",
  "vm_topology",
  "vmcore",

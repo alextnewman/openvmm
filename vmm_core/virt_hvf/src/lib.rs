@@ -10,6 +10,7 @@
 #![expect(unsafe_code)]
 
 mod abi;
+mod emu;
 mod hypercall;
 mod vp_state;
 
@@ -55,6 +56,7 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context as TaskContext;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -81,6 +83,7 @@ use vmcore::vmtime::VmTime;
 use vmcore::vmtime::VmTimeAccess;
 
 const HV_ARM64_HVC_SMCCC_IDENTIFIER: u32 = (1 << 30) | (6 << 24) | 1;
+const PHYSICAL_TIMER_PPI: u32 = 19;
 
 #[derive(Debug)]
 pub struct HvfHypervisor;
@@ -834,6 +837,7 @@ impl BindProcessor for HvfProcessorBinder {
             hv1: state.hv1,
             vmtime: state.vmtime,
             pmu: PmuState::default(),
+            physical_timer: PhysicalTimer::default(),
             crash_regs: Default::default(),
             synthetic_vbar_el1: 0,
             tlbi_control: 0,
@@ -855,7 +859,7 @@ impl BindProcessor for HvfProcessorBinder {
 #[derive(InspectMut)]
 pub struct HvfProcessor<'a> {
     #[inspect(skip)]
-    partition: &'a HvfPartitionInner,
+    partition: &'a Arc<HvfPartitionInner>,
     #[inspect(flatten)]
     inner: &'a HvfVpInner,
     gicr: gic::Redistributor,
@@ -866,6 +870,7 @@ pub struct HvfProcessor<'a> {
     wfi: bool,
     on: bool,
     pmu: PmuState,
+    physical_timer: PhysicalTimer,
     #[inspect(skip)]
     crash_regs: hypercall::GuestCrashRegisters,
     synthetic_vbar_el1: u64,
@@ -940,6 +945,27 @@ impl HvfVcpu {
             self.set_sys_reg(reg, value)
                 .expect("unrecoverable failure to set SP")
         }
+    }
+
+    fn q(&self, n: u8) -> u128 {
+        assert!(n < 32);
+        let mut value = [0u8; 16];
+        // SAFETY: the shim writes one SIMD register to the valid 16-byte buffer.
+        unsafe {
+            abi::openvmm_hv_vcpu_get_simd_fp_reg(self.vcpu, u32::from(n), value.as_mut_ptr())
+        }
+        .chk()
+        .expect("unrecoverable error getting SIMD register");
+        u128::from_ne_bytes(value)
+    }
+
+    fn set_q(&mut self, n: u8, value: u128) {
+        assert!(n < 32);
+        let value = value.to_ne_bytes();
+        // SAFETY: the shim reads one SIMD register from the valid 16-byte buffer.
+        unsafe { abi::openvmm_hv_vcpu_set_simd_fp_reg(self.vcpu, u32::from(n), value.as_ptr()) }
+            .chk()
+            .expect("unrecoverable error setting SIMD register");
     }
 
     fn pc(&self) -> u64 {
@@ -1019,6 +1045,120 @@ fn vtimer_wait_duration(counter: u64, compare: u64, frequency: NonZeroU64) -> Op
         )
         .min(MAX_HOST_TIMER_WAIT),
     )
+}
+
+#[derive(Debug, Default, Inspect)]
+struct PhysicalTimer {
+    control: u64,
+    compare: u64,
+}
+
+impl PhysicalTimer {
+    const ENABLE: u64 = 1 << 0;
+    const IMASK: u64 = 1 << 1;
+    const ISTATUS: u64 = 1 << 2;
+
+    fn output_asserted(&self, counter: u64) -> bool {
+        self.control & Self::ENABLE != 0
+            && self.control & Self::IMASK == 0
+            && self.compare <= counter
+    }
+
+    fn read(&self, reg: SystemReg, counter: u64) -> Option<u64> {
+        Some(match reg {
+            SystemReg::CNTP_CTL_EL0 => {
+                self.control
+                    | if self.compare <= counter {
+                        Self::ISTATUS
+                    } else {
+                        0
+                    }
+            }
+            SystemReg::CNTP_CVAL_EL0 => self.compare,
+            SystemReg::CNTP_TVAL_EL0 => self.compare.wrapping_sub(counter) as u32 as u64,
+            _ => return None,
+        })
+    }
+
+    fn write(&mut self, reg: SystemReg, value: u64, counter: u64) -> bool {
+        match reg {
+            SystemReg::CNTP_CTL_EL0 => self.control = value & (Self::ENABLE | Self::IMASK),
+            SystemReg::CNTP_CVAL_EL0 => self.compare = value,
+            SystemReg::CNTP_TVAL_EL0 => {
+                self.compare = counter.wrapping_add(value as u32 as i32 as i64 as u64);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn deadline(&self, counter: u64, now: VmTime, frequency: NonZeroU64) -> Option<VmTime> {
+        if self.control & Self::ENABLE == 0 || self.control & Self::IMASK != 0 {
+            return None;
+        }
+        vtimer_wait_duration(counter, self.compare, frequency)
+            .map(|duration| now.wrapping_add(duration))
+    }
+}
+
+struct TimerWake {
+    partition: Weak<HvfPartitionInner>,
+    vp_index: VpIndex,
+}
+
+impl std::task::Wake for TimerWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(partition) = self.partition.upgrade() {
+            let vp = &partition.vps[self.vp_index.index() as usize];
+            vp.cancel_run();
+            vp.wake();
+        }
+    }
+}
+
+#[cfg(test)]
+mod physical_timer_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn registers_preserve_signed_tval_and_level_output() {
+        let mut timer = PhysicalTimer::default();
+        assert!(timer.write(SystemReg::CNTP_TVAL_EL0, 25, 100));
+        assert_eq!(timer.read(SystemReg::CNTP_CVAL_EL0, 100), Some(125));
+        assert_eq!(timer.read(SystemReg::CNTP_TVAL_EL0, 110), Some(15));
+        assert!(timer.write(SystemReg::CNTP_CTL_EL0, PhysicalTimer::ENABLE, 110));
+        assert!(!timer.output_asserted(124));
+        assert!(timer.output_asserted(125));
+        assert!(timer.write(SystemReg::CNTP_CTL_EL0, PhysicalTimer::IMASK, 125));
+        assert!(!timer.output_asserted(125));
+        assert!(timer.write(SystemReg::CNTP_TVAL_EL0, u32::MAX.into(), 100));
+        assert_eq!(timer.read(SystemReg::CNTP_CVAL_EL0, 100), Some(99));
+    }
+
+    #[test]
+    fn disabled_or_masked_timer_does_not_arm_a_host_wait() {
+        let mut timer = PhysicalTimer::default();
+        let now = VmTime::from_100ns(50);
+        let frequency = NonZeroU64::new(10).unwrap();
+        assert_eq!(timer.deadline(100, now, frequency), None);
+        timer.write(SystemReg::CNTP_CVAL_EL0, 125, 100);
+        timer.write(SystemReg::CNTP_CTL_EL0, PhysicalTimer::ENABLE, 100);
+        assert_eq!(
+            timer.deadline(100, now, frequency),
+            Some(now.wrapping_add(Duration::new(2, 500_000_000)))
+        );
+        timer.write(
+            SystemReg::CNTP_CTL_EL0,
+            PhysicalTimer::ENABLE | PhysicalTimer::IMASK,
+            100,
+        );
+        assert_eq!(timer.deadline(100, now, frequency), None);
+    }
 }
 
 fn read_cntfrq() -> u64 {
@@ -1153,6 +1293,7 @@ impl HvfProcessor<'_> {
         self.vcpu.set_gp(0, cpu_on.x0);
         self.wfi = false;
         self.on = true;
+        self.physical_timer = PhysicalTimer::default();
         self.inner.power_state.store(VP_ON, Ordering::Release);
     }
 
@@ -1305,6 +1446,10 @@ impl<'p> Processor for HvfProcessor<'p> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         let vp_index = self.inner.vp_info.base.vp_index;
+        let timer_waker = Waker::from(Arc::new(TimerWake {
+            partition: Arc::downgrade(self.partition),
+            vp_index,
+        }));
         let mut last_waker = None;
         loop {
             self.inner.needs_yield.maybe_yield().await;
@@ -1334,6 +1479,22 @@ impl<'p> Processor for HvfProcessor<'p> {
 
                     if !self.on {
                         return Poll::Pending;
+                    }
+
+                    // SAFETY: the physical system counter has no read side effects.
+                    let counter = unsafe { abi::mach_absolute_time() };
+                    self.gicr.set_pending(
+                        PHYSICAL_TIMER_PPI,
+                        self.physical_timer.output_asserted(counter),
+                    );
+                    if let Some(deadline) = self.physical_timer.deadline(
+                        counter,
+                        self.vmtime.now(),
+                        NonZeroU64::new(read_cntfrq()).ok_or_else(|| {
+                            dev.fatal_error(anyhow::anyhow!("CNTFRQ_EL0 is zero").into())
+                        })?,
+                    ) {
+                        self.vmtime.set_timeout_if_before(deadline);
                     }
 
                     self.hv1
@@ -1393,7 +1554,11 @@ impl<'p> Processor for HvfProcessor<'p> {
                         if let Some(deadline) = vtimer_deadline {
                             self.vmtime.set_timeout_if_before(deadline);
                         }
-                        if self.vmtime.poll_timeout(cx).is_ready() {
+                        if self
+                            .vmtime
+                            .poll_timeout(&mut TaskContext::from_waker(&timer_waker))
+                            .is_ready()
+                        {
                             if vtimer_deadline
                                 .is_some_and(|deadline| !deadline.is_after(self.vmtime.now()))
                             {
@@ -1404,7 +1569,11 @@ impl<'p> Processor for HvfProcessor<'p> {
                         return Poll::Pending;
                     }
 
-                    if self.vmtime.poll_timeout(cx).is_ready() {
+                    if self
+                        .vmtime
+                        .poll_timeout(&mut TaskContext::from_waker(&timer_waker))
+                        .is_ready()
+                    {
                         continue;
                     }
 
@@ -1451,10 +1620,15 @@ impl<'p> Processor for HvfProcessor<'p> {
                         ExceptionClass::DATA_ABORT_LOWER => {
                             let iss = IssDataAbort::from(exception.syndrome.iss());
                             if !iss.isv() {
-                                return Err(dev.fatal_error(
-                                    anyhow::anyhow!("can't handle data abort without isv: {iss:?}")
-                                        .into(),
-                                ));
+                                emu::emulate_data_abort(
+                                    &mut self.vcpu,
+                                    self.partition,
+                                    vp_index,
+                                    exception,
+                                    dev,
+                                )
+                                .await?;
+                                continue;
                             }
                             let len = 1 << iss.sas();
                             let sign_extend = iss.sse();
@@ -1538,6 +1712,12 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     .map_err(|err| dev.fatal_error(err.into()))?
                                 {
                                     value
+                                } else if let Some(value) = self.physical_timer.read(
+                                    reg,
+                                    // SAFETY: the physical counter has no read side effects.
+                                    unsafe { abi::mach_absolute_time() },
+                                ) {
+                                    value
                                 } else if let Some(value) = self.pmu.read_sysreg(reg, now_100ns) {
                                     value
                                 } else {
@@ -1559,7 +1739,14 @@ impl<'p> Processor for HvfProcessor<'p> {
                                     value,
                                     |index| self.partition.vps[index].wake(),
                                 );
-                                if !handled_by_gic && !self.pmu.write_sysreg(reg, value, now_100ns)
+                                if !handled_by_gic
+                                    && !self.physical_timer.write(
+                                        reg,
+                                        value,
+                                        // SAFETY: the physical counter has no read side effects.
+                                        unsafe { abi::mach_absolute_time() },
+                                    )
+                                    && !self.pmu.write_sysreg(reg, value, now_100ns)
                                 {
                                     tracelimit::warn_ratelimited!(
                                         ?reg,

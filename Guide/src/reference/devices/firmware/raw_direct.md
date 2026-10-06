@@ -19,6 +19,12 @@ For a raw image, OpenVMM:
 The default load and entry address is therefore `0x40080000`. Raw direct boot
 does not support a separate initrd.
 
+## Hypervisor.framework guest instructions and timers
+
+Some raw guest startup code accesses MMIO with paired or SIMD load/store instructions whose data-abort syndrome does not include a valid decoded operand (`ISV=0`). The HVF backend uses the shared AArch64 instruction emulator for those exits, including guest virtual-address translation, guest exception injection and SIMD-register access. This is independent of the VP wake architecture; the landed runtime remains responsible for vCPU execution, cancellation and parking.
+
+The backend also models the non-secure physical timer registers `CNTP_CTL_EL0`, `CNTP_CVAL_EL0` and signed `CNTP_TVAL_EL0`, with a level output at INTID 19 matching the Microsoft ARM64 firmware profile. Physical comparisons use the unshifted host counter; the virtual counter retains the HVF virtual-timer offset. Timer deadlines use the current VM-time/VP wake path, and masking or disabling the timer withdraws its pending level. Functional timer and instruction emulation do not establish hardware timing or performance.
+
 ## Image selection
 
 `--kernel-format auto` is the default. On AArch64, OpenVMM checks for the Linux

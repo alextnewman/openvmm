@@ -1849,6 +1849,18 @@ mod gicr {
             self.shared.raise(intid)
         }
 
+        /// Sets or withdraws the pending level of one private interrupt.
+        pub fn set_pending(&mut self, intid: u32, pending: bool) -> bool {
+            if pending {
+                return self.shared.raise(intid);
+            }
+            if intid >= aarch64defs::GIC_PRIVATE_INTID_COUNT {
+                return false;
+            }
+            let mask = 1 << intid;
+            self.shared.pending.fetch_and(!mask, Ordering::Relaxed) & mask != 0
+        }
+
         /// The best deliverable Group-`group1` SGI/PPI candidate on this
         /// redistributor: the pending, inactive, enabled interrupt of the
         /// matching group with the numerically lowest priority byte (ties broken
@@ -2025,6 +2037,18 @@ mod gicr {
         const IPRIORITYR0: u64 = GicrSgiRegister::IPRIORITYR0.0 as u64;
         const ISENABLER0: u64 = GicrSgiRegister::ISENABLER0.0 as u64;
         const ICENABLER0: u64 = GicrSgiRegister::ICENABLER0.0 as u64;
+
+        #[test]
+        fn private_level_withdrawal_and_invalid_ids_are_bounded() {
+            let (mut redist, _) = Redistributor::new(0, 0, true);
+            assert!(redist.set_pending(20, true));
+            assert!(redist.is_pending_or_active(20));
+            assert!(redist.set_pending(20, false));
+            assert!(!redist.is_pending_or_active(20));
+            assert!(!redist.set_pending(20, false));
+            assert!(!redist.set_pending(32, true));
+            assert!(!redist.set_pending(u32::MAX, false));
+        }
 
         #[test]
         fn typer_supports_split_word_reads() {

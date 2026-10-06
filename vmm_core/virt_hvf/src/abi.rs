@@ -113,6 +113,8 @@ unsafe extern "C" {
 #[link(name = "System")]
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
+    pub fn openvmm_hv_vcpu_get_simd_fp_reg(vcpu: u64, reg: u32, value: *mut u8) -> HvfResult;
+    pub fn openvmm_hv_vcpu_set_simd_fp_reg(vcpu: u64, reg: u32, value: *const u8) -> HvfResult;
 }
 
 open_enum! {

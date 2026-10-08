@@ -560,6 +560,11 @@ Two optional device modes apply to explicitly requested `--mana` devices and are
 - `--mana-bm-hostmode`: present PCI physical-function ID `1414:00b9` and report bare-metal host mode, for exercising the guest driver's bare-metal-host paths.
 - `--mana-pf-caps`: expose a PF capability register block reporting the emulated device's resource limits. This cannot be combined with `--mana-bm-hostmode`.
 
+Both host-function presentations publish explicit remote HWC destination RQ/CQ
+records during bootstrap. Bare-metal host mode remains a VF-like Ethernet
+endpoint; its PF PCI identity and HWC bootstrap do not imply full PF-controller
+or SR-IOV functionality.
+
 On AArch64, the GICv2m MSI path also accepts Hyper-V-compatible GICv3 distributor doorbells when configured by the platform topology. Both doorbells deliver SPI pulses rather than persistent line assertions.
 
 **Filesystems and other virtio devices** (colon-prefixed):

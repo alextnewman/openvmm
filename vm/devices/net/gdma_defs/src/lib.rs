@@ -327,6 +327,8 @@ pub const HWC_INIT_DATA_MAX_RESPONSE: u8 = 6;
 pub const HWC_INIT_DATA_MAX_NUM_CQS: u8 = 7;
 pub const HWC_INIT_DATA_PDID: u8 = 8;
 pub const HWC_INIT_DATA_GPA_MKEY: u8 = 9;
+pub const HWC_INIT_DATA_PF_DEST_RQ_ID: u8 = 10;
+pub const HWC_INIT_DATA_PF_DEST_CQ_ID: u8 = 11;
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]

@@ -649,6 +649,74 @@ async fn test_gdma_create_pd_mr(driver: DefaultDriver) {
     .unwrap();
 }
 
+#[async_test]
+async fn test_gdma_hwc_bootstrap_destinations(driver: DefaultDriver) {
+    for bm_hostmode in [false, true] {
+        let mem = DeviceTestMemory::new(128, false, "test_gdma_hwc_bootstrap_destinations");
+        let msi_conn = MsiConnection::new();
+        let device = gdma::GdmaDevice::new_with_config(
+            &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+            mem.guest_memory(),
+            &msi_conn.target(),
+            vec![VportConfig {
+                mac_address: [1, 2, 3, 4, 5, 6].into(),
+                endpoint: Box::new(NullEndpoint::new()),
+            }],
+            &mut ExternallyManagedMmioIntercepts,
+            gdma::BnicConfig {
+                bm_hostmode,
+                ..Default::default()
+            },
+        );
+        let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+        let buffer = device
+            .dma_client()
+            .allocate_dma_buffer(6 * PAGE_SIZE)
+            .unwrap();
+        let eq_gpa = buffer.pfns()[0] * PAGE_SIZE64;
+        let mut gdma = GdmaDriver::new(&driver, device, 1, Some(buffer))
+            .await
+            .unwrap();
+
+        // Decode the published bootstrap, not the requester's permissive init parser.
+        let mut data = Vec::new();
+        let mut complete = false;
+        for index in 0..32 {
+            let mut entry = [0u8; 16];
+            mem.guest_memory()
+                .read_at(eq_gpa + index * 16, &mut entry)
+                .unwrap();
+            match entry[12] {
+                129 => assert_eq!(index, 0),
+                130 => {
+                    let word = u32::from_le_bytes(entry[..4].try_into().unwrap());
+                    data.push(((word >> 24) as u8, word & 0x00ff_ffff));
+                }
+                131 => {
+                    complete = true;
+                    break;
+                }
+                event => panic!("unexpected bootstrap event {event}"),
+            }
+        }
+        assert!(
+            complete,
+            "bootstrap did not publish initialization completion"
+        );
+        let expected_types: Vec<u8> = (1..=if bm_hostmode { 11 } else { 9 }).collect();
+        assert_eq!(
+            data.iter().map(|&(kind, _)| kind).collect::<Vec<_>>(),
+            expected_types
+        );
+        if bm_hostmode {
+            assert_eq!(&data[9..], &[(10, 0), (11, 0)]);
+            assert_ne!(data[0].1, data[10].1, "peer CQ is not the guest CQ");
+            assert_ne!(data[1].1, data[9].1, "peer RQ is not the guest RQ");
+        }
+        gdma.verify_vf_driver_version().await.unwrap();
+    }
+}
+
 /// In bare-metal-host mode the device presents itself as a physical function
 /// rather than an SR-IOV VF, so the guest exercises the Linux driver's
 /// bare-metal-host code paths. Three facts are observable: (1) the PCI device id

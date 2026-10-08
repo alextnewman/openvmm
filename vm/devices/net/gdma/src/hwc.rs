@@ -52,6 +52,8 @@ use gdma_defs::HWC_INIT_DATA_MAX_NUM_CQS;
 use gdma_defs::HWC_INIT_DATA_MAX_REQUEST;
 use gdma_defs::HWC_INIT_DATA_MAX_RESPONSE;
 use gdma_defs::HWC_INIT_DATA_PDID;
+use gdma_defs::HWC_INIT_DATA_PF_DEST_CQ_ID;
+use gdma_defs::HWC_INIT_DATA_PF_DEST_RQ_ID;
 use gdma_defs::HWC_INIT_DATA_QUEUE_DEPTH;
 use gdma_defs::HWC_INIT_DATA_RQID;
 use gdma_defs::HWC_INIT_DATA_SQID;
@@ -86,6 +88,10 @@ const BNIC_DEV_ID: GdmaDevId = GdmaDevId {
     instance: 0,
 };
 
+// The singleton remote HWC service is endpoint zero, not a guest queue.
+const HWC_REMOTE_RQ_ID: u32 = 0;
+const HWC_REMOTE_CQ_ID: u32 = 0;
+
 pub struct HwControl {
     state: HwState,
     cq_id: u32,
@@ -105,6 +111,8 @@ impl InspectTaskMut<HwControl> for Devices {
                     .field("cq_id", hwc.cq_id)
                     .field("sq_id", hwc.sq_id)
                     .field("rq_id", hwc.rq_id)
+                    .field("dest_rq_id", HWC_REMOTE_RQ_ID)
+                    .field("dest_cq_id", HWC_REMOTE_CQ_ID)
                     .field("pds", hwc.state.pds.len())
                     .field("mrs", hwc.state.mrs.len());
             })
@@ -215,6 +223,7 @@ impl HwControl {
         cq_gpa: u64,
         eq_gpa: u64,
         eq_msix: u32,
+        host_function: bool,
     ) -> Result<Self, QueueAllocError> {
         tracing::info!(sq_gpa, rq_gpa, cq_gpa, eq_gpa, eq_msix, "enabling hwc");
 
@@ -248,8 +257,12 @@ impl HwControl {
             (HWC_INIT_DATA_PDID, 0),
             (HWC_INIT_DATA_GPA_MKEY, 0),
         ];
+        let destinations = host_function.then_some([
+            (HWC_INIT_DATA_PF_DEST_RQ_ID, HWC_REMOTE_RQ_ID),
+            (HWC_INIT_DATA_PF_DEST_CQ_ID, HWC_REMOTE_CQ_ID),
+        ]);
 
-        for (ty, val) in data {
+        for (ty, val) in data.into_iter().chain(destinations.into_iter().flatten()) {
             queues.post_eq(
                 eq_id,
                 GDMA_EQE_HWC_INIT_DATA,
@@ -278,6 +291,18 @@ impl HwControl {
         })
     }
 
+    fn validate_destination(tx_oob: &HwcTxOob) -> anyhow::Result<()> {
+        if tx_oob.flags1.vrq_id() != HWC_REMOTE_RQ_ID || tx_oob.flags2.vrcq_id() != HWC_REMOTE_CQ_ID
+        {
+            anyhow::bail!(
+                "unknown hwc destination rq_id={} cq_id={}",
+                tx_oob.flags1.vrq_id(),
+                tx_oob.flags2.vrcq_id(),
+            );
+        }
+        Ok(())
+    }
+
     async fn process(&mut self, devices: &mut Devices) -> anyhow::Result<()> {
         tracing::info!("starting hwc");
 
@@ -289,6 +314,7 @@ impl HwControl {
             let tx_oob = HwcTxOob::read_from_prefix(sqe.oob())
                 .map_err(|_| anyhow!("reading tx oob"))?
                 .0; // TODO: zerocopy: map_err, use-rest-of-range, use error details in the returned `anyhow!` (https://github.com/microsoft/openvmm/issues/759)
+            Self::validate_destination(&tx_oob)?;
             if tx_oob.flags3.vscq_id() != self.cq_id {
                 anyhow::bail!(
                     "mismatched cq id: {} != {}",
@@ -781,5 +807,24 @@ impl AsyncRun<HwControl> for Devices {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HwControl;
+    use gdma_defs::HwcTxOob;
+    use test_with_tracing::test;
+    use zerocopy::FromZeros;
+
+    #[test]
+    fn test_hwc_remote_destination() {
+        let mut oob = HwcTxOob::new_zeroed();
+        HwControl::validate_destination(&oob).unwrap();
+        oob.flags1.set_vrq_id(1);
+        assert!(HwControl::validate_destination(&oob).is_err());
+        oob.flags1.set_vrq_id(0);
+        oob.flags2.set_vrcq_id(1);
+        assert!(HwControl::validate_destination(&oob).is_err());
     }
 }

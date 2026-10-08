@@ -680,6 +680,7 @@ impl GdmaDevice {
                     cq_gpn * PAGE_SIZE64,
                     eq_gpn * PAGE_SIZE64,
                     msix,
+                    self.pf_regs.is_some() || self.pf_cap_regs.is_some(),
                 )
                 .map_err(SmcError::QueueAlloc)?;
                 self.hwc.insert(&self.queues.driver, "gdma-hwc", hwc);

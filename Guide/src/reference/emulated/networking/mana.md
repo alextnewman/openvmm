@@ -64,6 +64,13 @@ consumer generations, SMC response correlation, standard HWC envelopes,
 response correlation, and known resource transitions.
 
 HWC initialization is decoded from the actual published EQE bytes.
+Host-function presentations, including bare-metal host mode, publish explicit
+destination RQ and CQ initialization records before initialization completion.
+These identify the emulator's remote management endpoint zero, not the guest's
+allocated receive or completion queue. Ordinary VF initialization retains its
+implicit zero destination. Requests must address that modeled remote endpoint;
+an unknown destination stops the HWC task with an error.
+
 Descriptor snapshots are captured from published queue storage before the
 emulator's payload decoder. HWC payload projection is independently
 implemented for legacy GPA-addressed SGLs with 8- or 24-byte inline OOB,
@@ -124,6 +131,12 @@ and rejects false findings. These host-side tests qualify the monitor and
 its adapter, not a Linux or FreeBSD kernel driver. Native driver claims
 require actual guest execution with exact emulator, driver, and kernel
 identities.
+
+A separate published-EQ regression decodes bootstrap storage independently of
+the requester's permissive initialization parser. It checks the unchanged VF
+record sequence and both BM peer-destination records before completion, with
+remote identities distinct from the guest queues. This does not add a
+PCI-role-dependent mandatory-field rule to the passive examiner.
 
 Model exploration establishes consistency only within its stated model
 and bounds. Independent wire examples, mutations, and requester replay

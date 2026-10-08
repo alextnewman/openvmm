@@ -97,6 +97,7 @@ pub struct HwControl {
     cq_id: u32,
     sq_id: u32,
     rq_id: u32,
+    host_function: bool,
 
     bnic_enabled: bool,
 }
@@ -113,6 +114,7 @@ impl InspectTaskMut<HwControl> for Devices {
                     .field("rq_id", hwc.rq_id)
                     .field("dest_rq_id", HWC_REMOTE_RQ_ID)
                     .field("dest_cq_id", HWC_REMOTE_CQ_ID)
+                    .field("host_function", hwc.host_function)
                     .field("pds", hwc.state.pds.len())
                     .field("mrs", hwc.state.mrs.len());
             })
@@ -286,13 +288,16 @@ impl HwControl {
             cq_id,
             sq_id,
             rq_id,
+            host_function,
 
             bnic_enabled: false,
         })
     }
 
-    fn validate_destination(tx_oob: &HwcTxOob) -> anyhow::Result<()> {
-        if tx_oob.flags1.vrq_id() != HWC_REMOTE_RQ_ID || tx_oob.flags2.vrcq_id() != HWC_REMOTE_CQ_ID
+    fn validate_destination(tx_oob: &HwcTxOob, host_function: bool) -> anyhow::Result<()> {
+        if host_function
+            && (tx_oob.flags1.vrq_id() != HWC_REMOTE_RQ_ID
+                || tx_oob.flags2.vrcq_id() != HWC_REMOTE_CQ_ID)
         {
             anyhow::bail!(
                 "unknown hwc destination rq_id={} cq_id={}",
@@ -314,7 +319,7 @@ impl HwControl {
             let tx_oob = HwcTxOob::read_from_prefix(sqe.oob())
                 .map_err(|_| anyhow!("reading tx oob"))?
                 .0; // TODO: zerocopy: map_err, use-rest-of-range, use error details in the returned `anyhow!` (https://github.com/microsoft/openvmm/issues/759)
-            Self::validate_destination(&tx_oob)?;
+            Self::validate_destination(&tx_oob, self.host_function)?;
             if tx_oob.flags3.vscq_id() != self.cq_id {
                 anyhow::bail!(
                     "mismatched cq id: {} != {}",
@@ -820,11 +825,19 @@ mod tests {
     #[test]
     fn test_hwc_remote_destination() {
         let mut oob = HwcTxOob::new_zeroed();
-        HwControl::validate_destination(&oob).unwrap();
+        HwControl::validate_destination(&oob, true).unwrap();
         oob.flags1.set_vrq_id(1);
-        assert!(HwControl::validate_destination(&oob).is_err());
+        assert!(HwControl::validate_destination(&oob, true).is_err());
         oob.flags1.set_vrq_id(0);
         oob.flags2.set_vrcq_id(1);
-        assert!(HwControl::validate_destination(&oob).is_err());
+        assert!(HwControl::validate_destination(&oob, true).is_err());
+    }
+
+    #[test]
+    fn test_hwc_vf_implicit_destination() {
+        let mut oob = HwcTxOob::new_zeroed();
+        oob.flags1.set_vrq_id(24);
+        HwControl::validate_destination(&oob, false).unwrap();
+        assert!(HwControl::validate_destination(&oob, true).is_err());
     }
 }

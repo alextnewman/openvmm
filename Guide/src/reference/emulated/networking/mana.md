@@ -68,8 +68,10 @@ Host-function presentations, including bare-metal host mode, publish explicit
 destination RQ and CQ initialization records before initialization completion.
 These identify the emulator's remote management endpoint zero, not the guest's
 allocated receive or completion queue. Ordinary VF initialization retains its
-implicit zero destination. Requests must address that modeled remote endpoint;
-an unknown destination stops the HWC task with an error.
+implicit destination and existing routing behavior. Host-function requests must
+address their advertised remote endpoint; an unknown destination stops the HWC
+task with an error. This explicit-destination check does not impose a new route
+constraint on VF requests.
 
 Descriptor snapshots are captured from published queue storage before the
 emulator's payload decoder. HWC payload projection is independently

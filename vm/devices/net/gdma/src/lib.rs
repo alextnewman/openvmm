@@ -65,6 +65,8 @@ use pci_core::spec::hwid::Subclass;
 use queues::Queues;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use task_control::TaskControl;
@@ -346,6 +348,8 @@ pub struct GdmaDevice {
     /// serviced asynchronously from [`PollDevice::poll_device`] because the
     /// teardown is async while [`FlrHandler::initiate_flr`] is synchronous.
     flr_rx: mesh::Receiver<()>,
+    flr_requests: Arc<AtomicU64>,
+    flr_completions: u64,
     /// Set once an FLR has been observed and cleared when the teardown
     /// completes. While set, [`PollDevice::poll_device`] keeps driving
     /// [`GdmaDevice::poll_flr_reset`] to completion across polls.
@@ -375,10 +379,13 @@ pub struct GdmaDevice {
 struct GdmaFlrHandler {
     #[inspect(skip)]
     flr_tx: mesh::Sender<()>,
+    #[inspect(skip)]
+    requests: Arc<AtomicU64>,
 }
 
 impl FlrHandler for GdmaFlrHandler {
     fn initiate_flr(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         self.flr_tx.send(());
     }
 }
@@ -390,6 +397,9 @@ impl InspectMut for GdmaDevice {
             .field("pf_caps", self.pf_cap_regs.is_some())
             .field("config", &self.config)
             .field("protocol", &self.queues.protocol)
+            .field("flr_requests", self.flr_requests.load(Ordering::Relaxed))
+            .field("flr_completions", self.flr_completions)
+            .field("flr_draining", self.flr_draining)
             .field("queues", &self.queues)
             .merge(&mut self.hwc);
     }
@@ -493,9 +503,13 @@ impl GdmaDevice {
         // the teardown. MSI-X stays first in the capability list so it keeps
         // its expected configuration-space offset.
         let (flr_tx, flr_rx) = mesh::channel();
+        let flr_requests = Arc::new(AtomicU64::new(0));
         let pci_express_capability = PciExpressCapability::new(
             DevicePortType::Endpoint,
-            Some(Arc::new(GdmaFlrHandler { flr_tx })),
+            Some(Arc::new(GdmaFlrHandler {
+                flr_tx,
+                requests: flr_requests.clone(),
+            })),
         );
 
         let hardware_ids = HardwareIds {
@@ -577,6 +591,8 @@ impl GdmaDevice {
                 bnic: bnic::BasicNic::new(vports, bnic_config),
             }),
             flr_rx,
+            flr_requests,
+            flr_completions: 0,
             flr_draining: false,
             pf_regs,
             pf_desc,
@@ -873,6 +889,7 @@ impl GdmaDevice {
         self.destroying_hwc = false;
         self.shmem = Shmem(FromZeros::new_zeroed());
         self.config.reset();
+        self.flr_completions = self.flr_completions.wrapping_add(1);
         Poll::Ready(())
     }
 }
@@ -972,6 +989,22 @@ impl PciConfigSpace for GdmaDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn flr_requests_are_observed_before_delivery() {
+        let (flr_tx, mut flr_rx) = mesh::channel();
+        let requests = Arc::new(AtomicU64::new(0));
+        let handler = GdmaFlrHandler {
+            flr_tx,
+            requests: requests.clone(),
+        };
+        handler.initiate_flr();
+        handler.initiate_flr();
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        futures::executor::block_on(flr_rx.recv()).unwrap();
+        futures::executor::block_on(flr_rx.recv()).unwrap();
+    }
 
     /// The SMC handler must fire only when a guest write actually touches the
     /// final header dword `[SHMEM_LEN - 4, SHMEM_LEN)`. The driver fills the

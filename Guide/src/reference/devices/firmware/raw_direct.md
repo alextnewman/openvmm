@@ -19,6 +19,22 @@ For a raw image, OpenVMM:
 The default load and entry address is therefore `0x40080000`. Raw direct boot
 does not support a separate initrd.
 
+PCI host bridges are described beneath an identity-mapped `pcie-hosts` simple
+bus. That parent uses two address cells and one size cell: ECAM addresses
+remain 64-bit, while an ECAM window is bounded by the 256 MiB size of a complete
+PCI segment. Each host bridge retains the standard three-cell PCI address and
+two-cell size format for its downstream BAR ranges, with the low
+non-prefetchable and high prefetchable apertures matching PCI resource
+assignment. Root RAM sizes remain 64-bit. Consumers must interpret each `reg`
+property using its parent's declared cell widths.
+
+This experimental raw-image profile also supplies an unused slot-31 legacy-map
+entry on the first bus-0 host bridge for PCI backends that require a nonempty
+legacy table before allocating MSIs. No attached device uses that entry. It
+does not implement or qualify legacy INTx delivery and must not be used for an
+INTx-producing device; MANA notification evidence still requires actual MSI-X
+delivery.
+
 ## Hypervisor.framework guest instructions and timers
 
 Some raw guest startup code accesses MMIO with paired or SIMD load/store instructions whose data-abort syndrome does not include a valid decoded operand (`ISV=0`). The HVF backend uses the shared AArch64 instruction emulator for those exits, including guest virtual-address translation, guest exception injection and SIMD-register access. This is independent of the VP wake architecture; the landed runtime remains responsible for vCPU execution, cancellation and parking.

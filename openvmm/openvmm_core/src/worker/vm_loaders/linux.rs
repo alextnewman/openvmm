@@ -334,6 +334,8 @@ fn build_dt(
     let p_interrupt_names = builder.add_string("interrupt-names")?;
     let p_interrupts = builder.add_string("interrupts")?;
     let p_interrupt_parent = builder.add_string("interrupt-parent")?;
+    let p_interrupt_map = builder.add_string("interrupt-map")?;
+    let p_interrupt_map_mask = builder.add_string("interrupt-map-mask")?;
     let p_always_on = builder.add_string("always-on")?;
     let p_phandle = builder.add_string("phandle")?;
     let p_clock_frequency = builder.add_string("clock-frequency")?;
@@ -561,87 +563,134 @@ fn build_dt(
     // Add a PCIe host bridge node for each bridge.
     // PCI address space type bits (phys.hi bits 25:24).
     const PCI_SPACE_MEM32: u32 = 0x02000000; // 32-bit non-prefetchable MMIO
-    const PCI_SPACE_MEM64: u32 = 0x03000000; // 64-bit prefetchable MMIO
+    const PCI_SPACE_MEM64: u32 = 0x03000000;
+    const PCI_PREFETCHABLE: u32 = 0x40000000;
 
-    for bridge in pcie_host_bridges {
-        let name = format!("pcie@{:x}", bridge.ecam_range.start());
+    // ECAM windows are at most 256 MiB. Give them a parent with one size
+    // cell, retaining 64-bit addresses and the root's 64-bit RAM sizes.
+    if !pcie_host_bridges.is_empty() {
+        let mut pci_parent = root_builder
+            .start_node("pcie-hosts")?
+            .add_str(p_compatible, "simple-bus")?
+            .add_u32(p_address_cells, 2)?
+            .add_u32(p_size_cells, 1)?
+            .add_null(p_ranges)?;
+        for bridge in pcie_host_bridges {
+            let name = format!("pcie@{:x}", bridge.ecam_range.start());
+            assert!(
+                bridge.ecam_range.len() <= 256 * 1024 * 1024,
+                "a PCI segment has at most 256 one-MiB ECAM bus windows"
+            );
+            let ecam_reg = [
+                (bridge.ecam_range.start() >> 32) as u32,
+                bridge.ecam_range.start() as u32,
+                bridge.ecam_range.len() as u32,
+            ];
 
-        // The `ranges` property encodes translations from PCI MMIO address
-        // space to CPU physical address space.  Each entry is 7 cells:
-        //   [pci-phys.hi, pci-phys.mid, pci-phys.lo,
-        //    cpu-phys.hi, cpu-phys.lo,
-        //    size.hi, size.lo]
-        let mut ranges: Vec<u32> = Vec::new();
+            // The `ranges` property encodes translations from PCI MMIO address
+            // space to CPU physical address space.  Each entry is 7 cells:
+            //   [pci-phys.hi, pci-phys.mid, pci-phys.lo,
+            //    cpu-phys.hi, cpu-phys.lo,
+            //    size.hi, size.lo]
+            let mut ranges: Vec<u32> = Vec::new();
 
-        let low_start = bridge.low_mmio.start();
-        let low_len = bridge.low_mmio.len();
-        if low_len > 0 {
-            ranges.extend_from_slice(&[
-                PCI_SPACE_MEM32,
-                0,
-                low_start as u32,
-                (low_start >> 32) as u32,
-                (low_start & 0xFFFF_FFFF) as u32,
-                (low_len >> 32) as u32,
-                (low_len & 0xFFFF_FFFF) as u32,
-            ]);
-        }
-
-        let high_start = bridge.high_mmio.start();
-        let high_len = bridge.high_mmio.len();
-        if high_len > 0 {
-            ranges.extend_from_slice(&[
-                PCI_SPACE_MEM64,
-                (high_start >> 32) as u32,
-                (high_start & 0xFFFF_FFFF) as u32,
-                (high_start >> 32) as u32,
-                (high_start & 0xFFFF_FFFF) as u32,
-                (high_len >> 32) as u32,
-                (high_len & 0xFFFF_FFFF) as u32,
-            ]);
-        }
-
-        // No interrupt-map is provided because all devices use MSIs via the
-        // ITS or v2m frame; legacy INTx routing is not supported.
-        let mut node = root_builder
-            .start_node(name.as_str())?
-            .add_str(p_compatible, "pci-host-ecam-generic")?
-            .add_str(p_device_type, "pci")?
-            .add_u32(p_linux_pci_domain, bridge.segment as u32)?
-            .add_u64_array(p_reg, &[bridge.ecam_range.start(), bridge.ecam_range.len()])?
-            .add_u32_array(
-                p_bus_range,
-                &[bridge.start_bus as u32, bridge.end_bus as u32],
-            )?
-            .add_u32(p_address_cells, 3)?
-            .add_u32(p_size_cells, 2)?
-            .add_u32(p_interrupt_parent, PHANDLE_GIC)?
-            .add_u32_array(p_ranges, &ranges)?;
-        match gic_msi {
-            GicMsiController::Its(_) => {
-                node = node.add_u32(p_msi_parent, PHANDLE_ITS)?;
+            let low_start = bridge.low_mmio.start();
+            let low_len = bridge.low_mmio.len();
+            if low_len > 0 {
+                ranges.extend_from_slice(&[
+                    PCI_SPACE_MEM32,
+                    0,
+                    low_start as u32,
+                    (low_start >> 32) as u32,
+                    (low_start & 0xFFFF_FFFF) as u32,
+                    (low_len >> 32) as u32,
+                    (low_len & 0xFFFF_FFFF) as u32,
+                ]);
             }
-            GicMsiController::V2m(_) => {
-                node = node.add_u32(p_msi_parent, PHANDLE_V2M)?;
+
+            let high_start = bridge.high_mmio.start();
+            let high_len = bridge.high_mmio.len();
+            if high_len > 0 {
+                ranges.extend_from_slice(&[
+                    PCI_SPACE_MEM64 | PCI_PREFETCHABLE,
+                    (high_start >> 32) as u32,
+                    (high_start & 0xFFFF_FFFF) as u32,
+                    (high_start >> 32) as u32,
+                    (high_start & 0xFFFF_FFFF) as u32,
+                    (high_len >> 32) as u32,
+                    (high_len & 0xFFFF_FFFF) as u32,
+                ]);
             }
-            GicMsiController::None => {}
+
+            let mut node = pci_parent
+                .start_node(name.as_str())?
+                .add_str(p_compatible, "pci-host-ecam-generic")?
+                .add_str(p_device_type, "pci")?
+                .add_u32(p_linux_pci_domain, bridge.segment as u32)?
+                .add_u32_array(p_reg, &ecam_reg)?
+                .add_u32_array(
+                    p_bus_range,
+                    &[bridge.start_bus as u32, bridge.end_bus as u32],
+                )?
+                .add_u32(p_address_cells, 3)?
+                .add_u32(p_size_cells, 2)?
+                .add_u32(p_interrupt_parent, PHANDLE_GIC)?
+                .add_u32_array(p_ranges, &ranges)?;
+            if matches!(
+                cfg.image_format,
+                openvmm_defs::config::DirectBootImageFormat::Raw
+            ) && bridge.index == 0
+                && bridge.start_bus == 0
+            {
+                // Scoped raw-image fixture: the unpopulated slot entry lets
+                // PCI backends with a legacy-table prerequisite allocate MSIs.
+                // It is not a working INTx path for any attached device.
+                node = node
+                    .add_u32(p_interrupt_cells, 1)?
+                    .add_u32_array(p_interrupt_map_mask, &[0xf800, 0, 0, 7])?
+                    .add_u32_array(
+                        p_interrupt_map,
+                        &[
+                            31 << 11,
+                            0,
+                            0,
+                            1,
+                            PHANDLE_GIC,
+                            0,
+                            0,
+                            GIC_SPI,
+                            48,
+                            IRQ_TYPE_LEVEL_HIGH,
+                        ],
+                    )?;
+            }
+            match gic_msi {
+                GicMsiController::Its(_) => {
+                    node = node.add_u32(p_msi_parent, PHANDLE_ITS)?;
+                }
+                GicMsiController::V2m(_) => {
+                    node = node.add_u32(p_msi_parent, PHANDLE_V2M)?;
+                }
+                GicMsiController::None => {}
+            }
+            if let Some((_, phandle)) = smmu_phandles.iter().find(|(idx, _)| *idx == bridge.index) {
+                // iommu-map: <rid_base> <&smmu_phandle> <stream_id_base> <length>
+                // Maps the full RID range (0..0x10000) for this root complex
+                // through its SMMU instance. stream_id_base is 0 because each
+                // SMMU is 1:1 with its RC — stream IDs are plain BDFs.
+                node = node.add_u32_array(p_iommu_map, &[0, *phandle, 0, 0x10000])?;
+            }
+            if bridge.preserve_boot_config {
+                // Tell Linux to keep the firmware-assigned PCI boot configuration
+                // (bus numbers and BARs) instead of re-enumerating. Linux checks
+                // this via of_pci_preserve_config(). This is the device-tree
+                // equivalent of the host-bridge "Ignore PCI Boot Configurations"
+                // _DSM emitted on the ACPI path.
+                node = node.add_u32(p_linux_pci_probe_only, 1)?;
+            }
+            pci_parent = node.end_node()?;
         }
-        if let Some((_, phandle)) = smmu_phandles.iter().find(|(idx, _)| *idx == bridge.index) {
-            // iommu-map: <rid_base> <&smmu_phandle> <stream_id_base> <length>
-            // Maps the full RID range (0..0x10000) for this root complex
-            // through its SMMU instance. stream_id_base is 0 because each
-            // SMMU is 1:1 with its RC — stream IDs are plain BDFs.
-            node = node.add_u32_array(p_iommu_map, &[0, *phandle, 0, 0x10000])?;
-        }
-        if bridge.preserve_boot_config {
-            // Tell Linux to keep the firmware-assigned PCI boot configuration
-            // (bus numbers and BARs) instead of re-enumerating. Linux checks
-            // this via of_pci_preserve_config(). This is the device-tree
-            // equivalent of the host-bridge "Ignore PCI Boot Configurations"
-            // _DSM emitted on the ACPI path.
-            node = node.add_u32(p_linux_pci_probe_only, 1)?;
-        }
-        root_builder = node.end_node()?;
+        root_builder = pci_parent.end_node()?;
     }
 
     for mmio in cfg.fixed_virtio_mmio {
@@ -1186,6 +1235,141 @@ pub fn load_direct_arm64(
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn pci_ecam_registers_match_their_parent_cells() {
+        use vm_topology::processor::TopologyBuilder;
+        use vm_topology::processor::aarch64::{
+            Aarch64PlatformConfig, GicMsiController, GicVersion,
+        };
+
+        let kernel = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let memory = MemoryLayout::new(1024 * 1024, &[], &[], &[], None).unwrap();
+        let smbios = openvmm_defs::config::SmbiosConfig::default();
+        let config = KernelConfig {
+            kernel: &kernel,
+            initrd: &None,
+            cmdline: "",
+            mem_layout: &memory,
+            isolation: KernelIsolationConfig::None,
+            smbios: &smbios,
+            image_format: openvmm_defs::config::DirectBootImageFormat::Raw,
+            fixed_virtio_mmio: &[],
+        };
+        let topology = TopologyBuilder::new_aarch64(Aarch64PlatformConfig {
+            gic_distributor_base: 0xffff0000,
+            gic_version: GicVersion::V3 {
+                redistributors_base: 0xeffee000,
+            },
+            gic_msi: GicMsiController::None,
+            pmu_gsiv: None,
+            virt_timer_ppi: 27,
+            gic_nr_irqs: 992,
+        })
+        .build(2)
+        .unwrap();
+        let bridge = PcieHostBridge {
+            index: 0,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 255,
+            ecam_range: MemoryRange::new(0x1_4000_0000..0x1_5000_0000),
+            low_mmio: MemoryRange::new(0xdc00_0000..0xe000_0000),
+            high_mmio: MemoryRange::new(0x1_0000_0000..0x1_4000_0000),
+            cxl: None,
+            vnode: None,
+            preserve_bars: false,
+            preserve_boot_config: false,
+        };
+        let blob = build_dt(
+            &config,
+            &GuestMemory::empty(),
+            false,
+            &topology,
+            &[bridge],
+            &[],
+            MemoryRange::EMPTY,
+            MemoryRange::EMPTY,
+            0,
+            0,
+        )
+        .unwrap();
+        let parser = fdt::parser::Parser::new(&blob).unwrap();
+        let root = parser.root().unwrap();
+        assert_eq!(
+            root.find_property("#size-cells")
+                .unwrap()
+                .unwrap()
+                .read_u32(0)
+                .unwrap(),
+            2
+        );
+        let parent = root
+            .children()
+            .map(Result::unwrap)
+            .find(|node| node.name == "pcie-hosts")
+            .unwrap();
+        for (name, expected) in [("#address-cells", 2), ("#size-cells", 1)] {
+            assert_eq!(
+                parent
+                    .find_property(name)
+                    .unwrap()
+                    .unwrap()
+                    .read_u32(0)
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(
+            parent
+                .find_property("ranges")
+                .unwrap()
+                .unwrap()
+                .data
+                .is_empty()
+        );
+        let endpoint = parent.children().next().unwrap().unwrap();
+        let reg = endpoint.find_property("reg").unwrap().unwrap();
+        assert_eq!(reg.data.len(), 12);
+        assert_eq!(reg.read_u32(0).unwrap(), 1);
+        assert_eq!(reg.read_u32(1).unwrap(), 0x4000_0000);
+        assert_eq!(reg.read_u32(2).unwrap(), 0x1000_0000);
+        let buses = endpoint.find_property("bus-range").unwrap().unwrap();
+        assert_eq!(buses.read_u32(0).unwrap(), 0);
+        assert_eq!(buses.read_u32(1).unwrap(), 255);
+        let ranges = endpoint.find_property("ranges").unwrap().unwrap();
+        assert_eq!(ranges.data.len(), 2 * 7 * 4);
+        assert_eq!(ranges.read_u32(0).unwrap(), 0x0200_0000);
+        assert_eq!(ranges.read_u32(7).unwrap(), 0x4300_0000);
+        let unused_slot_map = endpoint.find_property("interrupt-map").unwrap().unwrap();
+        assert_eq!(unused_slot_map.data.len(), 10 * 4);
+        assert_eq!(unused_slot_map.read_u32(0).unwrap(), 31 << 11);
+        assert_eq!(unused_slot_map.read_u32(3).unwrap(), 1);
+        assert_eq!(unused_slot_map.read_u32(7).unwrap(), 0);
+        assert_eq!(unused_slot_map.read_u32(8).unwrap(), 48);
+        let without_pci = build_dt(
+            &config,
+            &GuestMemory::empty(),
+            false,
+            &topology,
+            &[],
+            &[],
+            MemoryRange::EMPTY,
+            MemoryRange::EMPTY,
+            0,
+            0,
+        )
+        .unwrap();
+        let parser = fdt::parser::Parser::new(&without_pci).unwrap();
+        assert!(
+            parser
+                .root()
+                .unwrap()
+                .children()
+                .map(Result::unwrap)
+                .all(|node| node.name != "pcie-hosts")
+        );
+    }
 
     #[test]
     fn completes_snp_direct_ram_imports() {

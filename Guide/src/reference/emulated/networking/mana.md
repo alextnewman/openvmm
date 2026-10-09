@@ -34,6 +34,12 @@ Evidence retains at most 64 findings. Omitted-record counts remain visible.
 Reset begins a new ownership epoch without deleting earlier findings.
 There is no whole-driver "compliant" result derived from an empty error log.
 
+The device also exposes `flr_requests`, `flr_completions` and `flr_draining`
+separately from the protocol report. A request counts the capability callback;
+a completion counts finished control/datapath teardown and PCI-state reset.
+Their difference distinguishes an undelivered request from an outstanding
+reset and does not establish a guest driver's release behavior.
+
 ### Machine-readable evidence
 
 The `protocol/report_json` scalar exports `openvmm/gdma-protocol/v1`. It contains the same atomic monitor snapshot as the human rule tree: scope, epoch, observation sequence, rule counters, findings, completeness flags, and unobservable obligations. It also contains independently decoded request/response exchanges grouped by opcode, request version, requested reply version, actual reply version, status, and correlation, with counts, sequence bounds, and actual length ranges. The bounded table retains at most 128 keys; omitted exchanges are explicit.

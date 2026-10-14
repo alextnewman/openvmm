@@ -349,6 +349,13 @@ pub enum PciConfigAccessType {
 
 /// Implemented by devices which have a PCI config space.
 pub trait PciConfigSpace: ChipsetDevice {
+    /// Whether otherwise-unclaimed MMIO may be routed to this device through
+    /// its parent PCIe bridge windows. Ordinary BAR-backed devices leave this
+    /// disabled; a fabric implementation performs its own downstream decode.
+    fn supports_mmio_forwarding(&self) -> bool {
+        false
+    }
+
     /// Dispatch a PCI config space read to the device with the given address.
     ///
     /// This function serves as a shorthand that single-function endpoint devices

@@ -381,6 +381,26 @@ OpenVMM can emulate a PCI Express topology using `--pcie-root-complex` and
 `--pcie-root-port`. Devices that support the `pcie_port=` option can be
 attached to a root port to appear as PCIe devices in the guest.
 
+### Fabric memory forwarding
+
+Root complexes retain their configured low and high MMIO apertures. Ordinary
+device BAR intercepts take priority; an otherwise-unclaimed access can be
+forwarded through enabled root-port and switch memory windows to a device that
+explicitly supports fabric forwarding. Every bridge must decode the complete
+access, including 64-bit prefetch windows. Disabled, out-of-range and ambiguous
+overlapping windows do not select a downstream target.
+
+This permits an external fabric to retain ownership of its endpoint configuration
+and BAR decode. The VMM need not discover those BARs while constructing the device:
+normal PCI enumeration supplies routed BDFs after bus assignment. No additional
+CLI options are required, and ordinary BAR-backed endpoints remain on their
+existing intercept path. Forwarding follows the current bridge configuration and
+attached device, including after reset, restore and hotplug.
+
+DMA and MSI targets can be derived from complete requester IDs within the owning
+port's assigned bus range. This keeps identical device/function numbers on
+different downstream buses distinct, including when an IOMMU is present.
+
 ### Setting up a PCIe topology
 
 ```sh

@@ -22,6 +22,7 @@ use std::sync::Weak;
 
 struct IoRangesInner<T> {
     map: RangeMap<T, RangeEntry>,
+    fallback_map: RangeMap<T, RangeEntry>,
     trace_on: AddressFilter<T>,
     break_on: AddressFilter<T>,
     // Starts off a `Some(Vec::new())`, and then set to `None` as part of
@@ -78,6 +79,7 @@ impl<T: RangeKey> IoRanges<T> {
         Self {
             inner: Arc::new(RwLock::new(IoRangesInner {
                 map: RangeMap::new(),
+                fallback_map: RangeMap::new(),
                 trace_on: AddressFilter::new(trace_on_unknown),
                 break_on: AddressFilter::new(false),
                 static_registration_conflicts: Some(Vec::new()),
@@ -94,8 +96,36 @@ impl<T: RangeKey> IoRanges<T> {
         dev: Weak<CloseableMutex<dyn ChipsetDevice>>,
         dev_name: Arc<str>,
     ) -> Result<(), IoRangeConflict<T>> {
+        self.register_inner(start, end, region_name, dev, dev_name, false)
+    }
+
+    pub fn register_fallback(
+        &self,
+        start: T,
+        end: T,
+        region_name: Arc<str>,
+        dev: Weak<CloseableMutex<dyn ChipsetDevice>>,
+        dev_name: Arc<str>,
+    ) -> Result<(), IoRangeConflict<T>> {
+        self.register_inner(start, end, region_name, dev, dev_name, true)
+    }
+
+    fn register_inner(
+        &self,
+        start: T,
+        end: T,
+        region_name: Arc<str>,
+        dev: Weak<CloseableMutex<dyn ChipsetDevice>>,
+        dev_name: Arc<str>,
+        fallback: bool,
+    ) -> Result<(), IoRangeConflict<T>> {
         let mut inner = self.inner.write();
-        match inner.map.entry(start..=end) {
+        let map = if fallback {
+            &mut inner.fallback_map
+        } else {
+            &mut inner.map
+        };
+        match map.entry(start..=end) {
             range_map_vec::Entry::Vacant(entry) => {
                 entry.insert(RangeEntry {
                     region_name,
@@ -134,13 +164,46 @@ impl<T: RangeKey> IoRanges<T> {
         inner.map.remove(&start);
     }
 
+    pub fn revoke_fallback(&self, start: T) {
+        self.inner.write().fallback_map.remove(&start);
+    }
+
     pub fn lookup(&self, addr: T, is_read: bool) -> LookupResult {
+        self.lookup_range(addr, Some(addr), is_read)
+    }
+
+    pub fn lookup_range(&self, addr: T, end: Option<T>, is_read: bool) -> LookupResult {
+        let end = end.filter(|end| *end >= addr);
         static UNKNOWN_DEVICE: OnceLock<Arc<CloseableMutex<dyn ChipsetDevice>>> = OnceLock::new();
         static UNKNOWN_DEVICE_NAME: OnceLock<Arc<str>> = OnceLock::new();
         static UNKNOWN_RANGE: OnceLock<Arc<str>> = OnceLock::new();
 
         let inner = self.inner.read();
-        let entry = inner.map.get(&addr);
+        let resolved = inner
+            .map
+            .get(&addr)
+            .filter(|_| end.is_some())
+            .and_then(|entry| entry.dev.upgrade().map(|dev| (entry, dev)))
+            .or_else(|| {
+                let end = end?;
+                let entry = inner.fallback_map.get(&addr)?;
+                if !inner
+                    .fallback_map
+                    .get(&end)
+                    .is_some_and(|last| std::ptr::eq(entry, last))
+                {
+                    return None;
+                }
+                // A fallback must not consume bytes belonging to a more
+                // specific intercept later in the same access.
+                if inner.map.iter().any(|(range, entry)| {
+                    *range.start() <= end && addr <= *range.end() && entry.dev.upgrade().is_some()
+                }) {
+                    return None;
+                }
+                entry.dev.upgrade().map(|dev| (entry, dev))
+            });
+        let entry = resolved.as_ref().map(|(entry, _)| *entry);
         if let Some(entry) = entry {
             if is_read {
                 entry.read_count.increment()
@@ -150,8 +213,8 @@ impl<T: RangeKey> IoRanges<T> {
         }
 
         let (dev, dev_name) =
-            entry
-                .and_then(|e| e.dev.upgrade().map(|d| (d, e.dev_name.clone())))
+            resolved
+                .map(|(entry, dev)| (dev, entry.dev_name.clone()))
                 .unwrap_or_else(|| {
                     (
                         inner.fallback_device.clone().unwrap_or_else(|| {
@@ -196,7 +259,8 @@ impl<T: RangeKey> IoRanges<T> {
     }
 
     pub fn is_occupied(&self, addr: T) -> bool {
-        self.inner.read().map.contains(&addr)
+        let inner = self.inner.read();
+        inner.map.contains(&addr) || inner.fallback_map.contains(&addr)
     }
 }
 
@@ -216,5 +280,168 @@ impl<T: RangeKey> Inspect for IoRanges<T> {
         for (range, entry) in inner.map.iter() {
             resp.field(&format!("{:#x}-{:#x}", range.start(), range.end()), entry);
         }
+        for (range, entry) in inner.fallback_map.iter() {
+            resp.field(
+                &format!("fallback/{:#x}-{:#x}", range.start(), range.end()),
+                entry,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[derive(inspect::InspectMut)]
+    struct TestDevice;
+    impl ChipsetDevice for TestDevice {}
+
+    fn device() -> Arc<CloseableMutex<dyn ChipsetDevice>> {
+        Arc::new(CloseableMutex::new(TestDevice))
+    }
+
+    #[test]
+    fn bar_intercepts_override_fallback_without_replacing_it() {
+        let ranges = IoRanges::new(false, None);
+        let fabric = device();
+        let endpoint = device();
+        ranges
+            .register_fallback(
+                0x100u64,
+                0x1ff,
+                "aperture".into(),
+                Arc::downgrade(&fabric),
+                "fabric".into(),
+            )
+            .unwrap();
+        assert!(ranges.is_occupied(0x180));
+        ranges
+            .register(
+                0x180,
+                0x18f,
+                "bar".into(),
+                Arc::downgrade(&endpoint),
+                "endpoint".into(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, true).dev, &endpoint));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x170, true).dev, &fabric));
+        ranges.revoke(0x180);
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, false).dev, &fabric));
+        assert_eq!(ranges.lookup(0x200, true).dev_name.as_ref(), "<unknown>");
+        ranges.revoke_fallback(0x100);
+        assert_eq!(ranges.lookup(0x184, true).dev_name.as_ref(), "<unknown>");
+        assert!(!ranges.is_occupied(0x184));
+    }
+
+    #[test]
+    fn expired_regular_target_does_not_hide_live_fallback() {
+        let ranges = IoRanges::new(false, None);
+        let fabric = device();
+        let endpoint = device();
+        ranges
+            .register_fallback(
+                0x100u64,
+                0x1ff,
+                "aperture".into(),
+                Arc::downgrade(&fabric),
+                "fabric".into(),
+            )
+            .unwrap();
+        ranges
+            .register(
+                0x180,
+                0x18f,
+                "bar".into(),
+                Arc::downgrade(&endpoint),
+                "endpoint".into(),
+            )
+            .unwrap();
+        drop(endpoint);
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, true).dev, &fabric));
+    }
+
+    #[test]
+    fn fallback_conflicts_are_detected_within_the_same_priority() {
+        let ranges = IoRanges::new(false, None);
+        let first = device();
+        let second = device();
+        ranges
+            .register_fallback(
+                0x100u64,
+                0x1ff,
+                "first".into(),
+                Arc::downgrade(&first),
+                "first".into(),
+            )
+            .unwrap();
+        assert!(
+            ranges
+                .register_fallback(
+                    0x180,
+                    0x2ff,
+                    "second".into(),
+                    Arc::downgrade(&second),
+                    "second".into()
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&ranges.lookup(0x190, true).dev, &first));
+    }
+
+    #[test]
+    fn fallback_does_not_swallow_a_partial_higher_priority_mapping() {
+        let ranges = IoRanges::new(false, None);
+        let fabric = device();
+        let endpoint = device();
+        ranges
+            .register_fallback(
+                0x100u64,
+                0x1ff,
+                "aperture".into(),
+                Arc::downgrade(&fabric),
+                "fabric".into(),
+            )
+            .unwrap();
+        ranges
+            .register(
+                0x184,
+                0x187,
+                "register".into(),
+                Arc::downgrade(&endpoint),
+                "endpoint".into(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &ranges.lookup_range(0x180, Some(0x183), true).dev,
+            &fabric
+        ));
+        assert_eq!(
+            ranges
+                .lookup_range(0x180, Some(0x187), true)
+                .dev_name
+                .as_ref(),
+            "<unknown>"
+        );
+        assert_eq!(
+            ranges
+                .lookup_range(0x180, Some(0x18f), false)
+                .dev_name
+                .as_ref(),
+            "<unknown>"
+        );
+        assert_eq!(
+            ranges
+                .lookup_range(0x1fc, Some(0x203), true)
+                .dev_name
+                .as_ref(),
+            "<unknown>"
+        );
+        assert_eq!(
+            ranges.lookup_range(u64::MAX, None, true).dev_name.as_ref(),
+            "<unknown>"
+        );
     }
 }

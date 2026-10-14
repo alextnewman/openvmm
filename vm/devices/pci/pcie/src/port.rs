@@ -45,6 +45,20 @@ const ACS_CAPABILITY_ALLOWED_USP_MASK: u16 = 0x0000;
 type CxlComponentRegistersSavedState = <CxlComponentRegisters as SaveRestore>::SavedState;
 const CXL_COMPONENT_ALLOWED_ACCESS_SIZES: [usize; 2] = [4, 8];
 
+pub(crate) fn bridge_decodes_mmio(cfg: &ConfigSpaceType1Emulator, addr: u64, len: usize) -> bool {
+    let Some(end) = len
+        .checked_sub(1)
+        .and_then(|offset| addr.checked_add(offset as u64))
+    else {
+        return false;
+    };
+    cfg.assigned_memory_range()
+        .is_some_and(|range| u64::from(*range.start()) <= addr && end <= u64::from(*range.end()))
+        || cfg
+            .assigned_prefetch_range()
+            .is_some_and(|range| range.contains(&addr) && range.contains(&end))
+}
+
 fn validate_cxl_component_register_access(offset: u64, len: usize) -> Result<(), IoError> {
     if !CXL_COMPONENT_ALLOWED_ACCESS_SIZES.contains(&len) {
         return Err(IoError::InvalidAccessSize);
@@ -651,6 +665,59 @@ impl PcieDownstreamPort {
     /// emulator — writes, resets, and restores are reflected automatically.
     pub fn bus_range(&self) -> AssignedBusRange {
         self.cfg_space.bus_range()
+    }
+
+    /// Whether this bridge currently decodes the whole memory access.
+    pub fn decodes_mmio(&self, addr: u64, len: usize) -> bool {
+        bridge_decodes_mmio(&self.cfg_space, addr, len)
+    }
+
+    /// Whether any part of an access overlaps an enabled bridge window.
+    pub(crate) fn overlaps_mmio(&self, addr: u64, len: usize) -> bool {
+        let Some(end) = len
+            .checked_sub(1)
+            .and_then(|offset| addr.checked_add(offset as u64))
+        else {
+            return false;
+        };
+        self.cfg_space.assigned_memory_range().is_some_and(|range| {
+            addr <= u64::from(*range.end()) && u64::from(*range.start()) <= end
+        }) || self
+            .cfg_space
+            .assigned_prefetch_range()
+            .is_some_and(|range| addr <= *range.end() && *range.start() <= end)
+    }
+
+    /// Forward a decoded memory read to a downstream fabric.
+    pub fn forward_mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        if !self.decodes_mmio(addr, data.len()) {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        let Some((_, device)) = &mut self.link else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
+        if !device.supports_mmio_forwarding() {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        device
+            .mmio_read(addr, data)
+            .unwrap_or(IoResult::Err(IoError::InvalidRegister))
+    }
+
+    /// Forward a decoded memory write to a downstream fabric.
+    pub fn forward_mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        if !self.decodes_mmio(addr, data.len()) {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        let Some((_, device)) = &mut self.link else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
+        if !device.supports_mmio_forwarding() {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        device
+            .mmio_write(addr, data)
+            .unwrap_or(IoResult::Err(IoError::InvalidRegister))
     }
 
     /// Notify the guest of a hotplug event via MSI.

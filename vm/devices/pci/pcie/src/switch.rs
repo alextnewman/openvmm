@@ -18,7 +18,9 @@ use crate::port::PcieDownstreamPort;
 use crate::port::PciePortSettings;
 use anyhow::Context;
 use chipset_device::ChipsetDevice;
+use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
+use chipset_device::mmio::MmioIntercept;
 use chipset_device::pci::ByteEnabledDwordRead;
 use chipset_device::pci::ByteEnabledDwordWrite;
 use chipset_device::pci::PciConfigAccessType;
@@ -312,6 +314,26 @@ impl GenericPcieSwitch {
         &self.name
     }
 
+    fn mmio_port(&mut self, addr: u64, len: usize) -> Result<&mut PcieDownstreamPort, IoError> {
+        if !crate::port::bridge_decodes_mmio(&self.upstream_port.cfg_space, addr, len) {
+            return Err(IoError::InvalidRegister);
+        }
+        let mut matched = None;
+        for (_, _, port) in &mut self.downstream_ports {
+            if port.port.overlaps_mmio(addr, len) {
+                if matched.is_some() {
+                    tracelimit::warn_ratelimited!(addr, len, "overlapping switch memory windows");
+                    return Err(IoError::InvalidRegister);
+                }
+                if !port.port.decodes_mmio(addr, len) {
+                    return Err(IoError::InvalidRegister);
+                }
+                matched = Some(&mut port.port);
+            }
+        }
+        matched.ok_or(IoError::InvalidRegister)
+    }
+
     /// Get a reference to the upstream switch port.
     pub fn upstream_port(&self) -> &UpstreamSwitchPort {
         &self.upstream_port
@@ -408,6 +430,10 @@ impl ChangeDeviceState for GenericPcieSwitch {
 }
 
 impl ChipsetDevice for GenericPcieSwitch {
+    fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
+        Some(self)
+    }
+
     /// Exposes this switch as a PCI config-space device to the chipset bus.
     fn supports_pci(&mut self) -> Option<&mut dyn PciConfigSpace> {
         Some(self)
@@ -420,6 +446,10 @@ impl ChipsetDevice for GenericPcieSwitch {
 }
 
 impl PciConfigSpace for GenericPcieSwitch {
+    fn supports_mmio_forwarding(&self) -> bool {
+        true
+    }
+
     /// Reads the switch's own upstream-port config space (Type 0 view).
     fn pci_cfg_read(&mut self, byte_offset: u16, value: ByteEnabledDwordRead<'_>) -> IoResult {
         self.upstream_port
@@ -523,6 +553,22 @@ impl PciConfigSpace for GenericPcieSwitch {
     fn suggested_bdf(&mut self) -> Option<(u8, u8, u8)> {
         // PCIe switches typically don't have a fixed BDF requirement
         None
+    }
+}
+
+impl MmioIntercept for GenericPcieSwitch {
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        match self.mmio_port(addr, data.len()) {
+            Ok(port) => port.forward_mmio_read(addr, data),
+            Err(error) => IoResult::Err(error),
+        }
+    }
+
+    fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        match self.mmio_port(addr, data.len()) {
+            Ok(port) => port.forward_mmio_write(addr, data),
+            Err(error) => IoResult::Err(error),
+        }
     }
 }
 
@@ -1090,7 +1136,8 @@ mod tests {
         // Test that it supports PCI but not other interfaces
         assert!(switch.supports_pci().is_some());
         assert!(switch.supports_poll_device().is_some());
-        assert!(switch.supports_mmio().is_none());
+        assert!(switch.supports_mmio().is_some());
+        assert!(switch.supports_mmio_forwarding());
         assert!(switch.supports_pio().is_none());
 
         // Test PciConfigSpace interface

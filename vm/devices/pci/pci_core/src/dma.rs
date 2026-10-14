@@ -75,6 +75,7 @@ enum Passthrough {
 /// [`with_rid_offset`](Self::with_rid_offset) when creating VFs.
 #[derive(Clone)]
 pub struct DmaTarget {
+    bus_range: AssignedBusRange,
     /// This target's requester-ID offset from the secondary bus. Held so
     /// [`with_rid_offset`](Self::with_rid_offset) can derive a target at a
     /// further offset relative to this one.
@@ -102,8 +103,9 @@ impl DmaTarget {
         guest_memory: GuestMemory,
         msi: &MsiConnection,
     ) -> Self {
-        let msi_target = msi.msi_target(bus_range, devfn);
+        let msi_target = msi.msi_target(bus_range.clone(), devfn);
         Self {
+            bus_range,
             rid_offset: devfn as u16,
             guest_memory,
             msi_target,
@@ -173,8 +175,9 @@ impl DmaTarget {
         passthrough: Passthrough,
     ) -> Self {
         let guest_memory = iommu.guest_memory_for_rid_offset(devfn as u16);
-        let msi_target = msi.msi_target(bus_range, devfn);
+        let msi_target = msi.msi_target(bus_range.clone(), devfn);
         Self {
+            bus_range,
             rid_offset: devfn as u16,
             guest_memory,
             msi_target,
@@ -191,6 +194,25 @@ impl DmaTarget {
     /// Returns the MSI target for interrupt delivery from this device.
     pub fn msi_target(&self) -> &MsiTarget {
         &self.msi_target
+    }
+
+    /// Returns the current downstream bus range of this target's port.
+    pub fn bus_range(&self) -> (u8, u8) {
+        self.bus_range.bus_range()
+    }
+
+    /// Derives matching DMA and MSI identities from a segment-local requester
+    /// ID. IDs outside this port's current bus range are rejected.
+    ///
+    /// The derived target follows subsequent bus renumbering by keeping the
+    /// requester's offset from the secondary bus, like [`Self::with_rid_offset`].
+    pub fn with_rid(&self, rid: u16) -> Option<Self> {
+        let (secondary, subordinate) = self.bus_range();
+        if !(secondary..=subordinate).contains(&((rid >> 8) as u8)) {
+            return None;
+        }
+        let offset = rid.wrapping_sub(u16::from(secondary) << 8);
+        Some(self.with_rid_offset(offset.wrapping_sub(self.rid_offset)))
     }
 
     /// The device's host-passthrough disposition.
@@ -220,6 +242,7 @@ impl DmaTarget {
     pub fn with_rid_offset(&self, delta: u16) -> DmaTarget {
         let rid_offset = self.rid_offset.wrapping_add(delta);
         DmaTarget {
+            bus_range: self.bus_range.clone(),
             rid_offset,
             guest_memory: match &self.iommu {
                 Some(factory) => factory.guest_memory_for_rid_offset(rid_offset),
@@ -240,6 +263,7 @@ mod tests {
     use crate::msi::SignalMsi;
     use parking_lot::Mutex;
     use std::sync::Arc;
+    use test_with_tracing::test;
 
     /// Records the requester IDs signaled through an `MsiTarget`, so tests
     /// can observe the MSI identity derived by `with_rid_offset`.
@@ -403,6 +427,32 @@ mod tests {
 
         derived.msi_target().signal_msi(0xFEE0_0000, 0);
         assert_eq!(recorder.pop().unwrap(), (7 << 8) | 0x0A);
+    }
+
+    #[test]
+    fn absolute_rids_keep_downstream_buses_distinct() {
+        let buses = AssignedBusRange::new();
+        buses.set_bus_range(5, 10);
+        let msi = MsiConnection::new();
+        let recorder = RecordingSignalMsi::new();
+        msi.connect(recorder.clone());
+        let iommu = RecordingIommu::new();
+        let target = DmaTarget::with_iommu(buses.clone(), 0x08, iommu.clone(), &msi);
+
+        let first = target.with_rid(0x0602).unwrap();
+        let second = target.with_rid(0x0802).unwrap();
+        assert_eq!(*iommu.rid_offset_calls.lock(), [0x08, 0x0102, 0x0302]);
+        first.msi_target().signal_msi(0xfee0_0000, 1);
+        assert_eq!(recorder.pop(), Some(0x0602));
+        second.msi_target().signal_msi(0xfee0_0000, 2);
+        assert_eq!(recorder.pop(), Some(0x0802));
+        assert!(target.with_rid(0x0402).is_none());
+        assert!(target.with_rid(0x0b02).is_none());
+
+        buses.set_bus_range(9, 14);
+        first.msi_target().signal_msi(0xfee0_0000, 3);
+        assert_eq!(recorder.pop(), Some(0x0a02));
+        assert!(target.with_rid(0x0802).is_none());
     }
 
     /// An opaque nesting context behind the `HardwareNestable` handle, of the

@@ -16,6 +16,14 @@ impl RegisterMmioIntercept for TestPcieMmioRegistration {
     fn new_io_region(&mut self, _debug_name: &str, len: u64) -> Box<dyn ControlMmioIntercept> {
         Box::new(TestPcieControlMmioIntercept { mapping: None, len })
     }
+
+    fn new_fallback_io_region(
+        &mut self,
+        name: &str,
+        len: u64,
+    ) -> Option<Box<dyn ControlMmioIntercept>> {
+        Some(self.new_io_region(name, len))
+    }
 }
 
 pub struct TestPcieControlMmioIntercept {
@@ -56,7 +64,8 @@ impl ControlMmioIntercept for TestPcieControlMmioIntercept {
     /// Returns `None` if the provided `addr` is outside of the memory
     /// region, or the region is currently unmapped.
     fn offset_of(&self, addr: u64) -> Option<u64> {
-        self.mapping.map(|base_addr| addr - base_addr)
+        addr.checked_sub(self.mapping?)
+            .filter(|offset| *offset < self.len)
     }
 
     fn region_name(&self) -> &str {

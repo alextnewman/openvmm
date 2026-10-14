@@ -48,6 +48,10 @@ use vmcore::device_state::ChangeDeviceState;
 /// Error returned when a root complex configuration is invalid.
 #[derive(Debug, Error)]
 pub enum InvalidRootComplexError {
+    /// The chipset cannot register a root-complex memory aperture without
+    /// replacing ordinary device BAR mappings.
+    #[error("root-complex memory apertures require range-scoped fallback MMIO")]
+    MissingFallbackMmio,
     /// Too many root ports were requested for the available device/function
     /// slots.
     #[error("requested {port_count} root ports, but only {max} are supported")]
@@ -81,6 +85,9 @@ pub struct GenericPcieRootComplex {
     ecam: Box<dyn ControlMmioIntercept>,
     /// Intercept control for the CHBCR MMIO region, when present.
     chbcr: Option<Box<dyn ControlMmioIntercept>>,
+    /// Host-bridge apertures, below ordinary BAR intercepts in decode priority.
+    #[inspect(with = "|x| inspect::iter_by_index(x.iter().map(|region| region.as_ref()))")]
+    mmio_apertures: Vec<Box<dyn ControlMmioIntercept>>,
     /// CXL Component Registers backing CHBCR accesses in CXL mode.
     cxl_component_registers: Option<CxlComponentRegisters>,
     /// Devices on the root complex bus, sorted by devfn
@@ -140,6 +147,7 @@ pub struct GenericPcieRootComplexBuilder<'a> {
     first_port_device_number: u8,
     reserved_device_numbers: u32,
     chbcr_range: Option<MemoryRange>,
+    mmio_apertures: Vec<MemoryRange>,
 }
 
 fn device_number_is_reserved(reserved_device_numbers: u32, device: u8) -> bool {
@@ -192,6 +200,14 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
         self
     }
 
+    /// Set the fixed host-bridge memory apertures. Unclaimed accesses in these
+    /// ranges are routed through the currently enabled downstream bridge
+    /// windows; ordinary device BAR intercepts retain priority.
+    pub fn mmio_apertures(mut self, ranges: impl IntoIterator<Item = MemoryRange>) -> Self {
+        self.mmio_apertures = ranges.into_iter().collect();
+        self
+    }
+
     /// Build the root complex.
     ///
     /// Returns an error if the root port count exceeds the available
@@ -205,6 +221,7 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
             first_port_device_number,
             reserved_device_numbers,
             chbcr_range,
+            mmio_apertures,
         } = self;
 
         let start_bus = *bus_range.start();
@@ -230,6 +247,19 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
             region.map(range.start());
             region
         });
+
+        let mmio_apertures = mmio_apertures
+            .into_iter()
+            .filter(|range| !range.is_empty())
+            .enumerate()
+            .map(|(index, range)| {
+                let mut region = register_mmio
+                    .new_fallback_io_region(&format!("downstream-{index}"), range.len())
+                    .ok_or(InvalidRootComplexError::MissingFallbackMmio)?;
+                region.map(range.start());
+                Ok(region)
+            })
+            .collect::<Result<Vec<_>, InvalidRootComplexError>>()?;
 
         let mut devices: Vec<(u8, BusDevice)> = Vec::new();
 
@@ -287,6 +317,7 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
             end_bus,
             ecam,
             chbcr,
+            mmio_apertures,
             cxl_component_registers,
             devices,
             reserved_device_numbers,
@@ -316,7 +347,43 @@ impl GenericPcieRootComplex {
             first_port_device_number: 0,
             reserved_device_numbers: 0,
             chbcr_range: None,
+            mmio_apertures: Vec::new(),
         }
+    }
+
+    fn mmio_port(&mut self, addr: u64, len: usize) -> Result<&mut RootPort, IoError> {
+        let end = len
+            .checked_sub(1)
+            .and_then(|offset| addr.checked_add(offset as u64))
+            .ok_or(IoError::InvalidAccessSize)?;
+        if !self
+            .mmio_apertures
+            .iter()
+            .any(|region| region.offset_of(addr).is_some() && region.offset_of(end).is_some())
+        {
+            return Err(IoError::InvalidRegister);
+        }
+
+        let mut matched = None;
+        for (_, device) in &mut self.devices {
+            if let BusDevice::RootPort { port, .. } = device {
+                if port.port.overlaps_mmio(addr, len) {
+                    if matched.is_some() {
+                        tracelimit::warn_ratelimited!(
+                            addr,
+                            len,
+                            "overlapping PCIe bridge memory windows"
+                        );
+                        return Err(IoError::InvalidRegister);
+                    }
+                    if !port.port.decodes_mmio(addr, len) {
+                        return Err(IoError::InvalidRegister);
+                    }
+                    matched = Some(port.as_mut());
+                }
+            }
+        }
+        matched.ok_or(IoError::InvalidRegister)
     }
 
     /// Reads CHBCR bytes from the CXL component-register backing object.
@@ -601,6 +668,12 @@ impl MmioIntercept for GenericPcieRootComplex {
         if let Some(result) = self.mmio_read_non_ecam(addr, data) {
             return result;
         }
+        if self.ecam.offset_of(addr).is_none() {
+            return match self.mmio_port(addr, data.len()) {
+                Ok(port) => port.port.forward_mmio_read(addr, data),
+                Err(error) => IoResult::Err(error),
+            };
+        }
 
         let (address, byte_enable) = match self.parse_ecam_access(addr, data.len()) {
             Ok(result) => result,
@@ -626,6 +699,12 @@ impl MmioIntercept for GenericPcieRootComplex {
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
         if let Some(result) = self.mmio_write_non_ecam(addr, data) {
             return result;
+        }
+        if self.ecam.offset_of(addr).is_none() {
+            return match self.mmio_port(addr, data.len()) {
+                Ok(port) => port.port.forward_mmio_write(addr, data),
+                Err(error) => IoResult::Err(error),
+            };
         }
 
         let (address, byte_enable) = match self.parse_ecam_access(addr, data.len()) {
@@ -1044,7 +1123,415 @@ mod tests {
     use pal_async::async_test;
     use parking_lot::Mutex;
     use pci_core::test_helpers::TestCfgAccess;
+    use test_with_tracing::test;
+    use vmcore::save_restore::SaveRestore;
     use zerocopy::IntoBytes;
+
+    #[derive(Default)]
+    struct FabricTraffic {
+        reads: Vec<(u64, usize)>,
+        writes: Vec<(u64, Vec<u8>)>,
+        config: Vec<(PciConfigAccessType, u8, u8)>,
+    }
+
+    struct FabricEndpoint {
+        traffic: Arc<Mutex<FabricTraffic>>,
+        forwarding: bool,
+    }
+
+    impl GenericPciBusDevice for FabricEndpoint {
+        fn supports_mmio_forwarding(&mut self) -> bool {
+            self.forwarding
+        }
+
+        fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> Option<IoResult> {
+            self.traffic.lock().reads.push((addr, data.len()));
+            data.fill(0xa5);
+            Some(IoResult::Ok)
+        }
+
+        fn mmio_write(&mut self, addr: u64, data: &[u8]) -> Option<IoResult> {
+            self.traffic.lock().writes.push((addr, data.to_vec()));
+            Some(IoResult::Ok)
+        }
+
+        fn pci_cfg_read(
+            &mut self,
+            _offset: u16,
+            _value: ByteEnabledDwordRead<'_>,
+        ) -> Option<IoResult> {
+            panic!("fabric reads require a BDF")
+        }
+
+        fn pci_cfg_write(
+            &mut self,
+            _offset: u16,
+            _value: ByteEnabledDwordWrite,
+        ) -> Option<IoResult> {
+            panic!("fabric writes require a BDF")
+        }
+
+        fn pci_cfg_read_with_routing(
+            &mut self,
+            access_type: PciConfigAccessType,
+            address: PciConfigAddress,
+            mut value: ByteEnabledDwordRead<'_>,
+        ) -> Option<IoResult> {
+            self.traffic
+                .lock()
+                .config
+                .push((access_type, address.bus, address.devfn));
+            value.set(0x5678_1234);
+            Some(IoResult::Ok)
+        }
+    }
+
+    fn fabric_root(port_count: u8) -> GenericPcieRootComplex {
+        let ports = (0..port_count)
+            .map(|port| GenericPciePortDefinition {
+                name: format!("port{port}").into(),
+                devfn: Some(port << 3),
+                hotplug: true,
+                settings: PciePortSettings::default(),
+            })
+            .collect();
+        let msi = pci_core::msi::MsiConnection::new();
+        GenericPcieRootComplex::builder(
+            &mut TestPcieMmioRegistration {},
+            0..=15,
+            MemoryRange::new(0..0x0100_0000),
+        )
+        .root_ports(ports, &msi.target())
+        .mmio_apertures([
+            MemoryRange::new(0x8000_0000..0x9000_0000),
+            MemoryRange::new(0x1_0000_0000..0x1_2000_0000),
+        ])
+        .build()
+        .unwrap()
+    }
+
+    fn fabric_cfg_write(
+        rc: &mut GenericPcieRootComplex,
+        bus: u8,
+        devfn: u8,
+        offset: u16,
+        value: u32,
+    ) {
+        let address = (u64::from(bus) << 20) | (u64::from(devfn) << 12) | u64::from(offset);
+        rc.mmio_write(address, &value.to_le_bytes()).unwrap();
+    }
+
+    fn fabric_window(
+        rc: &mut GenericPcieRootComplex,
+        bus: u8,
+        devfn: u8,
+        first: u64,
+        last: u64,
+        prefetch: bool,
+    ) {
+        let low = ((first >> 16) as u32 & 0xfff0) | (((last >> 16) as u32 & 0xfff0) << 16);
+        if prefetch {
+            fabric_cfg_write(rc, bus, devfn, 0x24, low | 0x0001_0001);
+            fabric_cfg_write(rc, bus, devfn, 0x28, (first >> 32) as u32);
+            fabric_cfg_write(rc, bus, devfn, 0x2c, (last >> 32) as u32);
+        } else {
+            fabric_cfg_write(rc, bus, devfn, 0x20, low);
+        }
+        fabric_cfg_write(rc, bus, devfn, 0x04, 2);
+    }
+
+    #[test]
+    fn fabric_mmio_follows_enabled_windows_and_preserves_addresses() {
+        let mut rc = fabric_root(1);
+        let traffic = Arc::new(Mutex::new(FabricTraffic::default()));
+        rc.add_pcie_device(
+            0,
+            "fabric",
+            Box::new(FabricEndpoint {
+                traffic: traffic.clone(),
+                forwarding: true,
+            }),
+        )
+        .unwrap();
+        let mut value = [0; 8];
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut value),
+            IoResult::Err(_)
+        ));
+        fabric_window(&mut rc, 0, 0, 0x8100_0000, 0x81ff_ffff, false);
+        rc.mmio_read(0x8100_0040, &mut value).unwrap();
+        assert_eq!(value, [0xa5; 8]);
+        rc.mmio_write(0x8100_0080, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(traffic.lock().reads, [(0x8100_0040, 8)]);
+        assert_eq!(traffic.lock().writes, [(0x8100_0080, vec![1, 2, 3, 4])]);
+        assert!(matches!(
+            rc.mmio_read(0x81ff_fffc, &mut value),
+            IoResult::Err(_)
+        ));
+        assert!(matches!(
+            rc.mmio_read(0x9000_0000, &mut value),
+            IoResult::Err(_)
+        ));
+
+        fabric_window(&mut rc, 0, 0, 0x1_1000_0000, 0x1_10ff_ffff, true);
+        rc.mmio_read(0x1_1000_0040, &mut value).unwrap();
+        assert_eq!(traffic.lock().reads.last(), Some(&(0x1_1000_0040, 8)));
+        fabric_cfg_write(&mut rc, 0, 0, 0x04, 0);
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut value),
+            IoResult::Err(_)
+        ));
+        assert!(matches!(
+            rc.mmio_read(0x1_1000_0040, &mut value),
+            IoResult::Err(_)
+        ));
+    }
+
+    #[test]
+    fn fabric_apertures_require_fallback_registration_support() {
+        struct OrdinaryMmioRegistration;
+        impl RegisterMmioIntercept for OrdinaryMmioRegistration {
+            fn new_io_region(&mut self, name: &str, len: u64) -> Box<dyn ControlMmioIntercept> {
+                TestPcieMmioRegistration {}.new_io_region(name, len)
+            }
+        }
+
+        let mut register = OrdinaryMmioRegistration;
+        let result =
+            GenericPcieRootComplex::builder(&mut register, 0..=0, MemoryRange::new(0..0x10_0000))
+                .mmio_apertures([MemoryRange::new(0x8000_0000..0x9000_0000)])
+                .build();
+        assert!(matches!(
+            result,
+            Err(InvalidRootComplexError::MissingFallbackMmio)
+        ));
+    }
+
+    #[test]
+    fn fabric_rejects_empty_and_overflowing_accesses() {
+        let mut rc = fabric_root(1);
+        for (address, len) in [(0x8000_0000, 0), (u64::MAX, 8)] {
+            assert!(matches!(
+                rc.mmio_read(address, &mut [0; 8][..len]),
+                IoResult::Err(IoError::InvalidAccessSize)
+            ));
+            assert!(matches!(
+                rc.mmio_write(address, &[0; 8][..len]),
+                IoResult::Err(IoError::InvalidAccessSize)
+            ));
+        }
+    }
+
+    #[async_test]
+    async fn fabric_forwarding_tracks_reset_restore_and_hotplug() {
+        let mut rc = fabric_root(1);
+        let first = Arc::new(Mutex::new(FabricTraffic::default()));
+        let second = Arc::new(Mutex::new(FabricTraffic::default()));
+        fabric_window(&mut rc, 0, 0, 0x8100_0000, 0x81ff_ffff, false);
+        rc.hotplug_add_device(
+            "port0",
+            "first",
+            Box::new(FabricEndpoint {
+                traffic: first.clone(),
+                forwarding: true,
+            }),
+        )
+        .unwrap();
+        rc.mmio_read(0x8100_0040, &mut [0; 4]).unwrap();
+        let saved = rc.save().unwrap();
+        rc.reset().await;
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut [0; 4]),
+            IoResult::Err(_)
+        ));
+        rc.restore(saved).unwrap();
+        rc.mmio_read(0x8100_0040, &mut [0; 4]).unwrap();
+        rc.hotplug_remove_device("port0").unwrap();
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut [0; 4]),
+            IoResult::Err(_)
+        ));
+        rc.hotplug_add_device(
+            "port0",
+            "second",
+            Box::new(FabricEndpoint {
+                traffic: second.clone(),
+                forwarding: true,
+            }),
+        )
+        .unwrap();
+        rc.mmio_write(0x8100_0040, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(first.lock().reads, [(0x8100_0040, 4); 2]);
+        assert!(first.lock().writes.is_empty());
+        assert!(second.lock().reads.is_empty());
+        assert_eq!(second.lock().writes, [(0x8100_0040, vec![1, 2, 3, 4])]);
+    }
+
+    #[test]
+    fn unclaimed_mmio_is_not_delivered_to_ordinary_endpoints() {
+        let mut rc = fabric_root(1);
+        let traffic = Arc::new(Mutex::new(FabricTraffic::default()));
+        rc.add_pcie_device(
+            0,
+            "ordinary",
+            Box::new(FabricEndpoint {
+                traffic: traffic.clone(),
+                forwarding: false,
+            }),
+        )
+        .unwrap();
+        fabric_window(&mut rc, 0, 0, 0x8100_0000, 0x81ff_ffff, false);
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut [0; 4]),
+            IoResult::Err(_)
+        ));
+        assert!(traffic.lock().reads.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_bridge_windows_do_not_select_an_arbitrary_fabric() {
+        let mut rc = fabric_root(2);
+        let traffic = Arc::new(Mutex::new(FabricTraffic::default()));
+        for devfn in [0, 8] {
+            rc.add_pcie_device(
+                devfn,
+                "fabric",
+                Box::new(FabricEndpoint {
+                    traffic: traffic.clone(),
+                    forwarding: true,
+                }),
+            )
+            .unwrap();
+            fabric_window(&mut rc, 0, devfn, 0x8100_0000, 0x81ff_ffff, false);
+        }
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut [0; 4]),
+            IoResult::Err(_)
+        ));
+        assert!(traffic.lock().reads.is_empty());
+    }
+
+    #[test]
+    fn partial_bridge_window_overlap_rejects_the_entire_access() {
+        let mut rc = fabric_root(2);
+        let traffic = Arc::new(Mutex::new(FabricTraffic::default()));
+        for devfn in [0, 8] {
+            rc.add_pcie_device(
+                devfn,
+                "fabric",
+                Box::new(FabricEndpoint {
+                    traffic: traffic.clone(),
+                    forwarding: true,
+                }),
+            )
+            .unwrap();
+        }
+        fabric_window(&mut rc, 0, 0, 0x8100_0000, 0x82ff_ffff, false);
+        fabric_window(&mut rc, 0, 8, 0x8200_0000, 0x82ff_ffff, false);
+        assert!(matches!(
+            rc.mmio_read(0x81ff_fffc, &mut [0; 8]),
+            IoResult::Err(_)
+        ));
+        assert!(matches!(
+            rc.mmio_write(0x81ff_fffc, &[0; 8]),
+            IoResult::Err(_)
+        ));
+        assert!(traffic.lock().reads.is_empty());
+        assert!(traffic.lock().writes.is_empty());
+    }
+
+    #[test]
+    fn switch_fanout_routes_configuration_and_memory_by_topology() {
+        let mut rc = fabric_root(1);
+        let msi = pci_core::msi::MsiConnection::new();
+        let switch = Arc::new(Mutex::new(
+            GenericPcieSwitch::new(GenericPcieSwitchDefinition {
+                name: "switch".into(),
+                downstream_ports: (0..2)
+                    .map(|port| GenericPciePortDefinition {
+                        name: format!("dsp{port}").into(),
+                        devfn: Some(port << 3),
+                        hotplug: false,
+                        settings: PciePortSettings::default(),
+                    })
+                    .collect(),
+                msi_target: msi.target(),
+            })
+            .unwrap(),
+        ));
+        let first = Arc::new(Mutex::new(FabricTraffic::default()));
+        let second = Arc::new(Mutex::new(FabricTraffic::default()));
+        switch
+            .lock()
+            .add_pcie_device(
+                0,
+                "first",
+                Box::new(FabricEndpoint {
+                    traffic: first.clone(),
+                    forwarding: true,
+                }),
+            )
+            .unwrap();
+        switch
+            .lock()
+            .add_pcie_device(
+                8,
+                "second",
+                Box::new(FabricEndpoint {
+                    traffic: second.clone(),
+                    forwarding: true,
+                }),
+            )
+            .unwrap();
+        rc.add_pcie_device(0, "switch", Box::new(SwitchAdapter(switch.clone())))
+            .unwrap();
+
+        fabric_cfg_write(&mut rc, 0, 0, 0x18, 0x000f_0300);
+        fabric_cfg_write(&mut rc, 3, 0, 0x18, 0x000f_0403);
+        fabric_cfg_write(&mut rc, 4, 0, 0x18, 0x0005_0504);
+        fabric_cfg_write(&mut rc, 4, 8, 0x18, 0x000c_0904);
+        fabric_window(&mut rc, 0, 0, 0x8000_0000, 0x8fff_ffff, false);
+        fabric_window(&mut rc, 3, 0, 0x8000_0000, 0x8fff_ffff, false);
+        fabric_window(&mut rc, 4, 0, 0x8100_0000, 0x81ff_ffff, false);
+        fabric_window(&mut rc, 4, 8, 0x8200_0000, 0x82ff_ffff, false);
+
+        let mut data = [0; 4];
+        rc.mmio_read((5 << 20) | (2 << 12), &mut data).unwrap();
+        rc.mmio_read((11 << 20) | (0x28 << 12), &mut data).unwrap();
+        assert_eq!(first.lock().config, [(PciConfigAccessType::Type0, 5, 2)]);
+        assert_eq!(
+            second.lock().config,
+            [(PciConfigAccessType::Type1, 11, 0x28)]
+        );
+        rc.mmio_read(0x8100_0040, &mut data).unwrap();
+        rc.mmio_write(0x8200_0080, &[9, 8, 7, 6]).unwrap();
+        assert_eq!(first.lock().reads, [(0x8100_0040, 4)]);
+        assert_eq!(second.lock().writes, [(0x8200_0080, vec![9, 8, 7, 6])]);
+
+        fabric_window(&mut rc, 4, 0, 0x8100_0000, 0x82ff_ffff, false);
+        assert!(matches!(
+            rc.mmio_read(0x81ff_fffc, &mut [0; 8]),
+            IoResult::Err(_)
+        ));
+        assert_eq!(first.lock().reads, [(0x8100_0040, 4)]);
+        fabric_window(&mut rc, 4, 0, 0x8100_0000, 0x81ff_ffff, false);
+        let saved = switch.lock().save().unwrap();
+        fabric_cfg_write(&mut rc, 4, 8, 0x04, 0);
+        assert!(matches!(rc.mmio_write(0x8200_0080, &[1]), IoResult::Err(_)));
+        fabric_cfg_write(&mut rc, 3, 0, 0x04, 0);
+        assert!(matches!(
+            rc.mmio_read(0x8100_0040, &mut data),
+            IoResult::Err(_)
+        ));
+        switch.lock().restore(saved).unwrap();
+        rc.mmio_read(0x8100_0040, &mut data).unwrap();
+        rc.mmio_write(0x8200_0080, &[1]).unwrap();
+        assert_eq!(first.lock().reads, [(0x8100_0040, 4); 2]);
+        assert_eq!(
+            second.lock().writes,
+            [(0x8200_0080, vec![9, 8, 7, 6]), (0x8200_0080, vec![1])]
+        );
+    }
 
     struct DeferredEndpoint {
         state: Arc<Mutex<DeferredEndpointState>>,
@@ -1106,6 +1593,18 @@ mod tests {
     struct SwitchAdapter(Arc<Mutex<GenericPcieSwitch>>);
 
     impl GenericPciBusDevice for SwitchAdapter {
+        fn supports_mmio_forwarding(&mut self) -> bool {
+            true
+        }
+
+        fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> Option<IoResult> {
+            Some(self.0.lock().mmio_read(addr, data))
+        }
+
+        fn mmio_write(&mut self, addr: u64, data: &[u8]) -> Option<IoResult> {
+            Some(self.0.lock().mmio_write(addr, data))
+        }
+
         fn pci_cfg_read(
             &mut self,
             offset: u16,

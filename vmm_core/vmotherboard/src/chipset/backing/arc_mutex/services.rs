@@ -257,6 +257,7 @@ pub(crate) fn register_mmio_for_device(
 
 mod device_range {
     use crate::chipset::io_ranges::IoRanges;
+    use address_filter::RangeKey;
     use chipset_device::ChipsetDevice;
     use chipset_device::mmio::ControlMmioIntercept;
     use chipset_device::mmio::RegisterMmioIntercept;
@@ -276,13 +277,25 @@ mod device_range {
 
     // Implementation detail - the concrete type returned by DeviceRangeMapper's
     // `new_io_region` implementation
-    struct DeviceRange<T> {
+    struct DeviceRange<T: RangeKey> {
         ranges: IoRanges<T>,
         region_name: Arc<str>,
         len: T,
         addr: Option<T>,
         dev: Weak<CloseableMutex<dyn ChipsetDevice>>,
         dev_name: Arc<str>,
+        fallback: bool,
+    }
+
+    impl<T: RangeKey> Drop for DeviceRange<T> {
+        fn drop(&mut self) {
+            // Failed fabric construction must release any apertures already mapped.
+            if self.fallback {
+                if let Some(addr) = self.addr.take() {
+                    self.ranges.revoke_fallback(addr);
+                }
+            }
+        }
     }
 
     macro_rules! impl_device_range {
@@ -296,7 +309,24 @@ mod device_range {
                         addr: None,
                         dev: self.dev.clone(),
                         dev_name: self.dev_name.clone(),
+                        fallback: false,
                     })
+                }
+
+                fn new_fallback_io_region(
+                    &mut self,
+                    region_name: &str,
+                    len: $addr,
+                ) -> Option<Box<dyn $control>> {
+                    Some(Box::new(DeviceRange {
+                        ranges: self.ranges.clone(),
+                        region_name: region_name.into(),
+                        len,
+                        addr: None,
+                        dev: self.dev.clone(),
+                        dev_name: self.dev_name.clone(),
+                        fallback: true,
+                    }))
                 }
             }
 
@@ -311,9 +341,24 @@ mod device_range {
                         return;
                     }
                     self.unmap();
-                    match self.ranges.register(
+                    let Some(end) = addr.checked_add(self.len - 1) else {
+                        tracelimit::warn_ratelimited!(
+                            region_name = ?self.region_name,
+                            addr,
+                            len = self.len,
+                            "IO mapping exceeds the address space"
+                        );
+                        return;
+                    };
+                    let register = if self.fallback {
+                        IoRanges::register_fallback
+                    } else {
+                        IoRanges::register
+                    };
+                    match register(
+                        &self.ranges,
                         addr,
-                        addr.checked_add(self.len - 1).expect("overflow during addition, not possible in real hardware"),
+                        end,
                         self.region_name.clone(),
                         self.dev.clone(),
                         self.dev_name.clone(),
@@ -336,7 +381,11 @@ mod device_range {
                 fn unmap(&mut self) {
                     tracing::trace!(region_name = ?self.region_name, addr = ?self.addr, len = ?self.len, "unmap");
                     if let Some(addr) = self.addr.take() {
-                        self.ranges.revoke(addr)
+                        if self.fallback {
+                            self.ranges.revoke_fallback(addr)
+                        } else {
+                            self.ranges.revoke(addr)
+                        }
                     }
                 }
 
@@ -349,10 +398,8 @@ mod device_range {
                 }
 
                 fn offset_of(&self, addr: $addr) -> Option<$addr> {
-                    let base = self.addr?;
-                    (base..(base + self.len))
-                        .contains(&addr)
-                        .then(|| addr - base)
+                    addr.checked_sub(self.addr?)
+                        .filter(|offset| *offset < self.len)
                 }
             }
         };
@@ -360,4 +407,68 @@ mod device_range {
 
     impl_device_range!(RegisterMmioIntercept, ControlMmioIntercept, u64);
     impl_device_range!(RegisterPortIoIntercept, ControlPortIoIntercept, u16);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[derive(inspect::InspectMut)]
+    struct TestDevice;
+    impl ChipsetDevice for TestDevice {}
+
+    fn device() -> Arc<CloseableMutex<dyn ChipsetDevice>> {
+        Arc::new(CloseableMutex::new(TestDevice))
+    }
+
+    #[test]
+    fn dropping_fallback_registration_releases_only_its_priority() {
+        let ranges = IoRanges::new(false, None);
+        let dev = device();
+        let mut register =
+            register_mmio_for_device("test".into(), Arc::downgrade(&dev), ranges.clone());
+        let mut fallback = register.new_fallback_io_region("aperture", 0x100).unwrap();
+        let mut bar = register.new_io_region("bar", 0x10);
+        fallback.map(0x1000);
+        bar.map(0x1080);
+        drop(fallback);
+        assert_eq!(ranges.lookup(0x1000, true).dev_name.as_ref(), "<unknown>");
+        assert!(Arc::ptr_eq(&ranges.lookup(0x1080, true).dev, &dev));
+
+        let mut replacement = register
+            .new_fallback_io_region("replacement", 0x100)
+            .unwrap();
+        replacement.map(0x1000);
+        assert_eq!(replacement.addr(), Some(0x1000));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x1000, true).dev, &dev));
+        bar.unmap();
+    }
+
+    #[test]
+    fn fallback_offsets_include_the_last_address_without_overflow() {
+        let ranges = IoRanges::new(false, None);
+        let dev = device();
+        let mut register = register_mmio_for_device("test".into(), Arc::downgrade(&dev), ranges);
+        let mut region = register.new_fallback_io_region("last", 16).unwrap();
+        region.map(u64::MAX - 15);
+        assert_eq!(region.addr(), Some(u64::MAX - 15));
+        assert_eq!(region.offset_of(u64::MAX), Some(15));
+        assert_eq!(region.offset_of(u64::MAX - 16), None);
+        assert_eq!(region.offset_of(0), None);
+    }
+
+    #[test]
+    fn invalid_fallback_remapping_drops_the_old_mapping_without_panicking() {
+        let ranges = IoRanges::new(false, None);
+        let dev = device();
+        let mut register =
+            register_mmio_for_device("test".into(), Arc::downgrade(&dev), ranges.clone());
+        let mut region = register.new_fallback_io_region("aperture", 16).unwrap();
+        region.map(0x1000);
+        region.map(u64::MAX - 14);
+        assert_eq!(region.addr(), None);
+        assert_eq!(ranges.lookup(0x1000, true).dev_name.as_ref(), "<unknown>");
+        assert_eq!(ranges.lookup(u64::MAX, true).dev_name.as_ref(), "<unknown>");
+    }
 }

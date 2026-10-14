@@ -53,6 +53,14 @@ impl RegisterMmioIntercept for ExternallyManagedMmioIntercepts {
     fn new_io_region(&mut self, _region_name: &str, _len: u64) -> Box<dyn ControlMmioIntercept> {
         Box::new(())
     }
+
+    fn new_fallback_io_region(
+        &mut self,
+        _region_name: &str,
+        _len: u64,
+    ) -> Option<Box<dyn ControlMmioIntercept>> {
+        Some(Box::new(()))
+    }
 }
 
 impl ControlMmioIntercept for () {

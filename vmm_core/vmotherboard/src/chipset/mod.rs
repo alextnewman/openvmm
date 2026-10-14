@@ -165,13 +165,21 @@ impl Chipset {
 
     /// Dispatch a MMIO read to the given address.
     pub async fn mmio_read(&self, vp: u32, address: u64, data: &mut [u8]) {
-        let lookup = self.mmio_ranges.lookup(address, true);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_mmio()
-            .expect("objects on the mmio bus support mmio")
-            .mmio_read(address, data);
+        let end = data
+            .len()
+            .checked_sub(1)
+            .and_then(|offset| address.checked_add(offset as u64));
+        let lookup = self.mmio_ranges.lookup_range(address, end, true);
+        let r = if end.is_none() {
+            IoResult::Err(IoError::InvalidAccessSize)
+        } else {
+            lookup
+                .dev
+                .lock()
+                .supports_mmio()
+                .expect("objects on the mmio bus support mmio")
+                .mmio_read(address, data)
+        };
 
         self.handle_io_result(
             lookup,
@@ -187,13 +195,21 @@ impl Chipset {
 
     /// Dispatch a MMIO write to the given address.
     pub async fn mmio_write(&self, vp: u32, address: u64, data: &[u8]) {
-        let lookup = self.mmio_ranges.lookup(address, false);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_mmio()
-            .expect("objects on the mmio bus support mmio")
-            .mmio_write(address, data);
+        let end = data
+            .len()
+            .checked_sub(1)
+            .and_then(|offset| address.checked_add(offset as u64));
+        let lookup = self.mmio_ranges.lookup_range(address, end, false);
+        let r = if end.is_none() {
+            IoResult::Err(IoError::InvalidAccessSize)
+        } else {
+            lookup
+                .dev
+                .lock()
+                .supports_mmio()
+                .expect("objects on the mmio bus support mmio")
+                .mmio_write(address, data)
+        };
 
         self.handle_io_result(
             lookup,

@@ -562,6 +562,9 @@ message PcieRootComplex {
     repeated PciePort root_ports = 11;
     // Guest-visible IOMMU covering this root complex. Absent => none.
     PcieIommuConfig iommu = 12;
+    // Forward unclaimed MMIO in this root's apertures through bridge windows.
+    // Absent defaults to false, leaving unclaimed addresses with the chipset fallback.
+    optional bool mmio_forwarding = 13;
 }
 
 // Guest-visible IOMMU selection for a PCIe root complex.

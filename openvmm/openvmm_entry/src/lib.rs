@@ -1055,6 +1055,7 @@ async fn vm_config_from_command_line(
             },
             vnode: rc_cli.vnode,
             preserve_bars: rc_cli.preserve_bars,
+            mmio_forwarding: rc_cli.mmio_forwarding,
         });
     }
 
@@ -3343,6 +3344,46 @@ mod tests {
                     .unwrap();
                 assert_eq!(err.to_string(), expected_error);
             }
+            mesh.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn maps_mmio_forwarding_per_root_complex() {
+        DefaultPool::run_with(async |driver| {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let kernel_path = temp_dir.path().join("kernel");
+            File::create(&kernel_path).unwrap();
+            let initrd_path = temp_dir.path().join("initrd");
+            File::create(&initrd_path).unwrap();
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--kernel",
+                kernel_path.to_str().unwrap(),
+                "--initrd",
+                initrd_path.to_str().unwrap(),
+                "--pcie-root-complex",
+                "fabric,mmio_forwarding",
+                "--pcie-root-complex",
+                "ordinary,segment=1",
+                "--pcie-root-complex",
+                "disabled,segment=2,mmio_forwarding=off",
+                "--single-process",
+            ])
+            .unwrap();
+            let mesh = VmmMesh::new(&driver, true).unwrap();
+
+            let (config, _resources) = vm_config_from_command_line(driver, &mesh, &opt)
+                .await
+                .unwrap();
+            assert_eq!(
+                config
+                    .pcie_root_complexes
+                    .iter()
+                    .map(|rc| rc.mmio_forwarding)
+                    .collect::<Vec<_>>(),
+                [true, false, false]
+            );
             mesh.shutdown().await;
         });
     }

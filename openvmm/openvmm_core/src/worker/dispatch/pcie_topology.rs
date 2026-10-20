@@ -105,6 +105,7 @@ mod tests {
             iommu: None,
             vnode: None,
             preserve_bars: false,
+            mmio_forwarding: false,
         }
     }
 

@@ -1241,6 +1241,7 @@ Options:
     `hdm_window_restrictions=<m>`  CFMWS window restriction bitmask (u16, decimal or 0x-prefixed hex),
                                    default DEVICE_COHERENT (bit 0, value 0x1)
     `preserve_bars`                keep pinned BARs at their assigned addresses
+    `mmio_forwarding[=on|off]`      forward unclaimed MMIO through bridge windows, default off
     `node=<value>`                 NUMA node the root complex is associated with
 "#)]
     #[clap(long, conflicts_with("pcat"))]
@@ -3353,6 +3354,7 @@ pub struct PcieRootComplexCli {
     pub low_mmio_base: Option<u64>,
     pub high_mmio_base: Option<u64>,
     pub preserve_bars: bool,
+    pub mmio_forwarding: bool,
     pub hdm: u64,
     pub hdm_window_restrictions: CfmwsWindowRestrictions,
     pub vnode: Option<u32>,
@@ -3402,6 +3404,9 @@ struct PcieRootComplexArgs {
     high_mmio_base: Option<HexAddress>,
     #[kv(flag)]
     preserve_bars: bool,
+    /// Forward unclaimed MMIO through downstream bridge windows (default off).
+    #[kv(flag)]
+    mmio_forwarding: bool,
     #[kv(default = vmm_cli::MemorySize(1024 * 1024 * 1024))]
     hdm: vmm_cli::MemorySize,
     #[kv(default = CfmwsWindowRestrictionsCli(CfmwsWindowRestrictions::DEVICE_COHERENT))]
@@ -3432,6 +3437,7 @@ impl FromStr for PcieRootComplexCli {
             low_mmio_base: args.low_mmio_base.map(|a| a.0),
             high_mmio_base: args.high_mmio_base.map(|a| a.0),
             preserve_bars: args.preserve_bars,
+            mmio_forwarding: args.mmio_forwarding,
             hdm: args.hdm.0,
             hdm_window_restrictions: args.hdm_window_restrictions.0,
             vnode: args.vnode,
@@ -4733,6 +4739,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4751,6 +4758,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4769,6 +4777,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4787,6 +4796,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4805,6 +4815,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4823,6 +4834,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4841,6 +4853,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4859,6 +4872,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4877,6 +4891,7 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
 
@@ -4914,8 +4929,26 @@ mod tests {
                 low_mmio_base: None,
                 high_mmio_base: None,
                 preserve_bars: false,
+                mmio_forwarding: false,
             }
         );
+    }
+
+    #[test]
+    fn test_pcie_root_complex_mmio_forwarding() {
+        for (input, expected) in [
+            ("rc0", false),
+            ("rc0,mmio_forwarding", true),
+            ("rc0,mmio_forwarding=on", true),
+            ("rc0,mmio_forwarding=off", false),
+        ] {
+            assert_eq!(
+                PcieRootComplexCli::from_str(input).unwrap().mmio_forwarding,
+                expected,
+                "{input}"
+            );
+        }
+        assert!(PcieRootComplexCli::from_str("rc0,mmio_forwarding=invalid").is_err());
     }
 
     #[test]

@@ -2335,7 +2335,11 @@ impl InitializedVm {
                             .first_port_device_number(root_port_start_device)
                             .reserved_device_numbers(reserved_device_numbers)
                             .chbcr_range(chbcr_range)
-                            .mmio_apertures([ranges.low_mmio, ranges.high_mmio])
+                            .mmio_apertures(
+                                [ranges.low_mmio, ranges.high_mmio]
+                                    .into_iter()
+                                    .filter(|_| rc.mmio_forwarding),
+                            )
                             .build()
                         })?;
 

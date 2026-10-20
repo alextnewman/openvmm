@@ -383,19 +383,32 @@ attached to a root port to appear as PCIe devices in the guest.
 
 ### Fabric memory forwarding
 
-Root complexes retain their configured low and high MMIO apertures. Ordinary
-device BAR intercepts take priority; an otherwise-unclaimed access can be
-forwarded through enabled root-port and switch memory windows to a device that
-explicitly supports fabric forwarding. Every bridge must decode the complete
-access, including 64-bit prefetch windows. Disabled, out-of-range and ambiguous
-overlapping windows do not select a downstream target.
+Fabric memory forwarding is disabled by default. Enable it per root complex:
+
+```bash
+--pcie-root-complex rc0,mmio_forwarding --pcie-root-port rc0:rp0
+```
+
+An enabled root claims otherwise-unmapped addresses in its configured low and
+high MMIO apertures. Ordinary device BAR intercepts take priority; an
+otherwise-unclaimed access can be forwarded through enabled root-port and switch
+memory windows to a device that explicitly supports fabric forwarding. Every
+bridge must decode the complete forwarded access, including 64-bit prefetch
+windows. Disabled, out-of-range and ambiguous overlapping windows do not select
+a downstream target.
+
+Inside an enabled root's apertures, an unmatched access is rejected by that
+root rather than passed to the chipset's global MMIO fallback. Without
+`mmio_forwarding`, no fallback apertures are registered, and the chipset retains
+its existing handling of unclaimed addresses. The option does not affect other
+root complexes or change ordinary BAR-backed endpoint interception.
 
 This permits an external fabric to retain ownership of its endpoint configuration
 and BAR decode. The VMM need not discover those BARs while constructing the device:
-normal PCI enumeration supplies routed BDFs after bus assignment. No additional
-CLI options are required, and ordinary BAR-backed endpoints remain on their
-existing intercept path. Forwarding follows the current bridge configuration and
-attached device, including after reset, restore and hotplug.
+normal PCI enumeration supplies routed BDFs after bus assignment. Forwarding
+follows the current bridge configuration and attached device, including after
+reset, restore and hotplug. Enabling the option does not make an ordinary
+endpoint into a fabric backend.
 
 DMA and MSI targets can be derived from complete requester IDs within the owning
 port's assigned bus range. This keeps identical device/function numbers on
@@ -425,6 +438,9 @@ complex name:
 - `preserve_bars`: treat non-zero BAR values found during PCI probing as
   pinned addresses (GPA = HPA). Required for peer-to-peer DMA between
   VFIO passthrough devices without ATS.
+- `mmio_forwarding[=on|off]`: forward otherwise-unclaimed MMIO through this
+  root's bridge windows to forwarding-capable devices. Defaults to `off`;
+  bare `mmio_forwarding` enables it.
 - `hdm=<SIZE>`: CXL HDM decoder MMIO window size (CFMWS window). Default
   is `1G`.
 - `hdm_window_restrictions=<MASK>`: CFMWS window restrictions bitmask

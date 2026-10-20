@@ -260,6 +260,9 @@ pub struct PcieRootComplexConfig {
     /// When true, treat non-zero BAR values found during probing as pinned
     /// addresses. Used for P2P DMA with GPA = HPA.
     pub preserve_bars: bool,
+    /// Opt in to forwarding otherwise-unclaimed MMIO in this root's apertures
+    /// through downstream bridge windows. Ordinary BAR intercepts take priority.
+    pub mmio_forwarding: bool,
 }
 
 /// Configuration for a single PCIe port — either a root-complex root port or a

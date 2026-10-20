@@ -1995,6 +1995,7 @@ async fn build_pcie_topology(
             node,
             root_ports,
             iommu,
+            mmio_forwarding,
         } = rc;
         let mut ports = Vec::new();
         for root_port in root_ports {
@@ -2036,6 +2037,7 @@ async fn build_pcie_topology(
             iommu: iommu.map(parse_pcie_iommu).transpose()?,
             vnode: node,
             preserve_bars,
+            mmio_forwarding: mmio_forwarding.unwrap_or(false),
         });
     }
 
@@ -2786,6 +2788,40 @@ mod tests {
             } else {
                 assert_eq!(result.unwrap().root_complexes[0].iommu.is_some(), has_iommu);
             }
+        }
+    }
+
+    #[test]
+    fn pcie_topology_mmio_forwarding() {
+        assert_eq!(vmservice::PcieRootComplex::default().mmio_forwarding, None);
+        let topology = futures::executor::block_on(build_pcie_topology(
+            vmservice::PcieTopologyConfig {
+                root_complexes: [None, Some(false), Some(true)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mmio_forwarding)| vmservice::PcieRootComplex {
+                        name: format!("rc{index}"),
+                        segment: index as u32,
+                        mmio_forwarding,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            &FdRegistry::default(),
+            &IommufdContexts::default(),
+        ))
+        .unwrap();
+
+        for (rc, expected) in topology
+            .root_complexes
+            .into_iter()
+            .zip([false, false, true])
+        {
+            assert_eq!(rc.mmio_forwarding, expected);
+            let bytes = mesh::payload::encode(rc);
+            let decoded: PcieRootComplexConfig = mesh::payload::decode(&bytes).unwrap();
+            assert_eq!(decoded.mmio_forwarding, expected);
         }
     }
 

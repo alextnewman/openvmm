@@ -529,6 +529,7 @@ impl PetriVmConfigOpenVmm {
                     iommu: None,
                     vnode: None,
                     preserve_bars: false,
+                    mmio_forwarding: false,
                 });
             }
         }

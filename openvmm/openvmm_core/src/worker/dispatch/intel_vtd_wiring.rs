@@ -213,6 +213,7 @@ mod tests {
             iommu,
             vnode: None,
             preserve_bars: false,
+            mmio_forwarding: false,
         }
     }
 

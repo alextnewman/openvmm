@@ -303,6 +303,60 @@ mod tests {
     }
 
     #[test]
+    fn apertures_scope_global_fallback_and_mmio_classification() {
+        let global = device();
+        let root = device();
+        let endpoint = device();
+        let ranges = IoRanges::new(false, Some(global.clone()));
+        ranges
+            .register(
+                0u64,
+                0xff,
+                "ecam".into(),
+                Arc::downgrade(&root),
+                "root".into(),
+            )
+            .unwrap();
+        ranges
+            .register(
+                0x180,
+                0x18f,
+                "bar".into(),
+                Arc::downgrade(&endpoint),
+                "endpoint".into(),
+            )
+            .unwrap();
+
+        assert!(ranges.is_occupied(0));
+        assert!(ranges.is_occupied(0x184));
+        assert!(!ranges.is_occupied(0x170));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x170, true).dev, &global));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, true).dev, &endpoint));
+
+        ranges
+            .register_fallback(
+                0x100,
+                0x1ff,
+                "aperture".into(),
+                Arc::downgrade(&root),
+                "root".into(),
+            )
+            .unwrap();
+        assert!(ranges.is_occupied(0x170));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x170, true).dev, &root));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, true).dev, &endpoint));
+        assert!(!ranges.is_occupied(0x270));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x270, true).dev, &global));
+
+        ranges.revoke(0x180);
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, false).dev, &root));
+        ranges.revoke_fallback(0x100);
+        assert!(!ranges.is_occupied(0x184));
+        assert!(Arc::ptr_eq(&ranges.lookup(0x184, false).dev, &global));
+        assert!(ranges.is_occupied(0));
+    }
+
+    #[test]
     fn bar_intercepts_override_fallback_without_replacing_it() {
         let ranges = IoRanges::new(false, None);
         let fabric = device();

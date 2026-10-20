@@ -203,6 +203,8 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
     /// Set the fixed host-bridge memory apertures. Unclaimed accesses in these
     /// ranges are routed through the currently enabled downstream bridge
     /// windows; ordinary device BAR intercepts retain priority.
+    /// Without apertures (the default), the chipset retains its existing
+    /// handling of otherwise-unclaimed addresses.
     pub fn mmio_apertures(mut self, ranges: impl IntoIterator<Item = MemoryRange>) -> Self {
         self.mmio_apertures = ranges.into_iter().collect();
         self
@@ -1297,6 +1299,9 @@ mod tests {
         }
 
         let mut register = OrdinaryMmioRegistration;
+        GenericPcieRootComplex::builder(&mut register, 0..=0, MemoryRange::new(0..0x10_0000))
+            .build()
+            .unwrap();
         let result =
             GenericPcieRootComplex::builder(&mut register, 0..=0, MemoryRange::new(0..0x10_0000))
                 .mmio_apertures([MemoryRange::new(0x8000_0000..0x9000_0000)])

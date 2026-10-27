@@ -70,6 +70,7 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
+use openvmm_defs::config::IgvmPersonality;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
@@ -1382,6 +1383,11 @@ async fn vm_config_from_command_line(
                 Vtl2BaseAddressType::File
             },
             com_serial: has_com3.then_some(UartId::Com(ComPort::Com3)),
+            personality: match igvm.personality {
+                IgvmPersonalityCli::Openhcl => IgvmPersonality::Openhcl,
+                IgvmPersonalityCli::Uefi => IgvmPersonality::Uefi,
+                IgvmPersonalityCli::LinuxDirect => IgvmPersonality::LinuxDirect,
+            },
         };
 
         // An IGVM launch carries no SMBIOS field of its own; the identity is
@@ -1968,6 +1974,12 @@ async fn vm_config_from_command_line(
         } else {
             add_virtio_device(opt.virtio_rng_bus.clone(), resource, &mut pcie_devices);
         }
+    }
+
+    if let Some(rtc) = &opt.virtio_rtc {
+        let resource: Resource<VirtioDeviceHandle> =
+            virtio_resources::rtc::VirtioRtcHandle.into_resource();
+        add_virtio_device(rtc.bus.clone(), resource, &mut pcie_devices);
     }
 
     if let Some(backend) = virtio_console_backend {
@@ -2707,7 +2719,7 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
-    tracing_init::enable_tracing()?;
+    let _tracing_guard = tracing_init::enable_tracing()?;
 
     // Try to run as a worker host.
     // On success the worker runs to completion and then exits the process (does

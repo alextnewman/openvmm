@@ -3594,6 +3594,7 @@ impl LoadedVmInner {
                 ref cmdline,
                 vtl2_base_address,
                 com_serial,
+                personality,
             } => {
                 let madt = acpi_builder.build_madt();
                 let srat = acpi_builder.build_srat();
@@ -3629,6 +3630,7 @@ impl LoadedVmInner {
                     entropy: Some(&entropy),
                     chipset_mmio: self.chipset_mmio,
                     pcie_host_bridges: &self.pcie_host_bridges,
+                    personality,
                 };
                 super::vm_loaders::igvm::load_igvm(params)?
             }
@@ -3690,6 +3692,7 @@ impl LoadedVmInner {
 }
 
 impl LoadedVm {
+    #[tracing::instrument(name = "resume_vm", target = "openvmm::perf", skip_all)]
     async fn resume(&mut self) -> bool {
         if self.running {
             return false;

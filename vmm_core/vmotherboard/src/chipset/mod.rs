@@ -173,12 +173,14 @@ impl Chipset {
         let r = if end.is_none() {
             IoResult::Err(IoError::InvalidAccessSize)
         } else {
-            lookup
-                .dev
-                .lock()
-                .supports_mmio()
-                .expect("objects on the mmio bus support mmio")
-                .mmio_read(address, data)
+            lookup.dev.lock_if_open().map_or_else(
+                || IoResult::Err(IoError::NoResponse),
+                |mut dev| {
+                    dev.supports_mmio()
+                        .expect("objects on the mmio bus support mmio")
+                        .mmio_read(address, data)
+                },
+            )
         };
 
         self.handle_io_result(
@@ -203,12 +205,14 @@ impl Chipset {
         let r = if end.is_none() {
             IoResult::Err(IoError::InvalidAccessSize)
         } else {
-            lookup
-                .dev
-                .lock()
-                .supports_mmio()
-                .expect("objects on the mmio bus support mmio")
-                .mmio_write(address, data)
+            lookup.dev.lock_if_open().map_or_else(
+                || IoResult::Err(IoError::NoResponse),
+                |mut dev| {
+                    dev.supports_mmio()
+                        .expect("objects on the mmio bus support mmio")
+                        .mmio_write(address, data)
+                },
+            )
         };
 
         self.handle_io_result(
@@ -231,12 +235,14 @@ impl Chipset {
     /// Dispatch a Port IO read to the given address.
     pub async fn io_read(&self, vp: u32, port: u16, data: &mut [u8]) {
         let lookup = self.pio_ranges.lookup(port, true);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_pio()
-            .expect("objects on the pio bus support pio")
-            .io_read(port, data);
+        let r = lookup.dev.lock_if_open().map_or_else(
+            || IoResult::Err(IoError::NoResponse),
+            |mut dev| {
+                dev.supports_pio()
+                    .expect("objects on the pio bus support pio")
+                    .io_read(port, data)
+            },
+        );
 
         self.handle_io_result(
             lookup,
@@ -253,12 +259,14 @@ impl Chipset {
     /// Dispatch a Port IO write to the given address.
     pub async fn io_write(&self, vp: u32, port: u16, data: &[u8]) {
         let lookup = self.pio_ranges.lookup(port, false);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_pio()
-            .expect("objects on the pio bus support pio")
-            .io_write(port, data);
+        let r = lookup.dev.lock_if_open().map_or_else(
+            || IoResult::Err(IoError::NoResponse),
+            |mut dev| {
+                dev.supports_pio()
+                    .expect("objects on the pio bus support pio")
+                    .io_write(port, data)
+            },
+        );
 
         self.handle_io_result(
             lookup,

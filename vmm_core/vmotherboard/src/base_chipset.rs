@@ -668,15 +668,16 @@ mod weak_mutex_pci {
     impl GenericPciBusDevice for WeakMutexPciDeviceWrapper {
         fn supports_mmio_forwarding(&mut self) -> bool {
             self.0.upgrade().is_some_and(|dev| {
-                dev.lock()
-                    .supports_pci()
-                    .is_some_and(|pci| pci.supports_mmio_forwarding())
+                dev.lock_if_open().is_some_and(|mut dev| {
+                    dev.supports_pci()
+                        .is_some_and(|pci| pci.supports_mmio_forwarding())
+                })
             })
         }
 
         fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> Option<IoResult> {
             let dev = self.0.upgrade()?;
-            let mut dev = dev.lock();
+            let mut dev = dev.lock_if_open()?;
             if !dev.supports_pci()?.supports_mmio_forwarding() {
                 return None;
             }
@@ -685,7 +686,7 @@ mod weak_mutex_pci {
 
         fn mmio_write(&mut self, addr: u64, data: &[u8]) -> Option<IoResult> {
             let dev = self.0.upgrade()?;
-            let mut dev = dev.lock();
+            let mut dev = dev.lock_if_open()?;
             if !dev.supports_pci()?.supports_mmio_forwarding() {
                 return None;
             }
@@ -865,6 +866,28 @@ mod weak_mutex_pci {
 
         fn downstream_ports(&self) -> Vec<pcie::root::DownstreamPortInfo> {
             self.lock().downstream_ports()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use test_with_tracing::test;
+
+        #[test]
+        fn closed_pci_device_rejects_forwarded_mmio() {
+            #[derive(inspect::InspectMut)]
+            struct TestDevice;
+            impl ChipsetDevice for TestDevice {}
+
+            let device: Arc<CloseableMutex<dyn ChipsetDevice>> =
+                Arc::new(CloseableMutex::new(TestDevice));
+            let mut wrapper = WeakMutexPciDeviceWrapper(Arc::downgrade(&device));
+            let _closed = device.close_permanently();
+
+            assert!(!wrapper.supports_mmio_forwarding());
+            assert!(wrapper.mmio_read(0x1000, &mut [0; 4]).is_none());
+            assert!(wrapper.mmio_write(0x1000, &[0; 4]).is_none());
         }
     }
 }
@@ -1075,6 +1098,8 @@ pub mod options {
         pub with_psp: bool,
         /// Whether the VM exposes the Hyper-V guest watchdog device.
         pub with_guest_watchdog: bool,
+        /// Global system interrupt (GSI) for the ACPI power button, if present.
+        pub acpi_power_button_gsi: Option<u32>,
         /// Whether the VM exposes an i440BX Host-PCI Bridge (Gen1 legacy PCI bus).
         pub with_i440bx_host_pci_bridge: bool,
         /// COM1 through COM4 ports to describe in the device tree. Device
